@@ -74012,7 +74012,7 @@ QJS_AOT_STUB int qjs_aot_get_global_site(JSContext *ctx, JSRegRun *f, int site,
    1 when the site now holds (the caller probes it again), 0 when the global is absent, an accessor, uninitialised or the function has no
    cache array yet. A compiled loop whose hoisted global read found the cell empty (a process that has not run the site yet) fills it here
    and goes on, where the miss would hand the rest of the activation to the interpreter. */
-QJS_AOT_STUB int qjs_aot_global_warm(JSContext *ctx, JSRegRun *f, int site, int atom)
+static int qjs_aot_global_warm_pic(JSContext *ctx, JSFunctionBytecode *b, JSRegPIC **ppic, int site, int atom)
 {
     JSValue v;
     JSObject *p;
@@ -74020,7 +74020,7 @@ QJS_AOT_STUB int qjs_aot_global_warm(JSContext *ctx, JSRegRun *f, int site, int 
     JSProperty *pr;
     int k;
 
-    if (f->pic == NULL)
+    if (*ppic == NULL)
         return 0;
     if (!js_gv_cell_peek(ctx, (JSAtom)atom, &v)) {
         for (k = 0; k < 2; k++) {
@@ -74043,8 +74043,19 @@ QJS_AOT_STUB int qjs_aot_global_warm(JSContext *ctx, JSRegRun *f, int site, int 
         }
         JS_FreeValue(ctx, v);
     }
-    regvm_global_site_fill(ctx, f->b, &f->pic, (JSAtom)atom, site);
+    regvm_global_site_fill(ctx, b, ppic, (JSAtom)atom, site);
     return 1;
+}
+
+QJS_AOT_STUB int qjs_aot_global_warm(JSContext *ctx, JSRegRun *f, int site, int atom)
+{
+    return qjs_aot_global_warm_pic(ctx, f->b, &f->pic, site, atom);
+}
+
+/* The same for a frameless body, which has no frame: the cache array is the function's own (a frame's is the same pointer). */
+QJS_AOT_STUB int qjs_aot_global_warm_b(JSContext *ctx, struct JSFunctionBytecode *b, int site, int atom)
+{
+    return qjs_aot_global_warm_pic(ctx, b, &b->regvm_pic, site, atom);
 }
 
 __attribute__((always_inline)) int qjs_aot_put_field_own(JSContext *ctx, JSRegRun *f, JSValue recv, int site, JSValue v)

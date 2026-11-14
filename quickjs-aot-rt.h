@@ -716,6 +716,9 @@ QJS_AOT_STUB int qjs_aot_get_global_site(JSContext *ctx, JSRegRun *f, int site,
 
 /* Fill the cache cell of a global-read site for a plain data property, running no user code: 1 when the site now holds, else 0. */
 QJS_AOT_STUB int qjs_aot_global_warm(JSContext *ctx, JSRegRun *f, int site, int atom);
+/* The same for a frameless body: `b` is the function's bytecode, whose cache array the body read at entry. */
+struct JSFunctionBytecode;
+QJS_AOT_STUB int qjs_aot_global_warm_b(JSContext *ctx, struct JSFunctionBytecode *b, int site, int atom);
 
 /* The get_global handler's site-cache hit alone: 1 with a borrowed *out (store
    with AOT_SET_B), 0 when the caller must take qjs_aot_get_global_site. Runs no
