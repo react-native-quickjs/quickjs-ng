@@ -26484,12 +26484,9 @@ regvm_light_alloc(JSRuntime *rt, JSRegRun *f, JSFunctionBytecode *cb)
     JSRegRun *nf;
 
     if (unlikely(f->caller == NULL)) {
-        /*
-         * The activation's entry record lives on the C stack, not in the
-         * arena, so there is no frame to sit above: take the frame from the
-         * arena top as before. This is the cold side; a light caller uses the
-         * caller's own frame end and never reads or writes the top.
-         */
+        /* The entry record lives on the C stack, not in the arena, so take the
+           frame from the arena top. Before the first record call there is no
+           arena at all; fall back to the record path, which allocates it. */
         size_t top = (rt->regvm_frames_top + 15) & ~(size_t)15;
 
         nf = (JSRegRun *)(rt->regvm_frames + top);
@@ -60981,12 +60978,10 @@ static void regvm_fuse_self_branch(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
     js_free(ctx, first);
 }
 
-/*
- * The back edge of a counted loop targets the constant load of its bound, which
- * re-executes every iteration. Retarget the edge past the load. Only a backward
- * edge to a pure constant load whose register is written nowhere else
- * qualifies, so the load has always run when the edge is taken.
- */
+/* The back edge of a counted loop targets the constant load of its bound,
+   which re-executes every iteration. Retarget the edge past the load. Only a
+   backward edge to a pure constant load that is the last write of its register
+   qualifies, so the load has always run when the edge is taken. */
 static void regvm_hoist_loop_const(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
                                    int n_pcs, int n_values, const int *ireg)
 {
@@ -60999,6 +60994,9 @@ static void regvm_hoist_loop_const(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
     insn_pc = js_malloc(ctx, (size_t)n * sizeof(int));
     if (!defs || !insn_pc)
         goto done;
+    /* defs[pr] is the last instruction writing physical register pr. The load
+       must be that last write: a later write could run between the load and the
+       back edge. */
     for (i = 0; i < n_values; i++)
         defs[i] = -1;
     for (i = 0; i < n; i++) {
@@ -61014,7 +61012,8 @@ static void regvm_hoist_loop_const(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
         pr = ireg[v];
         if (pr < 0 || pr >= n_values)
             continue;
-        defs[pr] = (defs[pr] < 0) ? i : -2;
+        if (i > defs[pr])
+            defs[pr] = i;
     }
     for (i = 0; i < n; i++)
         insn_pc[i] = -1;
@@ -61049,7 +61048,7 @@ static void regvm_hoist_loop_const(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
             continue;
         pr = ireg[v];
         if (pr < 0 || pr >= n_values || defs[pr] != ti)
-            continue;                       /* one definition: this load */
+            continue;                       /* the load is the register's last write */
         nxt = ti + 1;
         if (nxt >= i || insn_pc[nxt] < 0)   /* nothing between load and edge */
             continue;
