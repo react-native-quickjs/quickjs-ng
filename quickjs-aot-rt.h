@@ -361,6 +361,9 @@ int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out);
    the frame is `f`), the function itself, new.target and most of the family;
    `array_from` is an array literal of `na` registers. */
 int qjs_aot_object_template(JSContext *ctx, JSRegRun *f, int index, JSValue *out);
+struct JSFunctionBytecode;
+/* The same with the function's bytecode instead of its frame, for a body that has none. */
+int qjs_aot_object_template_b(JSContext *ctx, struct JSFunctionBytecode *b, int index, JSValue *out);
 int qjs_aot_special_object(JSContext *ctx, JSRegRun *f, int kind, JSValue *out);
 int qjs_aot_array_from(JSContext *ctx, JSValue *argv, int na, JSValue *out);
 /* An exception leaves a compiled frame that has no handler: builds the error's stack
@@ -378,6 +381,8 @@ int qjs_aot_load_const(JSContext *ctx, JSRegRun *f, int kind, uint32_t idx, JSVa
    template's shape when the object still has it, else property definitions. The
    registers are left undefined, as the handler leaves them. 0, or -1 on an exception. */
 int qjs_aot_object_fill(JSContext *ctx, JSRegRun *f, JSValue obj, JSValue *vals, int n, int ti);
+int qjs_aot_object_fill_b(JSContext *ctx, struct JSFunctionBytecode *b, JSValue obj, JSValue *vals,
+                          int n, int ti);
 /* `f.apply(this, arguments)`: with the builtin `apply` and this frame's arguments not
    reified, calls the callee with the frame's own arguments. 1 with an owned *out when
    it did; 0 when the case needs the handler (not the builtin, or the arguments
