@@ -23343,7 +23343,8 @@ static uint8_t *REGVM_CC regvm_t_call_slow(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_call_method_slow(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_call_record(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_call_method_record(REGVM_ARGS);
-static void regvm_record_release(JSRuntime *rt, JSRegRun *rec);
+static __attribute__((always_inline)) inline void
+regvm_record_release(JSRuntime *rt, JSRegRun *rec);
 #endif
 
 /*
@@ -25186,7 +25187,8 @@ static int regvm_record_alloc(JSRuntime *rt, JSFunctionBytecode *b, int arg_slot
  * The last handshake slot holds the control-stack depth as an integer, so it
  * is excluded.
  */
-static void regvm_record_release(JSRuntime *rt, JSRegRun *rec)
+static __attribute__((always_inline)) inline void
+regvm_record_release(JSRuntime *rt, JSRegRun *rec)
 {
     JSStackFrame *sf = rec->sf;
     JSValue *pval;
