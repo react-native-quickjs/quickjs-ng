@@ -10646,6 +10646,19 @@ static void js_drc_zero(JSRuntime *rt, JSValue v)
         js_free_value_rt(rt, v);
         return;
     }
+    if (likely(tag == JS_TAG_OBJECT)) {
+        JSGCObjectHeader *p = JS_VALUE_GET_PTR(v);
+        if (likely(((JSObject *)p)->class_id == JS_CLASS_OBJECT)) {
+            /* A plain object is not a value js_drc_value_is_large() can call
+               large, so parking it takes neither the tag switch below nor the
+               large-value walk. */
+            list_del(&p->link);
+            list_add(&p->link, &rt->gc_zero_ref_count_list);
+            JS_GC_IN_ZCT(p) = 1;
+            rt->zct_nobj++;
+            return;
+        }
+    }
     if (js_drc_value_is_large(v)) {
         /* One large value can dominate the parked memory before allocation
            pressure is even felt; make the next safepoint reconcile. */
