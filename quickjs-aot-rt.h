@@ -157,4 +157,27 @@ JSValue qjs_aot_field_read(JSValue recv, int slot_off);
 int qjs_aot_get_length_num(JSValue v, double *out, int *isint);
 JSValue *qjs_aot_var_ref_ptr(JSRegRun *f, int slot);
 
+/* --- AOT call-site helpers ------------------------------------------------
+ *
+ * The prototype watchpoint epoch: the unit reads it at function entry; a
+ * change means folded values must be re-read.
+ */
+uint32_t qjs_aot_epoch(JSContext *ctx);
+JSValue qjs_aot_site_expect(JSContext *ctx, int site);
+
+/* The specialised C-call path: 1 with an owned *out, 0 to fall back to the
+   step engine, -1 on exception. `cproto` is the profile's prototype. */
+int qjs_aot_call_c(JSContext *ctx, int site, int cproto, int na, JSValue callee,
+                   JSValue this_obj, JSValue *argv, JSValue *out);
+
+/* Direct compiled call: 1 with an owned *out, 0 to fall back to the step
+   engine, -1 on exception. Only the no-copy frame case is handled. */
+int qjs_aot_call_b(JSContext *ctx, int na, JSValue callee, JSValue this_obj,
+                   JSValue *argv, JSValue *out);
+
+/* Folded prototype read: 1 with an owned *out while the PIC site still
+   resolves to the same prototype slot and the epoch is unchanged. */
+int qjs_aot_proto_fold(JSContext *ctx, JSRegRun *f, const void *pic, int site,
+                       JSValue recv, int pic_site, JSValue *out);
+
 #endif /* QUICKJS_AOT_RT_H */
