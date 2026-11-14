@@ -33467,6 +33467,13 @@ static inline void regvm_light_seal(JSRuntime *rt, JSRegRun *lf)
     }
 }
 
+/* The seal for the native-entry call sites in the call machinery, kept out of
+   line so those hot paths carry one test and a call. */
+static __attribute__((noinline)) void regvm_light_seal_out(JSRuntime *rt, JSRegRun *lf)
+{
+    regvm_light_seal(rt, lf);
+}
+
 /* Build the callee light frame and return it, or NULL when the chunk is full.
    Inlined into both handlers. */
 static __attribute__((always_inline)) inline JSRegRun *
@@ -43552,6 +43559,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JSValue aot_ret;
             js_aot_enter_count++;
             Y_FORMLESS_ARGS(this_obj, argv, argc);
+            if (rt->regvm_cur != NULL)
+                regvm_light_seal_out(rt, rt->regvm_cur);
             aot_ret = ((JSAotNFn)b->aot_nfn)(caller_ctx, rt->regvm_cur, p, this_obj,
                                              (JSValue *)argv, argc);
             return aot_ret;
@@ -47164,6 +47173,8 @@ JSValue JS_Call(JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj,
                 if (js_poll_interrupts(ctx))
                     return JS_EXCEPTION;
                 Y_FORMLESS_ARGS(this_obj, argv, argc);
+                if (rt->regvm_cur != NULL)
+                    regvm_light_seal_out(rt, rt->regvm_cur);
                 res = ((JSAotNFn)b->aot_nfn)(ctx, rt->regvm_cur, p, this_obj, (JSValue *)argv, argc);
                 if (rt->current_stack_frame == NULL && regvm_light_head(rt->regvm_cur) == NULL)
                     js_drc_safepoint(rt);
@@ -72596,10 +72607,11 @@ JSValue qjs_aot_wrap_init(JSContext *ctx, JSRegRun *caller_f, JSObject *co, JSVa
     }
     init = (JSObject *)wc[AOT_WC_INIT];
     cb2 = init->u.func.function_bytecode;
-    if (cb2->aot_nfn != NULL && argc >= cb2->arg_count)
+    if (cb2->aot_nfn != NULL && argc >= cb2->arg_count) {
+        regvm_light_seal_out(ctx->rt, caller_f);
         ret = ((JSValue (*)(JSContext *, JSRegRun *, JSObject *, JSValue, JSValue *, int))cb2->aot_nfn)(
             ctx, caller_f, init, thisv, argv, argc);
-    else
+    } else
         ret = JS_Call(ctx, JS_MKPTR(JS_TAG_OBJECT, init), thisv, argc, vc(argv));
     if (JS_IsException(ret))
         return ret;
@@ -96612,6 +96624,7 @@ static int js_array_cmp_generic(const void *a, const void *b, void *opaque) {
                         !((ar->disabled[b->aot_index >> 3] >> (b->aot_index & 7)) & 1)))) {
                 if (js_poll_interrupts(ctx))
                     goto exception;
+                regvm_light_seal_out(rt, rt->regvm_cur);
                 res = ((JSAotNFn)b->aot_nfn)(ctx, rt->regvm_cur, JS_VALUE_GET_OBJ(psc->method),
                                              JS_UNDEFINED, (JSValue *)argv, 2);
             } else {
