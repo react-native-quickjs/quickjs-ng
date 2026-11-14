@@ -65284,6 +65284,45 @@ QJS_AOT_STUB int qjs_aot_shape_slot(const void *shape, uint32_t atom, uint32_t *
     return 0;
 }
 
+/* The method a receiver of shape `shape` finds as `atom`: 1 with the value when the shape has no own property of that name and the first
+   object of its prototype chain that has one holds it as a plain data property (ordinary objects only, at most eight links), else 0.
+   Like qjs_aot_shape_slot it reads the shape and the prototype objects only, so the caller keeps the answer while shape_free_epoch
+   and aot_pic_epoch have not moved (every write that can change what a prototype holds, or a prototype link, moves the latter). */
+QJS_AOT_STUB int qjs_aot_shape_method(const void *shape, uint32_t atom, JSValue *out)
+{
+    JSShape *sh = (JSShape *)shape;
+    JSShapeProperty *prop, *prs;
+    JSProperty *pr;
+    JSObject *holder;
+    intptr_t h;
+    int depth;
+
+    if (sh == NULL)
+        return 0;
+    h = (uintptr_t)atom & sh->prop_hash_mask;
+    h = prop_hash_end(sh)[-h - 1];
+    prop = get_shape_prop(sh);
+    while (h) {
+        if (prop[h - 1].atom == (JSAtom)atom)
+            return 0;
+        h = prop[h - 1].hash_next;
+    }
+    holder = sh->proto;
+    for (depth = 0; holder != NULL; depth++) {
+        if (depth >= 8 || holder->class_id != JS_CLASS_OBJECT || holder->is_exotic)
+            return 0;
+        prs = find_own_property(&pr, holder, (JSAtom)atom);
+        if (prs != NULL) {
+            if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL || JS_VALUE_GET_TAG(pr->u.value) != JS_TAG_OBJECT)
+                return 0;
+            *out = pr->u.value;
+            return 1;
+        }
+        holder = holder->shape->proto;
+    }
+    return 0;
+}
+
 QJS_AOT_STUB const void *qjs_aot_function_apply_fn(void)
 {
     return (const void *)js_function_apply;
