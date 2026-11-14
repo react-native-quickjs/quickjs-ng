@@ -196,11 +196,16 @@ typedef struct JSAotGenLayout {
        prototype tag and the tag of an iterator `next`. */
     uint32_t class_array_iterator, off_array_iter_obj, off_array_iter_kind, off_array_iter_idx;
     uint32_t array_iter_kind_value, off_cfunc_cproto, cfunc_cproto_iterator_next;
+    /* The prototype tag of a builtin that takes a magic number (Array's push and pop are such). */
+    uint32_t cfunc_cproto_generic_magic;
 } JSAotGenLayout;
 
 /* The function pointer of Array Iterator's `next`, which a C function object holds when it is
    that builtin. */
 QJS_AOT_STUB const void *qjs_aot_array_iterator_next_fn(void);
+/* The function pointer of Array.prototype.push (0) or pop (1), which a C function object holds,
+   with magic 0, when it is that builtin. */
+QJS_AOT_STUB const void *qjs_aot_array_builtin_fn(int which);
 
 /* Fold every field after `hash` (the hash field itself is excluded). Shared by
    the generator and the runtime. */
