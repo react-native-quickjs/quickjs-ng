@@ -57,6 +57,7 @@ typedef struct JSAotGenFunc {
     int light_need;
     char name[128];
     char file[256];
+    int line, col;             /* the definition's source position, or 0 */
 } JSAotGenFunc;
 
 /* Collect every function bytecode in `rt`, eligible or not. Returns the count
