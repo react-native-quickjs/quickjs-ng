@@ -77595,6 +77595,33 @@ static int regvm_lower_insn(JSContext *ctx, JSRegIR *ir, const uint8_t *bc,
    verifier failure, which is an emitter bug. */
 #define REGVM_REFUSED (-2)
 
+/* Prechecks for the fusion passes: each tests the first condition a pass's
+   rewrite requires, so a pass whose precheck fails would change nothing and
+   returns before its setup. */
+static int regvm_ir_has_rop(const JSRegIR *ir, int a, int b, int c)
+{
+    int i;
+    for (i = 0; i < ir->n_insns; i++) {
+        int r = ir->insns[i].rop;
+        if (r == a || r == b || r == c)
+            return 1;
+    }
+    return 0;
+}
+
+/* A backward unconditional branch (program order): what the loop passes act on. */
+static int regvm_ir_has_back_branch(const JSRegIR *ir, int n_pcs)
+{
+    int i;
+    for (i = 0; i < ir->n_insns; i++) {
+        const JSRegInsn *br = &ir->insns[i];
+        if (br->rop == ROP_branch && br->n_ops == 1 && br->ops[0] >= 0 &&
+            br->ops[0] < n_pcs && br->ops[0] < br->src_pc)
+            return 1;
+    }
+    return 0;
+}
+
 /*
  * Fuse an in-place add with the block's trailing unconditional branch: a
  * counted loop's update and back edge in one instruction.
@@ -77613,6 +77640,11 @@ static void regvm_fuse_self_branch(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
     int *remap = NULL, *first = NULL;
 
     if (n < 2 || n_values <= 0 || !ireg)
+        return;
+    for (i = 0; i + 1 < n; i++)
+        if (ir->insns[i].rop == ROP_binary_imm && ir->insns[i + 1].rop == ROP_branch)
+            break;
+    if (i + 1 >= n)
         return;
     drop = js_mallocz(ctx, (size_t)n);
     remap = js_malloc(ctx, (size_t)n * sizeof(int));
@@ -77677,7 +77709,7 @@ static void regvm_hoist_loop_const(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
     int n = ir->insns ? ir->n_insns : 0, i, p;
     int *defs = NULL, *insn_pc = NULL;
 
-    if (n < 3 || n_values <= 0 || !ireg)
+    if (n < 3 || n_values <= 0 || !ireg || !regvm_ir_has_back_branch(ir, n_pcs))
         return;
     defs = js_malloc(ctx, (size_t)n_values * sizeof(int));
     insn_pc = js_malloc(ctx, (size_t)n * sizeof(int));
@@ -77761,7 +77793,7 @@ static void regvm_rotate_loop_test(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
     int *insn_pc = NULL;
     int *is_target = NULL;
 
-    if (n < 3 || n_values <= 0)
+    if (n < 3 || n_values <= 0 || !regvm_ir_has_back_branch(ir, n_pcs))
         return;
     insn_pc = js_malloc(ctx, (size_t)n * sizeof(int));
     is_target = js_mallocz(ctx, (size_t)n * sizeof(int));
@@ -77847,6 +77879,11 @@ static void regvm_fuse_inc_branch(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
     int *remap = NULL, *first = NULL, *is_target = NULL;
 
     if (n < 2 || n_values <= 0 || !ireg)
+        return;
+    for (i = 0; i + 1 < n; i++)
+        if (ir->insns[i].rop == ROP_unary && ir->insns[i + 1].rop == ROP_branch_cmp_reg_reg)
+            break;
+    if (i + 1 >= n)
         return;
     drop = js_mallocz(ctx, (size_t)n);
     remap = js_malloc(ctx, (size_t)n * sizeof(int));
@@ -78808,7 +78845,8 @@ static void regvm_fold_frame_reads(JSContext *ctx, JSRegIR *ir,
     int *ri = NULL, *rp = NULL, *remap = NULL, *first = NULL;
     unsigned char *drop = NULL;
 
-    if (n <= 0 || n_values <= 0 || fd->has_eval_call)
+    if (n <= 0 || n_values <= 0 || fd->has_eval_call ||
+        !regvm_ir_has_rop(ir, ROP_binary, -1, -1))
         return;
     /* A debugger can rewrite a frame slot at a trap, so in a function with a
        trap a read stays a real frame read. */
@@ -78926,7 +78964,8 @@ static void regvm_elide_dead_stores(JSContext *ctx, JSRegIR *ir,
     unsigned char *read_named = NULL, *drop = NULL;
     int *remap = NULL, *first = NULL;
 
-    if (n <= 0 || n_values <= 0 || nslots <= 0)
+    if (n <= 0 || n_values <= 0 || nslots <= 0 ||
+        !regvm_ir_has_rop(ir, ROP_put_local, -1, -1))
         return;
     /* eval, with and captured locals reach a slot through something these
        instructions do not name, so none of them is allowed. */
@@ -79026,7 +79065,7 @@ static void regvm_fuse_local_rmw(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
     unsigned char *drop = NULL;
     int *remap = NULL, *first = NULL;
 
-    if (n < 3 || n_values <= 0)
+    if (n < 3 || n_values <= 0 || !regvm_ir_has_rop(ir, ROP_put_local, -1, -1))
         return;
     nref = js_malloc(ctx, (size_t)n_values);
     drop = js_mallocz(ctx, (size_t)n);
@@ -79158,7 +79197,8 @@ static void regvm_fuse_branches(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
     unsigned char *drop = NULL;
     int *remap = NULL, *first = NULL;
 
-    if (n < 2 || n_values <= 0)
+    if (n < 2 || n_values <= 0 ||
+        !regvm_ir_has_rop(ir, ROP_branch_if, ROP_branch_if_not, ROP_local_rmw_imm))
         return;
     nref = js_malloc(ctx, (size_t)n_values);
     drop = js_mallocz(ctx, (size_t)n);
@@ -79335,7 +79375,7 @@ static void regvm_fuse_const_operand(JSContext *ctx, JSRegIR *ir,
     unsigned char *drop = NULL;
     int *remap = NULL, *first = NULL;
 
-    if (n < 2 || n_values <= 0)
+    if (n < 2 || n_values <= 0 || !regvm_ir_has_rop(ir, ROP_binary, -1, -1))
         return;
     nref = js_malloc(ctx, (size_t)n_values);
     drop = js_mallocz(ctx, (size_t)n);
