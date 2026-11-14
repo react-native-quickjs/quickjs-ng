@@ -73870,7 +73870,7 @@ static void regvm_fuse_branches(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
 
             /* the compare's result must be this branch's only reader */
             if (d < 0 || d >= n_values || nref[d] != 2 ||
-                prev->ops[0] != d)
+                prev->n_ops < 2 || prev->ops[0] != d)
                 continue;
             sub = prev->ops[1];
             if (sub < 0 || sub > 0x3f)
