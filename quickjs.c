@@ -64662,6 +64662,12 @@ static void js_aot_unbind(JSFunctionBytecode *b)
 {
     if (b->aot_index == UINT32_MAX)
         return;
+    /* A compiled body that identified a callee by its bound entry (a method table's entry pointer) trusts
+       it until the cache epoch moves, so dropping the binding moves it. */
+    if (b->aot_fn != NULL) {
+        b->realm->rt->aot_epoch_bumps++;
+        b->realm->rt->aot_pic_epoch++;
+    }
     b->aot_fn = NULL;
     b->aot_nfn = NULL;
     b->regvm_call_ready = b->aot_call_ready;
@@ -64792,6 +64798,10 @@ static void js_aot_bind(JSFunctionBytecode *b)
 
     if (b->aot_fn != NULL && b->aot_index != UINT32_MAX && b->realm->rt->aot_bound != NULL)
         b->realm->rt->aot_bound[b->aot_index] = 0;
+    if (b->aot_fn != NULL) {
+        b->realm->rt->aot_epoch_bumps++;
+        b->realm->rt->aot_pic_epoch++;
+    }
     b->aot_fn = NULL;
     b->aot_nfn = NULL;
     b->aot_index = UINT32_MAX;
