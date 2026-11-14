@@ -4659,7 +4659,11 @@ void qjs_y_note_slow(void *p) {
           y_roots[y_roots_n++] = p; y_roots_cap = y_roots_n; return; }
     }
     y_roots_cap = y_roots_cap ? y_roots_cap * 2 : 65536; y_roots = __builtin_realloc(y_roots, (size_t)y_roots_cap * sizeof(void *)); y_roots[y_roots_n++] = p; }
-int qjs_y_force, qjs_y_gate = 1;
+/* Whether reconciles are paced by allocation pressure alone, because compiled code allocates (nursery cells never reach the zero-count table, and
+   the scan form leaves the deaths to the reconcile). It is on when a unit is linked in, so an interpreter-only run keeps the count-paced
+   reconcile; QJS_Y_GATE=0/1 in the environment fixes it either way. */
+int qjs_y_force, qjs_y_gate = 0;
+static int y_gate_fixed;
 static uint64_t y_cyc[8], y_cnt[16], y_pinr, y_pinv;
 uint64_t qjs_y_ep48 = (uint64_t)1 << 48; static uint32_t y_epoch = 1;
 static uint64_t ss_stat[8];
@@ -4675,11 +4679,32 @@ static void y_vec_push(YChunk ***v, uint32_t *n, uint32_t *cap, YChunk *c) {
     if (*n >= *cap) { *cap = *cap ? *cap * 2 : 64; *v = __builtin_realloc(*v, (size_t)*cap * sizeof(void *)); }
     (*v)[(*n)++] = c;
 }
+/* A nursery pays only for cells that die before anything stores into them or a collection finds them reachable. Over each window of
+   allocations the cells that left the nursery as ordinary objects are counted; when (nearly) all of them did (a program that builds a
+   long-lived structure), the nursery hands out no chunk for a while, so compiled code allocates counted objects and the reconcile is
+   count-paced again. A refused request costs the caller one old-form allocation; the next window is measured afresh. */
+#define Y_WIN_CELLS 32768ull
+#define Y_PAUSE_REQS (1u << 20)
+static uint64_t y_win_a, y_win_p;
+static uint32_t y_pause;
 int qjs_y_refill(JSContext *ctx, unsigned idx, unsigned bsi, unsigned long long gcw)
 {
     YChunk *c;
     JSRuntime *rt = ctx->rt;
     YCls *k = &qjs_ycls[idx];
+    if (y_pause) {
+        if (--y_pause == 0 && !y_gate_fixed) qjs_y_gate = 1;
+        return 0;
+    }
+    if (y_cnt[1] + y_abytes - y_win_a >= Y_WIN_CELLS) {
+        uint64_t left = y_cnt[10] + y_cnt[2] - y_win_p, made = y_cnt[1] + y_abytes - y_win_a;
+        y_win_a = y_cnt[1] + y_abytes; y_win_p = y_cnt[10] + y_cnt[2];
+        if (left * 100 >= made * 98) {
+            y_pause = Y_PAUSE_REQS;
+            if (!y_gate_fixed) qjs_y_gate = 0;
+            return 0;
+        }
+    }
     y_rt = rt;
     if (!k->ready) {
         k->stride = arena_block_sizes[bsi];
@@ -4843,7 +4868,14 @@ __attribute__((constructor)) static void js_drc_repark_init(void)
     if (getenv("QJS_BLKCACHE_MAX")) js_blk_cache_max = (uint32_t)atoi(getenv("QJS_BLKCACHE_MAX"));
     if (getenv("QJS_NOFREESTACK")) js_free_stack_on = 0;
     if (getenv("QJS_NEVERFREE")) js_neverfree = 1;
-    if (getenv("QJS_Y_GATE")) qjs_y_gate = atoi(getenv("QJS_Y_GATE"));
+#if QJS_AOT
+    {
+        extern const uint32_t qjs_aot_count __attribute__((weak));
+        if (&qjs_aot_count != NULL && qjs_aot_count > 0 && !y_gate_fixed)
+            qjs_y_gate = 1;
+    }
+#endif
+    if (getenv("QJS_Y_GATE")) { qjs_y_gate = atoi(getenv("QJS_Y_GATE")); y_gate_fixed = 1; }
     if (getenv("QJS_DRC_MINLIM")) js_drc_minlim = (uint32_t)atoi(getenv("QJS_DRC_MINLIM"));
     if (getenv("QJS_DRC_SLACK_MB")) js_drc_slack_min = (size_t)atoi(getenv("QJS_DRC_SLACK_MB")) << 20;
 }
