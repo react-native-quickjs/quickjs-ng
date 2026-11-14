@@ -103,10 +103,12 @@ static uint8_t *REGVM_CC regvm_s_ROP_add_imm_self_branch(uint8_t *ip, JSValue *f
 
                     if (likely(!__builtin_add_overflow(JS_VALUE_GET_INT(v), imm, &sum))) {
                         regs[d] = js_int32((int32_t)sum);
+                        REGVM_MONO_BACKEDGE(off);
                         rpc += off;
                         REGVM_NEXT();
                     }
                     regs[d] = js_float64((double)((int64_t)JS_VALUE_GET_INT(v) + imm));
+                    REGVM_MONO_BACKEDGE(off);
                     rpc += off;
                     REGVM_NEXT();
                 }
@@ -114,6 +116,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_add_imm_self_branch(uint8_t *ip, JSValue *f
                     js_regvm_binary(ctx, REG_BIN_ADD, v, js_int32(imm), &out))
                     goto exception;
                 SET_REG_P(d, out);
+                REGVM_MONO_BACKEDGE(off);
                 rpc += off;
                 REGVM_NEXT();
             }
@@ -144,10 +147,12 @@ static uint8_t *REGVM_CC regvm_s_ROP_add_imm_self_branch_s(uint8_t *ip, JSValue 
 
                     if (likely(!__builtin_add_overflow(JS_VALUE_GET_INT(v), imm, &sum))) {
                         regs[d] = js_int32((int32_t)sum);
+                        REGVM_MONO_BACKEDGE(off);
                         rpc += off;
                         REGVM_NEXT();
                     }
                     regs[d] = js_float64((double)((int64_t)JS_VALUE_GET_INT(v) + imm));
+                    REGVM_MONO_BACKEDGE(off);
                     rpc += off;
                     REGVM_NEXT();
                 }
@@ -155,6 +160,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_add_imm_self_branch_s(uint8_t *ip, JSValue 
                     js_regvm_binary(ctx, REG_BIN_ADD, v, js_int32(imm), &out))
                     goto exception;
                 SET_REG_P(d, out);
+                REGVM_MONO_BACKEDGE(off);
                 rpc += off;
                 REGVM_NEXT();
             }
@@ -660,7 +666,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_branch(uint8_t *ip, JSValue *fr, JSRegRun *
     JSValue *regs = fr;
     (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
 
-                { int32_t off = RD_I32(); rpc += off;; REGVM_NEXT(); }
+                { int32_t off = RD_I32(); REGVM_MONO_BACKEDGE(off); rpc += off;; REGVM_NEXT(); }
  exception:
     rf->ret = JS_EXCEPTION;
     return NULL;
@@ -834,7 +840,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_branch_if(uint8_t *ip, JSValue *fr, JSRegRu
     (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
 
                 { int c = RD_REG(); int32_t off = RD_I32();
-                  if (regvm_to_bool(ctx, regs[c])) { rpc += off;; }
+                  if (regvm_to_bool(ctx, regs[c])) { REGVM_MONO_BACKEDGE(off); rpc += off;; }
                   REGVM_NEXT(); }
  exception:
     rf->ret = JS_EXCEPTION;
@@ -853,7 +859,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_branch_if_not(uint8_t *ip, JSValue *fr, JSR
     (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
 
                 { int c = RD_REG(); int32_t off = RD_I32();
-                  if (!regvm_to_bool(ctx, regs[c])) { rpc += off;; }
+                  if (!regvm_to_bool(ctx, regs[c])) { REGVM_MONO_BACKEDGE(off); rpc += off;; }
                   REGVM_NEXT(); }
             /*
              * Suspension. The frame stays in the state and the body is
@@ -1017,7 +1023,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_branch_s(uint8_t *ip, JSValue *fr, JSRegRun
     JSValue *regs = fr;
     (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs;
 
-                { int32_t off = RD_OFF8(); rpc += off;; REGVM_NEXT(); }
+                { int32_t off = RD_OFF8(); REGVM_MONO_BACKEDGE(off); rpc += off;; REGVM_NEXT(); }
  exception:
     rf->ret = JS_EXCEPTION;
     return NULL;
@@ -1794,6 +1800,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_finally_enter(uint8_t *ip, JSValue *fr, JSR
                 rf->ctl[rf->nctl].reg = -1;
                 rf->ctl[rf->nctl].pc = (uint32_t)(rpc - b->regvm_code);
                 rf->nctl++;
+                REGVM_MONO_BACKEDGE(off);
                 rpc += off;
                 REGVM_NEXT();
             }
@@ -3080,6 +3087,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_local_rmw_branch(uint8_t *ip, JSValue *fr, 
                                               : iv != INT32_MIN) {
                               rf->var_buf[slot] = js_int32(u == REG_UN_INC ? iv + 1
                                                                        : iv - 1);
+                              REGVM_MONO_BACKEDGE(off);
                               rpc += off;; REGVM_NEXT();
                           }
                       }
@@ -3092,6 +3100,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_local_rmw_branch(uint8_t *ip, JSValue *fr, 
                       goto exception;
                   }
                   set_value(ctx, &rf->var_buf[slot], out);
+                  REGVM_MONO_BACKEDGE(off);
                   rpc += off;;
                   REGVM_NEXT(); }
  exception:
@@ -3150,7 +3159,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_local_rmw_imm(uint8_t *ip, JSValue *fr, JSR
                      guarantees. */ \
                   if (unlikely((unsigned)(sub - REG_BIN_IS_UNDEF) < 2)) { \
                       if ((JS_VALUE_GET_TAG(_a) == JS_TAG_UNDEFINED) \
-                              == (sub == REG_BIN_IS_UNDEF)) { rpc += off; REGVM_NEXT(); } \
+                              == (sub == REG_BIN_IS_UNDEF)) { REGVM_MONO_BACKEDGE(off); rpc += off; REGVM_NEXT(); } \
                       REGVM_NEXT(); \
                   } \
                   if (likely(JS_VALUE_IS_BOTH_INT(_a, _b) && \
@@ -3169,7 +3178,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_local_rmw_imm(uint8_t *ip, JSValue *fr, JSR
                       if (unlikely(take < 0)) \
                           goto exception; \
                   } \
-                  if (take) { rpc += off; REGVM_NEXT(); } \
+                  if (take) { REGVM_MONO_BACKEDGE(off); rpc += off; REGVM_NEXT(); } \
                   REGVM_NEXT(); \
               } while (0)
  exception:
@@ -5187,6 +5196,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_with_get(uint8_t *ip, JSValue *fr, JSRegRun
                     if (unlikely(JS_IsException(val)))
                         goto exception;
                     SET_REG_P(d, val);
+                    REGVM_MONO_BACKEDGE(off);
                     rpc += off;
                 }
                 REGVM_NEXT();
@@ -5239,6 +5249,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_with_make_ref(uint8_t *ip, JSValue *fr, JSR
                                                           : JS_UNDEFINED);
                     }
                     SET_REG_P(d1, val);
+                    REGVM_MONO_BACKEDGE(off);
                     rpc += off;
                 }
                 REGVM_NEXT();
@@ -5281,6 +5292,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_with_put(uint8_t *ip, JSValue *fr, JSRegRun
                     if (unlikely(JS_SetPropertyInternal(ctx, regs[o], atom, val,
                                                         JS_PROP_THROW_STRICT) < 0))
                         goto exception;
+                    REGVM_MONO_BACKEDGE(off);
                     rpc += off;
                 } else {
                     /* The fall-through result is another reference to value. */
