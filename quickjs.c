@@ -3388,14 +3388,9 @@ static __attribute__((noinline)) void js_trigger_gc_slow(JSRuntime *rt, size_t s
                 js_drc_reconcile(rt);
                 if (rt->malloc_state.malloc_size + size <=
                     rt->malloc_gc_threshold) {
-                    /* A reconcile is not a collection: it must not count as an unproductive one, or the threshold ratchets up by a factor of
-                       five each time the parked values are what grew the heap and cyclic garbage is never collected. */
+                    /* A reconcile is not a collection: the threshold stays where the last collection put it (its result plus the growth step).
+                       Moving it up with the heap, as every rearm did, made it follow the uncollected cyclic garbage and never be reached. */
                     gc_trig[1]++;
-                    {
-                        size_t step_ = rt->malloc_state.malloc_size >> 1;
-
-                        rt->malloc_gc_threshold = rt->malloc_state.malloc_size + (step_ < GC_MIN_STEP ? GC_MIN_STEP : step_);
-                    }
                     return;
                 }
             }
@@ -4282,7 +4277,7 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     rt->malloc_state = ms;
     rt->json_lazy_enabled = QJS_JSON_LAZY_DEFAULT;
     js_arena_init(rt);
-    rt->malloc_gc_threshold = 256 * 1024;
+    rt->malloc_gc_threshold = GC_MIN_STEP;
     rt->gc_pace_streak_cap = JS_GC_PACE_STREAK_DEFAULT;
     rt->gc_cyc_empty_streak = 0;
 
