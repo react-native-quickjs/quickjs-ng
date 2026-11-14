@@ -566,6 +566,13 @@ typedef enum JSRegOpcode {
        quickening; both alias the generic monolith label. */
     ROP_get_field_chain, ROP_get_field_chain_own,
 
+    /* Fused arithmetic: a `mul` followed by an `add`/`sub` consuming the
+       product as its left operand. Operands: the product's destination, x, y,
+       the add's destination, its other operand. */
+    ROP_mul_add, ROP_mul_sub,
+    /* the product as the right operand */
+    ROP_add_mul, ROP_sub_mul,
+
     ROP_COUNT
 } JSRegOpcode;
 
