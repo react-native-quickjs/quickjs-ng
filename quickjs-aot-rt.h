@@ -50,6 +50,27 @@ typedef struct JSAotGenLayout {
     uint32_t off_shape_property_flags_atom;
     uint32_t off_string_len_bits, off_string_strv;
     uint32_t off_jsvalue_tag, off_jsvalue_u;
+    /* The register-PIC entry the compiled named read tests inline, and the
+       ABI constants it compares against (the entry kind, the no-site marker and
+       the lazy-JSON tag). */
+    uint32_t sizeof_JSRegPIC;
+    uint32_t off_regpic_shape, off_regpic_slot_off, off_regpic_kind;
+    uint32_t reg_pic_own, reg_pic_proto, reg_ic_none, tag_lazy_json;
+    /* The binary sub-operations the inline arithmetic path names, from
+       JSRegBinaryOp. */
+    uint32_t reg_bin_add, reg_bin_sub, reg_bin_mul, reg_bin_div, reg_bin_mod;
+    uint32_t reg_bin_lt, reg_bin_lte, reg_bin_gt, reg_bin_gte;
+    uint32_t reg_bin_strict_eq, reg_bin_strict_neq;
+    uint32_t reg_bin_eq, reg_bin_neq;
+    uint32_t reg_cmp_invert, reg_bin_is_undef, reg_bin_is_not_undef;
+    /* The compiled named store's inline hit: the own-writable entry kind, and
+       the byte and mask of JSObject.is_prototype (a store to a prototype goes
+       to the engine, which invalidates the prototype epoch). */
+    uint32_t reg_pic_own_w;
+    uint32_t off_object_flags_byte, object_is_prototype_mask;
+    /* The unary sub-operations the inline unary path names, from
+       JSRegUnaryOp. */
+    uint32_t reg_un_neg, reg_un_inc;
 } JSAotGenLayout;
 
 /* Fold every field after `hash` (the hash field itself is excluded). Shared by
@@ -186,9 +207,34 @@ int qjs_aot_unary_num_fast(int sub, JSValue a, JSValue *out);
 int qjs_aot_own_read_hit(JSRegRun *f, const void *pic, JSValue recv, int site,
                          JSValue *out);
 
+/* The frame's PIC holder-shape array, for the inline hit the layout header
+   builds. */
+void *const *qjs_aot_pic_holder(JSRegRun *f);
+
+/* The miss path of a compiled named read: run the engine's cache-filling read
+   and fill this frame's PIC, so the next execution takes the inline hit. `ip`
+   is the instruction, whose quickened opcode is dropped back to the generic one
+   when the fill leaves the site without an own slot. 0 with an owned *out, -1
+   on exception. */
+QJS_AOT_STUB int qjs_aot_read_field_slow(JSContext *ctx, JSRegRun *f, uint8_t *ip,
+                                         JSValue recv, int atom, int site,
+                                         JSValue *out);
+
+/* The miss path of a compiled named store, as the interpreter's: the cached
+   add transition, else the engine's cache-filling write. `ip` is the
+   instruction, published for a setter's backtrace. 0 on success (the store
+   landed), -1 on exception. The value is borrowed. */
+QJS_AOT_STUB int qjs_aot_put_field_slow(JSContext *ctx, JSRegRun *f, uint8_t *ip,
+                                        JSValue recv, int atom, int site,
+                                        JSValue v);
+
 /* Mirror the int/float fast path of REGVM_CMP_BRANCH. Return 1 when the
    comparison is decided (*take), 0 when it needs the generic slow path. */
 int qjs_aot_branch_cmp(int sub, JSValue a, JSValue b, int *take);
+
+/* The generic slow half of a compare branch (REGVM_CMP_BRANCH's
+   regvm_cmp_take): the branch sense, or -1 on exception. */
+QJS_AOT_STUB int qjs_aot_cmp_take(JSContext *ctx, int sub, JSValue a, JSValue b);
 
 /* Mirror js_regvm_binary (the general binary op, exception-capable): 0 on
    success with an owned *out, -1 on exception. */
@@ -205,6 +251,11 @@ QJS_AOT_STUB void qjs_aot_put_local(JSContext *ctx, JSValue *vb, int slot, JSVal
    AOT_SET_B), 1 = owned *out (store with AOT_SET_P), -1 = exception. */
 QJS_AOT_STUB int qjs_aot_get_global_site(JSContext *ctx, JSRegRun *f, int site,
                                          int atom, int throwing, JSValue *out);
+
+/* The get_global handler's site-cache hit alone: 1 with a borrowed *out (store
+   with AOT_SET_B), 0 when the caller must take qjs_aot_get_global_site. Runs no
+   user code. */
+int qjs_aot_get_global_hit(JSContext *ctx, JSRegRun *f, int site, JSValue *out);
 
 /* Mirror the get_global cell-cache fast path then JS_GetGlobalVar: 0 on
    success with an owned *out, -1 on exception. */
@@ -248,10 +299,22 @@ QJS_AOT_STUB int qjs_aot_array_const(JSContext *ctx, JSRegRun *f, uint32_t idx,
 /* --- AOT typed-region helpers ----------------------------------------------
  *
  * A region carries a value as (double, isint) and boxes only at an exit or a
- * deopt. qjs_aot_fitsi is the shared int-fit rule.
+ * deopt. qjs_aot_fitsi is the shared int-fit rule. Both are static inline so a
+ * box in generated code is the test and the constructor, not a call across the
+ * unit boundary; the engine keeps its own out-of-line copies.
  */
-int qjs_aot_fitsi(double d);
-JSValue qjs_aot_box_num(double d, int isint);
+static inline int qjs_aot_fitsi(double d)
+{
+    return d >= -2147483648.0 && d <= 2147483647.0 &&
+           (double)(int32_t)d == d && !(d == 0.0 && signbit(d));
+}
+
+static inline JSValue qjs_aot_box_num(double d, int isint)
+{
+    if (isint)
+        return JS_MKVAL(JS_TAG_INT, (int32_t)d);
+    return __JS_NewFloat64(d);
+}
 int qjs_aot_to_num(JSValue v, double *out, int *isint);
 QJS_AOT_STUB int qjs_aot_dense(JSValue v, JSValue **data, uint32_t *len);
 QJS_AOT_STUB int qjs_aot_elem_num(JSValue *data, uint32_t i, double *out, int *isint);
