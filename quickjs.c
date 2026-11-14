@@ -1979,6 +1979,7 @@ typedef struct JSFunctionBytecode {
     /* The function is the constructor of a contracted layout (the unit says so at
        bind): creating its function object builds that layout's chain. */
     uint8_t aot_layout_ctor;
+    uint8_t aot_layout_tries;   /* attempts the layout hook has made for this bytecode while rows of its digest were still unbuilt (see js_aot_layout_fn_hook) */
 #endif
 } JSFunctionBytecode;
 
@@ -66181,6 +66182,7 @@ static void js_aot_bind(JSFunctionBytecode *b)
     b->aot_index = UINT32_MAX;
     b->aot_state = 2;           /* known-absent until a match is found */
     b->aot_layout_ctor = 0;
+    b->aot_layout_tries = 0;
     if (!aot_unit_present())
         return;
     if (!b->regvm_compiled || b->regvm_len <= 0 || b->is_lazy)
@@ -67015,16 +67017,28 @@ static void js_aot_layout_fn_hook(JSContext *ctx, JSValueConst fn)
     if (p->class_id != JS_CLASS_BYTECODE_FUNCTION)
         return;
     b = p->u.func.function_bytecode;
+    /* between attempts the flag counts constructs down (cheap: no digest) */
+    if (b->aot_layout_ctor > 1) {
+        b->aot_layout_ctor--;
+        return;
+    }
     js_aot_digest(b, dg);
     qjs_aot_layout_fn_created(ctx, fn, dg);
     /* The closure itself succeeded, so nothing may be left pending by the build: an
        allocation failure there refuses the layout and is dropped here. */
     if (unlikely(JS_HasException(ctx)))
         JS_FreeValue(ctx, JS_GetException(ctx));
-    /* One attempt per bytecode: the layout is built (or refused) from the first
-       constructor object that constructs, so the mark is dropped whatever the
-       answer and every later construct skips the hash. */
-    b->aot_layout_ctor = 0;
+    /* One attempt per bytecode, unless rows of its digest are still unbuilt: the rows of classes
+       made by one function (every Class.create class) are built by each class's constant path, and
+       a class defined after the first construct is not there yet. Retry after 250 constructs, at
+       most 16 times; a digest with nothing pending drops the mark as before, so every later
+       construct skips the hash. */
+    if (&qjs_aot_layout_ctor != NULL && b->aot_layout_tries < 16 && qjs_aot_layout_ctor(dg)) {
+        b->aot_layout_tries++;
+        b->aot_layout_ctor = 250;
+    } else {
+        b->aot_layout_ctor = 0;
+    }
 }
 
 /* The unit built layout `layout_id` on `proto`, which is `fn`'s own `prototype` right now.
