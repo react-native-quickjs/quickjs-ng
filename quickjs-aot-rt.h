@@ -129,6 +129,9 @@ typedef struct JSAotGenLayout {
        the allocator's block header, js_rc()), so a unit counts a reference
        inline instead of calling JS_DupValue. */
     uint32_t off_rc_back;
+    /* Where a closure cell keeps the pointer to its value, so a unit reads a
+       captured variable through the function object's cell vector inline. */
+    uint32_t off_varref_pvalue;
 } JSAotGenLayout;
 
 /* Fold every field after `hash` (the hash field itself is excluded). Shared by
