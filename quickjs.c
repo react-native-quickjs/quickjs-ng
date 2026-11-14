@@ -26290,7 +26290,9 @@ static uint8_t *REGVM_CC regvm_t_call_method_record(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_call_lazy(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_call_method_lazy(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_construct_record(REGVM_ARGS);
+#if QJS_REGVM_RECORD
 static uint8_t *REGVM_CC regvm_t_construct_light(REGVM_ARGS);
+#endif
 static uint8_t *REGVM_CC regvm_t_apply_arguments_record(REGVM_ARGS);
 static JSFunctionBytecode *js_new_target_bytecode(JSValueConst new_target);
 static void js_learn_instance_cap(JSFunctionBytecode *nb, JSValueConst inst);
@@ -28471,6 +28473,7 @@ static uint8_t *REGVM_CC regvm_t_binary_cpool(REGVM_ARGS)
     T_SET_NEXT_P(d, out, 11);
 }
 
+#if QJS_REGVM_RECORD
 static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_construct_light(REGVM_ARGS)
 {
     int c = T_REG(3), ab = T_REG(7);
@@ -28508,6 +28511,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_construct_light(REGVM
     __attribute__((musttail))
         return regvm_t_dispatch(cb->regvm_code, regs, nf, cb->realm);
 }
+#endif /* QJS_REGVM_RECORD */
 
 static uint8_t *REGVM_CC regvm_t_construct(REGVM_ARGS)
 {
