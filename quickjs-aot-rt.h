@@ -38,6 +38,20 @@ typedef struct JSRegRun JSRegRun;
    runtime re-derives the hash at bind. A layout change therefore invalidates an
    old unit instead of corrupting it. All fields are uint32 so the hash is a
    well-defined word fold, and it covers every field after `hash` itself. */
+/* The activation record a frameless function that makes calls leaves on `rt->aot_fl_top`
+   while it runs. Such a function has no JSRegRun, so without this its frame would be
+   missing from the backtrace of an error a callee creates. `pc` is the bytecode offset
+   of the call in progress. `roots` and `nroots` publish the argument window of the call in
+   progress as a root range, because the function has no register file the collector
+   scans. Records live on the C stack and are linked innermost-first. */
+typedef struct JSAotFlRec {
+    struct JSAotFlRec *prev;
+    JSObject *func;
+    uint32_t pc;
+    uint32_t nroots;
+    JSValue *roots;
+} JSAotFlRec;
+
 typedef struct JSAotGenLayout {
     uint32_t hash;
     uint32_t sizeof_JSObject, sizeof_JSShape, sizeof_JSProperty, sizeof_JSString;
@@ -119,7 +133,7 @@ typedef struct JSAotGenLayout {
     uint32_t off_regrun_ret_ip, off_regrun_fr, off_regrun_var_refs;
     uint32_t off_regrun_hdr_pack, off_regrun_cap_ip;
     uint32_t off_fnbc_realm;
-    uint32_t off_rt_regvm_cur, off_rt_stack_limit;
+    uint32_t off_rt_regvm_cur, off_rt_stack_limit, off_rt_fl_top;
     uint32_t off_object_func_var_refs;
     uint32_t light_prefix_slots;
     /* The frame flags a generated native entry composes, from REGVM_FLAG_*. */
