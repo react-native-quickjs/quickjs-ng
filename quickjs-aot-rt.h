@@ -73,6 +73,7 @@ typedef struct JSAotGenLayout {
        count, and the bit word that records a broken contract. */
     uint32_t off_shape_layout_id;
     uint32_t off_rt_layout_broken, off_rt_layout_shape, off_rt_layout_count;
+    uint32_t off_rt_htmldda;
     uint32_t off_string_len_bits, off_string_strv;
     uint32_t off_jsvalue_tag, off_jsvalue_u;
     /* The register-PIC entry the compiled named read tests inline, and the
