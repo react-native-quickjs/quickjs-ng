@@ -125,6 +125,13 @@ typedef struct JSRegRopInfo {
     uint8_t rmask;   /* bit k: operand k is a register ('r') */
     uint8_t narrow;  /* regvm_rop_narrow */
     int8_t tidx;     /* index of the last branch-target operand ('t'), or -1 */
+    uint8_t flen;    /* operand count of the format */
+    int8_t di;       /* regvm_own_dest_index */
+    int8_t di2;      /* regvm_own_second_dest_index */
+    int8_t dst;      /* di when it names a register destination (regvm_own_has_dest and 'r'), else -1 */
+    int8_t dst2;     /* di2 when dst >= 0, else -1 */
+    uint8_t rd_own;  /* register operands other than di and di2: the reads the ownership report checks */
+    uint8_t rd_arg;  /* register operands other than dst and dst2: the reads the argument index counts */
 } JSRegRopInfo;
 static void js_regvm_rop_info_init(JSRegRopInfo *ri);
 #endif
@@ -68034,6 +68041,10 @@ static int regvm_fmt_size(const char *fmt, int wide, uint16_t rop)
     return n;
 }
 
+static int regvm_own_has_dest(uint16_t rop);
+static int regvm_own_dest_index(uint16_t rop);
+static int regvm_own_second_dest_index(uint16_t rop);
+
 static void js_regvm_rop_info_init(JSRegRopInfo *ri)
 {
     int op, k;
@@ -68054,6 +68065,25 @@ static void js_regvm_rop_info_init(JSRegRopInfo *ri)
             if (fmt[k] == 't')
                 ri[op].tidx = (int8_t)k;
         }
+        ri[op].flen = (uint8_t)k;
+        ri[op].di = (int8_t)regvm_own_dest_index((uint16_t)op);
+        ri[op].di2 = (int8_t)regvm_own_second_dest_index((uint16_t)op);
+        ri[op].dst = -1;
+        ri[op].dst2 = -1;
+        if (fmt && regvm_own_has_dest((uint16_t)op) && fmt[ri[op].di] == 'r') {
+            ri[op].dst = ri[op].di;
+            ri[op].dst2 = ri[op].di2;
+        }
+        ri[op].rd_own = ri[op].rmask;
+        ri[op].rd_arg = ri[op].rmask;
+        if (ri[op].di >= 0)
+            ri[op].rd_own &= (uint8_t)~(1u << ri[op].di);
+        if (ri[op].di2 >= 0)
+            ri[op].rd_own &= (uint8_t)~(1u << ri[op].di2);
+        if (ri[op].dst >= 0)
+            ri[op].rd_arg &= (uint8_t)~(1u << ri[op].dst);
+        if (ri[op].dst2 >= 0)
+            ri[op].rd_arg &= (uint8_t)~(1u << ri[op].dst2);
     }
 }
 
@@ -76457,27 +76487,22 @@ static void regvm_arg_index_sync(JSRegIR *ir)
         return;
     for (i = ir->aw_scanned; i < ir->n_insns; i++) {
         const JSRegInsn *in = &ir->insns[i];
-        const char *fmt = regvm_rop_fmt[in->rop];
-        int di, di2, k;
-        if (!fmt)
+        const JSRegRopInfo *oi = &ir->ri[in->rop];
+        int k, nk = in->n_ops < oi->flen ? in->n_ops : oi->flen;
+        unsigned m;
+        if (!regvm_rop_fmt[in->rop])
             continue;
-        di = regvm_own_dest_index(in->rop);
-        if (!regvm_own_has_dest(in->rop) || fmt[di] != 'r')
-            di = -1;
-        di2 = di >= 0 ? regvm_own_second_dest_index(in->rop) : -1;
-        for (k = 0; k < in->n_ops && fmt[k]; k++) {
-            int r = in->ops[k];
-            if (fmt[k] != 'r' || k == di || (di2 >= 0 && k == di2))
-                continue;
+        for (m = oi->rd_arg & ((1u << nk) - 1); m; m &= m - 1) {
+            int r = in->ops[__builtin_ctz(m)];
             if (r >= 0 && r < ir->aw_n)
                 ir->aw_reads[r]++;
         }
-        if (di >= 0) {
-            int d = in->ops[di];
+        if (oi->dst >= 0) {
+            int d = in->ops[oi->dst];
             if (d >= 0 && d < ir->aw_n)
                 ir->aw_def[d] = i;
         }
-        for (k = 0; k < in->n_ops && fmt[k]; k++)
+        for (k = 0; k < nk; k++)
             if (in->ops[k] <= REGVM_WIN(0))
                 ir->aw_last_win = i;
     }
@@ -80876,16 +80901,16 @@ static int regvm_own_second_dest_index(uint16_t rop)
     }
 }
 
-static void regvm_own_step(const JSRegInsn *in, uint8_t *st, const int *ireg,
+static void regvm_own_step(const JSRegRopInfo *ri, const JSRegInsn *in,
+                           uint8_t *st, const int *ireg,
                            int n_values, int reg_count, int cycle_reg, int weak)
 {
     uint16_t rop = in->rop;
-    const char *f = regvm_rop_fmt[rop];
-    int di = regvm_own_dest_index(rop);
+    int di = ri[rop].dst;
     int d, s = -1;
     (void)weak;   /* unused: every update here is strong */
 
-    if (regvm_own_has_dest(rop) && f && f[di] == 'r') {
+    if (di >= 0) {
         d = regvm_own_op_reg(in, di, ireg, n_values, reg_count, cycle_reg);
         if (d >= 0) {
             uint8_t cls;
@@ -80901,7 +80926,7 @@ static void regvm_own_step(const JSRegInsn *in, uint8_t *st, const int *ireg,
             if (rop == ROP_move_xfer && s >= 0 && s != d)
                 st[s] = regvm_own_join(st[s], REG_OWN_NONE);
         }
-        di = regvm_own_second_dest_index(rop);
+        di = ri[rop].dst2;
         if (di >= 0) {
             d = regvm_own_op_reg(in, di, ireg, n_values, reg_count, cycle_reg);
             if (d >= 0)
@@ -80926,21 +80951,21 @@ static void regvm_own_step(const JSRegInsn *in, uint8_t *st, const int *ireg,
 
 /* The init transfer: a definition marks its destination written. The `*_xfer`
    stores write a slot, not a register. */
-static void regvm_own_init_step(const JSRegInsn *in, uint8_t *st,
+static void regvm_own_init_step(const JSRegRopInfo *ri, const JSRegInsn *in,
+                                uint8_t *st,
                                 const int *ireg, int n_values, int reg_count,
                                 int cycle_reg, int weak)
 {
     uint16_t rop = in->rop;
-    const char *f = regvm_rop_fmt[rop];
-    int di = regvm_own_dest_index(rop);
+    int di = ri[rop].dst;
     int d;
 
-    if (!(regvm_own_has_dest(rop) && f && f[di] == 'r'))
+    if (di < 0)
         return;
     d = regvm_own_op_reg(in, di, ireg, n_values, reg_count, cycle_reg);
     if (d >= 0)
         st[d] = weak ? (uint8_t)(st[d] & REG_INIT_INIT) : REG_INIT_INIT;
-    di = regvm_own_second_dest_index(rop);
+    di = ri[rop].dst2;
     if (di >= 0) {
         d = regvm_own_op_reg(in, di, ireg, n_values, reg_count, cycle_reg);
         if (d >= 0)
@@ -81033,15 +81058,14 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
     memset(has_def, 0, (size_t)(n_values > 0 ? n_values : 1));
     for (i = 0; i < n; i++) {
         const JSRegInsn *in = &ir->insns[i];
-        const char *f = regvm_rop_fmt[in->rop];
-        int di = regvm_own_dest_index(in->rop);
+        int di = ir->ri[in->rop].dst;
         int v;
-        if (regvm_own_has_dest(in->rop) && f && f[di] == 'r') {
+        if (di >= 0) {
             v = in->ops[di];
             if (v >= 0 && v < n_values)
                 has_def[v] = 1;
         }
-        di = regvm_own_second_dest_index(in->rop);
+        di = ir->ri[in->rop].di2;
         if (di >= 0) {
             v = in->ops[di];
             if (v >= 0 && v < n_values)
@@ -81226,9 +81250,9 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
         memcpy(init_i, in_i, nreg);
         for (j = boff[b]; j < boff[b + 1]; j++) {
             i = bl[j];
-            regvm_own_step(&ir->insns[i], tmp, ireg, n_values, reg_count,
+            regvm_own_step(ir->ri, &ir->insns[i], tmp, ireg, n_values, reg_count,
                            cycle_reg, weak[b]);
-            regvm_own_init_step(&ir->insns[i], init_i, ireg, n_values, reg_count,
+            regvm_own_init_step(ir->ri, &ir->insns[i], init_i, ireg, n_values, reg_count,
                                 cycle_reg, weak[b]);
         }
         {
@@ -81301,28 +81325,20 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
                 /* An operand read: a register that may be UNINIT here must be
                    filled at entry. */
                 {
-                    const char *ff = regvm_rop_fmt[rop];
-                    int di_ = regvm_own_dest_index(rop);
-                    int di2_ = regvm_own_second_dest_index(rop);
-                    if (ff) {
-                        for (k = 0; ff[k]; k++) {
-                            int r;
-                            if (ff[k] != 'r' || k == di_ || k == di2_)
-                                continue;
-                            r = regvm_own_op_reg(in, k, ireg, n_values, reg_count,
-                                                 cycle_reg);
-                            if (r >= 0 && init_st[r] == REG_INIT_UNINIT) {
-                                init_set[r] = REG_INIT_INIT;
-                                undef_set[r] = REG_INIT_INIT;
-                            }
+                    unsigned m;
+                    for (m = ir->ri[rop].rd_own; m; m &= m - 1) {
+                        int r = regvm_own_op_reg(in, __builtin_ctz(m), ireg,
+                                                 n_values, reg_count, cycle_reg);
+                        if (r >= 0 && init_st[r] == REG_INIT_UNINIT) {
+                            init_set[r] = REG_INIT_INIT;
+                            undef_set[r] = REG_INIT_INIT;
                         }
                     }
                 }
-                if (regvm_own_has_dest(rop) && regvm_rop_fmt[rop] &&
-                    regvm_rop_fmt[rop][regvm_own_dest_index(rop)] == 'r') {
-                    int d = regvm_own_op_reg(in, regvm_own_dest_index(rop), ireg,
+                if (ir->ri[rop].dst >= 0) {
+                    int d = regvm_own_op_reg(in, ir->ri[rop].dst, ireg,
                                              n_values, reg_count, cycle_reg);
-                    int di2 = regvm_own_second_dest_index(rop);
+                    int di2 = ir->ri[rop].dst2;
                     int d2 = di2 >= 0 ? regvm_own_op_reg(in, di2, ireg, n_values,
                                                          reg_count, cycle_reg)
                                       : -1;
@@ -81349,9 +81365,9 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
                         if (init_st[k] == REG_INIT_UNINIT)
                             init_set[k] = REG_INIT_INIT;
                 }
-                regvm_own_step(in, st, ireg, n_values, reg_count, cycle_reg,
+                regvm_own_step(ir->ri, in, st, ireg, n_values, reg_count, cycle_reg,
                                weak[b]);
-                regvm_own_init_step(in, init_st, ireg, n_values, reg_count,
+                regvm_own_init_step(ir->ri, in, init_st, ireg, n_values, reg_count,
                                     cycle_reg, weak[b]);
             }
         }
