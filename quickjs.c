@@ -1995,6 +1995,8 @@ static inline void js_aot_prof_store_packed(JSFunctionBytecode *b, JSObject *o)
 }
 static void js_aot_prof_call(JSContext *ctx, JSFunctionBytecode *b, uint32_t pc,
                              JSValue fn, int argc);
+static void js_aot_prof_call_this(JSContext *ctx, JSFunctionBytecode *b, uint32_t pc,
+                                  JSValue fn, JSValue thisv, int argc);
 static void js_aot_prof_call_result(JSFunctionBytecode *b, uint8_t *rip,
                                     JSValue v);
 #if QJS_REGVM_THREAD
@@ -2034,6 +2036,10 @@ void js_aot_prof_sample(JSRuntime *rt, JSFunctionBytecode *b, int pc);
 #define AOT_PROF_CALL(c_, b_, pc_, fn_, na_) \
         do { if (unlikely(AOT_PROF_ON(b_))) \
                  js_aot_prof_call((c_), (b_), (pc_), (fn_), (na_)); } while (0)
+/* A method call: also records what `f.call(...)` is applied to, see js_aot_prof_call_this. */
+#define AOT_PROF_CALLM(c_, b_, pc_, fn_, this_, na_) \
+        do { if (unlikely(AOT_PROF_ON(b_))) \
+                 js_aot_prof_call_this((c_), (b_), (pc_), (fn_), (this_), (na_)); } while (0)
 /* A bytecode callee returned `v_` into frame `c_` (a regvm frame) resuming at
    `rip_`: record it against the call site that ends there. */
 #define AOT_PROF_CALL_RESULT(c_, rip_, v_) \
@@ -2063,6 +2069,7 @@ void js_aot_prof_sample(JSRuntime *rt, JSFunctionBytecode *b, int pc);
 #define AOT_PROF_PIC(b_, s_, sh_, k_, sl_) ((void)0)
 #define AOT_PROF_REG(b_, d_, v_)    ((void)0)
 #define AOT_PROF_CALL(c_, b_, pc_, fn_, na_) ((void)0)
+#define AOT_PROF_CALLM(c_, b_, pc_, fn_, this_, na_) ((void)0)
 #define AOT_PROF_CALL_RESULT(c_, rip_, v_) ((void)0)
 #define AOT_PROF_TICK(f_, ip_)      ((void)0)
 #define AOT_PROF_EDGE(f_, ip_, off_) ((void)0)
@@ -2831,6 +2838,8 @@ static JSValue js_array_pop(JSContext *ctx, JSValueConst this_val,
                             int argc, JSValueConst *argv, int shift);
 static JSValue js_array_constructor(JSContext *ctx, JSValueConst new_target,
                                     int argc, JSValueConst *argv);
+static JSValue js_function_call(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv);
 static JSValue js_error_constructor(JSContext *ctx, JSValueConst new_target,
                                     int argc, JSValueConst *argv, int magic);
 static JSValue js_object_defineProperty(JSContext *ctx, JSValueConst this_val,
@@ -29757,7 +29766,7 @@ static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS)
     int c = T_REG(3);
     JSValue cf = FR(c);
 
-    AOT_PROF_CALL(ctx, f->b, (uint32_t)(ip - f->b->regvm_code) + 10, cf, T_U8(9));
+    AOT_PROF_CALLM(ctx, f->b, (uint32_t)(ip - f->b->regvm_code) + 10, cf, FR(T_REG(5)), T_U8(9));
     /* Pure classify-and-jump; the lazy materialize is in
        `regvm_t_call_method_lazy`. */
     if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
@@ -37624,7 +37633,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 int na = RD_U8();
                 /* `oargv`: `argv` is the activation's own argument vector. */
                 JSValue *oargv = &regs[ab];
-                AOT_PROF_CALL(ctx, b, (uint32_t)(rpc - b->regvm_code), regs[c], na);
+                AOT_PROF_CALLM(ctx, b, (uint32_t)(rpc - b->regvm_code), regs[c], regs[r], na);
 #ifdef QJS_REGVM_COUNT
                 js_regvm_argmoves += (uint64_t)na;
 #endif
@@ -63883,6 +63892,38 @@ static void js_aot_prof_call(JSContext *ctx, JSFunctionBytecode *b, uint32_t pc,
         ce->hits++;
 }
 
+/* A call_method site whose callee is Function.prototype.call applied to a bytecode function X (`X.call(thisArg, ...)`): X is recorded as a
+   callee of kind 4, beside the builtin itself (kind 2), so the compiled caller can call X directly. */
+static void js_aot_prof_call_this(JSContext *ctx, JSFunctionBytecode *b, uint32_t pc,
+                                  JSValue fn, JSValue thisv, int argc)
+{
+    js_aot_prof_call(ctx, b, pc, fn, argc);
+    if (JS_VALUE_GET_TAG(fn) == JS_TAG_OBJECT && JS_VALUE_GET_TAG(thisv) == JS_TAG_OBJECT) {
+        JSObject *o = JS_VALUE_GET_OBJ(fn), *x = JS_VALUE_GET_OBJ(thisv);
+        if (o->class_id == JS_CLASS_C_FUNCTION && o->u.cfunc.c_function.generic == js_function_call &&
+            x->class_id == JS_CLASS_BYTECODE_FUNCTION) {
+            JSAotProfFunc *pf = js_aot_prof_ensure(ctx->rt, b);
+            JSAotProfCall *c = pf ? aot_call_slot(ctx->rt, pf, pc) : NULL;
+            uint8_t digest[16];
+            int i;
+            if (!c)
+                return;
+            js_aot_digest(x->u.func.function_bytecode, digest);
+            for (i = 0; i < c->ncallee; i++)
+                if (c->callee[i].kind == 4 && memcmp(c->callee[i].digest, digest, 16) == 0)
+                    break;
+            if (i == c->ncallee && c->ncallee < 4) {
+                memset(&c->callee[i], 0, sizeof(c->callee[i]));
+                c->callee[i].kind = 4;
+                memcpy(c->callee[i].digest, digest, 16);
+                c->ncallee++;
+            }
+            if (i < c->ncallee)
+                c->callee[i].hits++;
+        }
+    }
+}
+
 /* Record a returned value against the call site that ends at `rip`. Find only:
    a return into a frame whose resume address is not a profiled call site
    (a getter, a callback) records nothing. */
@@ -64390,6 +64431,10 @@ static void aot_dump_one(FILE *f, JSRuntime *rt, JSFunctionBytecode *b)
                 const char *sn = aot_sym_name(rt, ce->cfn, sbuf, sizeof(sbuf));
                 fprintf(f, "callee=c:%s:fn=%p:magic=%d:cproto=%u",
                         sn ? sn : "?", ce->cfn, ce->magic, ce->cproto);
+            } else if (ce->kind == 4) {
+                char cd[33];
+                aot_digest_hex(ce->digest, cd);
+                fprintf(f, "callee=thru:%s", cd);
             } else {
                 fprintf(f, "callee=other");
             }
@@ -65342,6 +65387,13 @@ QJS_AOT_STUB int qjs_aot_shape_method(const void *shape, uint32_t atom, JSValue 
 QJS_AOT_STUB const void *qjs_aot_function_apply_fn(void)
 {
     return (const void *)js_function_apply;
+}
+
+/* The function pointer of the builtin `Function.prototype.call`, which a C function object holds with cproto generic: a unit that
+   calls `X.call(thisArg, ...)` as a direct call of X compares the callee it would bypass against this. */
+QJS_AOT_STUB const void *qjs_aot_function_call_fn(void)
+{
+    return (const void *)js_function_call;
 }
 
 /* A contracted layout's shape, from the unit's side: the unit cannot name JSShape

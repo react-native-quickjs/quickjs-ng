@@ -236,6 +236,8 @@ QJS_AOT_STUB int qjs_aot_shape_method(const void *shape, uint32_t atom, JSValue 
    `f.apply(this, arguments)` compares the `apply` it would bypass against this, so a program that
    replaced `apply` keeps its own. */
 QJS_AOT_STUB const void *qjs_aot_function_apply_fn(void);
+/* the function pointer of the builtin `Function.prototype.call` (cproto generic), to recognise the callee of `X.call(thisArg, ...)` */
+QJS_AOT_STUB const void *qjs_aot_function_call_fn(void);
 /* Whether reading `fn.apply` would return the builtin `Function.prototype.apply`: the property
    is found by walking the function's own properties and then its prototypes, every object on the
    way must be a plain ordinary object, and the property must be a plain data property whose value
