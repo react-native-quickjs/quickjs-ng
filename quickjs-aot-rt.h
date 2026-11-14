@@ -450,6 +450,7 @@ int qjs_aot_strproto_slot(JSContext *ctx, uint32_t atom, const void **shape,
 /* 1 when every typed-array class reads `length` from the builtin accessor (no class
    prototype shadows it); revalidates after a watched change. */
 int qjs_aot_ta_len_valid(JSContext *ctx);
+int qjs_aot_instanceof(JSContext *ctx, JSValue a, JSValue b);
 /* Stores a number into an in-range element of a typed array; 0 when the case is not that. */
 int qjs_aot_typed_put(JSValue recv, uint32_t idx, JSValue v);
 /* `f.apply(this, arguments)`: with the builtin `apply` and this frame's arguments not
