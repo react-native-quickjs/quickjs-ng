@@ -214,6 +214,12 @@ QJS_AOT_STUB const void *qjs_aot_array_builtin_fn(int which);
    `f.apply(this, arguments)` compares the `apply` it would bypass against this, so a program that
    replaced `apply` keeps its own. */
 QJS_AOT_STUB const void *qjs_aot_function_apply_fn(void);
+/* Whether reading `fn.apply` would return the builtin `Function.prototype.apply`: the property
+   is found by walking the function's own properties and then its prototypes, every object on the
+   way must be a plain ordinary object, and the property must be a plain data property whose value
+   is the builtin. A getter is never run, nothing is allocated, and no reference is taken. A unit
+   that bypasses `f.apply(this, arguments)` asks this first and keeps the program's own call on 0. */
+QJS_AOT_STUB int qjs_aot_apply_is_builtin(JSValue fn);
 
 /* Fold every field after `hash` (the hash field itself is excluded). Shared by
    the generator and the runtime. */
