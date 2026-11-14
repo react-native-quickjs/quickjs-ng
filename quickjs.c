@@ -32483,8 +32483,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             return JS_EXCEPTION;
     }
 
+    /* Under DRC the caller's argv may be borrowed registers. A var_ref onto a
+       parameter slot frees the old value on write, so such a callee must own
+       copies, as in regvm_args_borrowable. */
     if (unlikely(argc < b->arg_count ||
-                 ((flags & JS_CALL_FLAG_COPY_ARGV) && !JS_ARGV_SAFE(b)))) {
+                 ((flags & JS_CALL_FLAG_COPY_ARGV) && !JS_ARGV_SAFE(b))
+#if QJS_REGVM && QJS_DRC
+                 || b->args_captured
+#endif
+                 )) {
         arg_allocated_size = b->arg_count;
     } else {
         arg_allocated_size = 0;
