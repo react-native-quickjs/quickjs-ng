@@ -23661,6 +23661,114 @@ static inline __attribute__((always_inline)) __exception int js_regvm_binary(JSC
     return -1;
 }
 
+/*
+ * The in-place string accumulator: `s += x`, where the add's destination is
+ * also its left operand. Appends in place when the register provably holds
+ * the only reference.
+ *
+ * Under deferred RC a register-only string has ref_count 0 and is parked,
+ * while a slot-owned one has a count; register aliases are invisible either
+ * way. So the test is the count plus a scan of the register file and the
+ * argument window, the only places a borrowed value can be.
+ *
+ * Returns 1 when appended (fr[a] names the result), 0 for the generic add,
+ * -1 with an exception set. The right operand is borrowed. d and a are
+ * register indices, not the byte offsets the threaded decoder produces.
+ */
+static int regvm_accum_append(JSContext *ctx, JSFunctionBytecode *b,
+                              JSValue *fr, JSValue *arg_buf, int argc,
+                              int d, int a, JSValue op2)
+{
+#if QJS_DRC
+    JSString *p1, *p2;
+    uint32_t i, nregs, nlen, cap;
+    size_t need;
+    void *p1ptr;
+
+    if (d != a)
+        return 0;
+    if (JS_VALUE_GET_TAG(fr[a]) != JS_TAG_STRING ||
+        JS_VALUE_GET_TAG(op2) != JS_TAG_STRING)
+        return 0;
+    p1 = JS_VALUE_GET_STRING(fr[a]);
+    p2 = JS_VALUE_GET_STRING(op2);
+    if (p1->kind != JS_STRING_KIND_NORMAL || p1->atom_type != 0)
+        return 0;
+    /* No counted owner, and parked: a register-only value. */
+    if (JS_REF_COUNT(p1) != 0 || !JS_GC_IN_ZCT(p1))
+        return 0;
+    if (p1->is_wide_char != p2->is_wide_char)
+        return 0;
+    if (p2->len == 0)
+        return 0;
+    if ((uint64_t)p1->len + p2->len > JS_STRING_LEN_MAX)
+        return 0;
+    p1ptr = p1;
+    nregs = b->regvm_reg_count;
+    for (i = 0; i < nregs; i++) {
+        if (i == (uint32_t)a)
+            continue;
+        if (JS_VALUE_GET_TAG(fr[i]) == JS_TAG_STRING &&
+            JS_VALUE_GET_PTR(fr[i]) == p1ptr)
+            return 0;
+    }
+    if (arg_buf != NULL) {
+        for (i = 0; i < (uint32_t)argc; i++) {
+            if (JS_VALUE_GET_TAG(arg_buf[i]) == JS_TAG_STRING &&
+                JS_VALUE_GET_PTR(arg_buf[i]) == p1ptr)
+                return 0;
+        }
+    }
+    nlen = p1->len + p2->len;
+    need = sizeof(*p1) + ((size_t)nlen << p1->is_wide_char) + 1 -
+           p1->is_wide_char;
+    if (js_malloc_usable_size(ctx, p1) >= need) {
+        if (p1->is_wide_char) {
+            memcpy(str16(p1) + p1->len, str16(p2), (size_t)p2->len << 1);
+        } else {
+            memcpy(str8(p1) + p1->len, str8(p2), p2->len);
+            str8(p1)[nlen] = '\0';
+        }
+        p1->len = nlen;
+        return 1;
+    } else {
+        JSString *np;
+        JSValue nv;
+
+        cap = nlen;
+        if (nlen >= JS_STRING_ACCUM_MIN_GROW) {
+            uint32_t slack = nlen >> 1;
+            if (slack > JS_STRING_ACCUM_MAX_SLACK)
+                slack = JS_STRING_ACCUM_MAX_SLACK;
+            if (nlen <= JS_STRING_LEN_MAX - slack)
+                cap = nlen + slack;
+        }
+        np = js_alloc_string(ctx, cap, p1->is_wide_char);
+        if (unlikely(!np))
+            return -1;
+        if (p1->is_wide_char) {
+            memcpy(str16(np), str16(p1), (size_t)p1->len << 1);
+            memcpy(str16(np) + p1->len, str16(p2), (size_t)p2->len << 1);
+        } else {
+            memcpy(str8(np), str8(p1), p1->len);
+            memcpy(str8(np) + p1->len, str8(p2), p2->len);
+            str8(np)[nlen] = '\0';
+        }
+        np->len = nlen;
+        nv = JS_MKPTR(JS_TAG_STRING, np);
+        fr[a] = nv;
+        /* Adopt the producer's reference: the result is parked like any other
+           register value. */
+        REG_ADOPT(ctx->rt, nv);
+        return 1;
+    }
+#else
+    (void)ctx; (void)b; (void)fr; (void)arg_buf; (void)argc;
+    (void)d; (void)a; (void)op2;
+    return 0;
+#endif
+}
+
 static __exception int js_regvm_unary(JSContext *ctx, int subop, JSValue v,
                                       JSValue *out)
 {
@@ -24516,7 +24624,14 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_safepoint_slow(REGVM_
 /* the cold halves: decode the shape, run the engine's slow routine, continue */
 #define T_BODY_RRR(SUB_, SZ_) do { \
         int _d = T_REG(1); \
-        JSValue _o1 = FR(T_REG(3)), _o2 = FR(T_REG(5)), _out; \
+        int _a = T_REG(3); \
+        JSValue _o1 = FR(_a), _o2 = FR(T_REG(5)), _out; \
+        if ((SUB_) == REG_BIN_ADD) { \
+            int _ar = regvm_accum_append(ctx, f->b, fr, f->arg_buf, f->argc, \
+                                         _d >> 4, _a >> 4, _o2); \
+            if (_ar > 0) T_NEXT(SZ_); \
+            if (_ar < 0) T_FAIL(); \
+        } \
         if (js_regvm_binary(ctx, SUB_, _o1, _o2, &_out)) \
             T_FAIL(); \
         T_SET_NEXT_P(_d, _out, SZ_); \
@@ -26075,9 +26190,16 @@ static uint8_t *REGVM_CC regvm_t_binary_cpool(REGVM_ARGS)
     JSValue out;
 
     if (kind == REG_CONST_CPOOL) {
-        if (!regvm_num_fast(sub, FR(a), f->b->cpool[idx], &out) &&
-            js_regvm_binary(ctx, sub, FR(a), f->b->cpool[idx], &out))
-            T_FAIL();
+        if (!regvm_num_fast(sub, FR(a), f->b->cpool[idx], &out)) {
+            if (sub == REG_BIN_ADD) {
+                int ar = regvm_accum_append(ctx, f->b, fr, f->arg_buf, f->argc,
+                                            d >> 4, a >> 4, f->b->cpool[idx]);
+                if (ar > 0) T_NEXT(11);
+                if (ar < 0) T_FAIL();
+            }
+            if (js_regvm_binary(ctx, sub, FR(a), f->b->cpool[idx], &out))
+                T_FAIL();
+        }
     } else {
         JSValue cst = JS_AtomToValue(ctx, idx);
         if (JS_IsException(cst))
@@ -29030,9 +29152,16 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
             int a_ = RD_REG(); \
             int c_ = RD_REG(); \
             JSValue out_; \
-            if (!regvm_num_fast(SUB_, regs[a_], regs[c_], &out_) && \
-                js_regvm_binary(ctx, SUB_, regs[a_], regs[c_], &out_)) \
-                goto exception; \
+            if (!regvm_num_fast(SUB_, regs[a_], regs[c_], &out_)) { \
+                if ((SUB_) == REG_BIN_ADD) { \
+                    int _ar = regvm_accum_append(ctx, b, regs, arg_buf, argc, \
+                                                 d_, a_, regs[c_]); \
+                    if (_ar > 0) REGVM_NEXT(); \
+                    if (_ar < 0) goto exception; \
+                } \
+                if (js_regvm_binary(ctx, SUB_, regs[a_], regs[c_], &out_)) \
+                    goto exception; \
+            } \
             SET_REG_P(d_, out_); \
             REGVM_NEXT(); \
         } while (0)
@@ -31741,9 +31870,18 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 uint32_t idx = RD_U32();
                 JSValue out;
                 if (kind == REG_CONST_CPOOL) {
-                    if (!regvm_num_fast(sub, regs[a], b->cpool[idx], &out) &&
-                        js_regvm_binary(ctx, sub, regs[a], b->cpool[idx], &out))
-                        goto exception;
+                    if (!regvm_num_fast(sub, regs[a], b->cpool[idx], &out)) {
+                        if (sub == REG_BIN_ADD) {
+                            int _ar = regvm_accum_append(ctx, b, regs, arg_buf,
+                                                         argc, d, a,
+                                                         b->cpool[idx]);
+                            if (_ar > 0) REGVM_NEXT();
+                            if (_ar < 0) goto exception;
+                        }
+                        if (js_regvm_binary(ctx, sub, regs[a], b->cpool[idx],
+                                            &out))
+                            goto exception;
+                    }
                 } else {
                     JSValue cst = JS_AtomToValue(ctx, idx);
                     if (JS_IsException(cst))
