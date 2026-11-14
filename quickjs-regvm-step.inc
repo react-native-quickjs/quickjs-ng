@@ -968,6 +968,90 @@ static uint8_t *REGVM_CC regvm_s_ROP_branch_if(uint8_t *ip, JSValue *fr, JSRegRu
     return NULL;
 }
 
+static uint8_t *REGVM_CC regvm_s_ROP_branch_null(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+{
+    JSFunctionBytecode *b = rf->b;
+    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
+    JSRegPIC *pic = rf->pic;
+    uint8_t *rpc = ip;
+    int op = *rpc++;
+    JSValue ret_val = JS_UNDEFINED;
+    JSValue *regs = fr;
+    JSValue *arg_buf = rf->arg_buf;
+    int argc = rf->argc;
+    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+
+                { int c = RD_REG(); int32_t off = RD_I32();
+                  if (JS_VALUE_GET_TAG(regs[c]) == JS_TAG_NULL) { REGVM_MONO_BACKEDGE(off); rpc += off; }
+                  REGVM_NEXT(); }
+ exception:
+    rf->ret = JS_EXCEPTION;
+    return NULL;
+}
+
+static uint8_t *REGVM_CC regvm_s_ROP_branch_not_null(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+{
+    JSFunctionBytecode *b = rf->b;
+    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
+    JSRegPIC *pic = rf->pic;
+    uint8_t *rpc = ip;
+    int op = *rpc++;
+    JSValue ret_val = JS_UNDEFINED;
+    JSValue *regs = fr;
+    JSValue *arg_buf = rf->arg_buf;
+    int argc = rf->argc;
+    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+
+                { int c = RD_REG(); int32_t off = RD_I32();
+                  if (JS_VALUE_GET_TAG(regs[c]) != JS_TAG_NULL) { REGVM_MONO_BACKEDGE(off); rpc += off; }
+                  REGVM_NEXT(); }
+ exception:
+    rf->ret = JS_EXCEPTION;
+    return NULL;
+}
+
+static uint8_t *REGVM_CC regvm_s_ROP_branch_nullish(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+{
+    JSFunctionBytecode *b = rf->b;
+    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
+    JSRegPIC *pic = rf->pic;
+    uint8_t *rpc = ip;
+    int op = *rpc++;
+    JSValue ret_val = JS_UNDEFINED;
+    JSValue *regs = fr;
+    JSValue *arg_buf = rf->arg_buf;
+    int argc = rf->argc;
+    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+
+                { int c = RD_REG(); int32_t off = RD_I32();
+                  if (regvm_is_nullish_loose(regs[c])) { REGVM_MONO_BACKEDGE(off); rpc += off; }
+                  REGVM_NEXT(); }
+ exception:
+    rf->ret = JS_EXCEPTION;
+    return NULL;
+}
+
+static uint8_t *REGVM_CC regvm_s_ROP_branch_not_nullish(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+{
+    JSFunctionBytecode *b = rf->b;
+    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
+    JSRegPIC *pic = rf->pic;
+    uint8_t *rpc = ip;
+    int op = *rpc++;
+    JSValue ret_val = JS_UNDEFINED;
+    JSValue *regs = fr;
+    JSValue *arg_buf = rf->arg_buf;
+    int argc = rf->argc;
+    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+
+                { int c = RD_REG(); int32_t off = RD_I32();
+                  if (!regvm_is_nullish_loose(regs[c])) { REGVM_MONO_BACKEDGE(off); rpc += off; }
+                  REGVM_NEXT(); }
+ exception:
+    rf->ret = JS_EXCEPTION;
+    return NULL;
+}
+
 static uint8_t *REGVM_CC regvm_s_ROP_branch_if_not(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
 {
     JSFunctionBytecode *b = rf->b;
@@ -6473,6 +6557,10 @@ static const regvm_handler regvm_step_table[ROP_COUNT] = {
     [ROP_slot_put] = regvm_s_ROP_slot_put,
     [ROP_get_this_field] = regvm_s_ROP_get_this_field,
     [ROP_get_this_field2] = regvm_s_ROP_get_this_field,
+    [ROP_branch_null] = regvm_s_ROP_branch_null,
+    [ROP_branch_not_null] = regvm_s_ROP_branch_not_null,
+    [ROP_branch_nullish] = regvm_s_ROP_branch_nullish,
+    [ROP_branch_not_nullish] = regvm_s_ROP_branch_not_nullish,
 };
 
 
@@ -6711,6 +6799,10 @@ static const uint8_t regvm_step_covered[ROP_COUNT] = {
     [ROP_slot_put] = 1,
     [ROP_get_this_field] = 1,
     [ROP_get_this_field2] = 1,
+    [ROP_branch_null] = 1,
+    [ROP_branch_not_null] = 1,
+    [ROP_branch_nullish] = 1,
+    [ROP_branch_not_nullish] = 1,
 };
 
 
