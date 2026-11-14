@@ -121014,3 +121014,37 @@ uintptr_t js_std_cmd(int cmd, ...) {
 #undef malloc
 #undef free
 #undef realloc
+
+#if QJS_AOT
+/* An own data property read by position: the receiver's shape names `atom` at index `slot` as a plain data property, so the value is
+   at the same index of the property array, whichever shape the receiver has. A site whose receivers have many shapes that all keep
+   the field at one index (the objects of one hierarchy build their common fields first) is served without a lookup. The value is
+   borrowed, as at a register read hit. Anything else (an exotic object, an accessor, a variable reference, an array length, a lazy
+   value, another atom at that index) is a miss for the caller to take its own way. */
+int qjs_aot_slot_atom_hit(JSValue recv, uint32_t slot, JSAtom atom, JSValue *out)
+{
+    JSObject *p;
+    JSShape *sh;
+    JSShapeProperty *prs;
+    JSValue v;
+
+    if (unlikely(JS_VALUE_GET_TAG(recv) != JS_TAG_OBJECT))
+        return 0;
+    p = JS_VALUE_GET_OBJ(recv);
+    sh = p->shape;
+    if (unlikely(p->is_exotic || slot >= (uint32_t)sh->prop_count))
+        return 0;
+    prs = &get_shape_prop(sh)[slot];
+    if (unlikely(prs->atom != atom || (prs->flags & (JS_PROP_TMASK | JS_PROP_LENGTH))))
+        return 0;
+    v = p->prop[slot].u.value;
+    if (unlikely(JS_VALUE_GET_TAG(v) == JS_TAG_LAZY_JSON))
+        return 0;
+#if !QJS_DRC
+    if (JS_VALUE_GET_TAG(v) < 0)
+        return 0;
+#endif
+    *out = v;
+    return 1;
+}
+#endif

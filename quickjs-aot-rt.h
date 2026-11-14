@@ -821,6 +821,7 @@ QJS_AOT_STUB int qjs_aot_call_b(JSContext *ctx, int na, JSValue callee, JSValue 
 /* A call to a bytecode function the unit cannot enter natively, made directly instead of through the step engine: JS_UNINITIALIZED
    with nothing done when `callee` is not one; otherwise the owned result or an exception. `cap` is the call's byte offset. */
 JSValue qjs_aot_call_generic(JSContext *ctx, JSRegRun *f, JSValue callee, JSValue this_obj, JSValue *argv, int na, uint32_t cap);
+int qjs_aot_slot_atom_hit(JSValue recv, uint32_t slot, JSAtom atom, JSValue *out);
 
 JSValue qjs_aot_construct_learn(JSContext *ctx, JSObject *ctor, JSValue *argv, int na, const uint32_t *fm);
 int qjs_aot_call_light(JSContext *ctx, JSRegRun *caller_f, int na,
