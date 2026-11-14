@@ -7141,7 +7141,11 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
     intptr_t h;
 
     sh = *psh;
-    new_size = max_int(count, sh->prop_size * 3 / 2);
+    /* Amortised doubling (upstream grows by 3/2). Objects built one field at a
+       time reallocate their property array half as often, an object that never
+       exceeds two properties pays nothing, and prop_size stays equal to the
+       shape's power-of-two hash_size. */
+    new_size = max_int(count, sh->prop_size * 2);
     /* Reallocate prop array first to avoid crash or size inconsistency
        in case of memory allocation failure */
     if (p) {
