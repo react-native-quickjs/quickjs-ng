@@ -104966,6 +104966,7 @@ static int js_is_standard_regexp(JSContext *ctx, JSValueConst rx)
     return res;
 }
 
+#if QJS_AOT
 /* `str.replace(re, rep).length` of a compiled body, without making the result string: `this_val` and `rep` are flat strings, `rx` a pristine
    RegExp (its replace method, its exec and its flags are the original ones), `rep` has no `$`. The length is the one the replacement
    would have; a global RegExp's lastIndex is left at 0 as replace leaves it. Returns 0 with nothing observable done when any of that does
@@ -105021,6 +105022,7 @@ QJS_AOT_STUB int qjs_aot_replace_len(JSContext *ctx, JSValue this_val, JSValue r
     *out = (int32_t)total;
     return 1;
 }
+#endif
 
 static JSValue js_regexp_Symbol_replace_body(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv);
