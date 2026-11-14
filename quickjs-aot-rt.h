@@ -191,7 +191,16 @@ typedef struct JSAotGenLayout {
     uint32_t off_rope_left, off_rope_right;
     /* The epoch at which the typed-array `length` accessor was last validated. */
     uint32_t off_ctx_ta_len_epoch;
+    /* An array iterator's step, read inline: the iterator's class, where it keeps its array,
+       kind and index, the kind of a values iterator, and where a builtin C function keeps its
+       prototype tag and the tag of an iterator `next`. */
+    uint32_t class_array_iterator, off_array_iter_obj, off_array_iter_kind, off_array_iter_idx;
+    uint32_t array_iter_kind_value, off_cfunc_cproto, cfunc_cproto_iterator_next;
 } JSAotGenLayout;
+
+/* The function pointer of Array Iterator's `next`, which a C function object holds when it is
+   that builtin. */
+QJS_AOT_STUB const void *qjs_aot_array_iterator_next_fn(void);
 
 /* Fold every field after `hash` (the hash field itself is excluded). Shared by
    the generator and the runtime. */
