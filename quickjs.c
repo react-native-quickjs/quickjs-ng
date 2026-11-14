@@ -80713,12 +80713,10 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
     uint8_t *ex_entry = NULL;
     uint8_t *blkin_i = NULL, *blkout_i = NULL, *init_i = NULL;
     uint8_t *weak = NULL;
-    uint8_t *has_def = NULL, *entry_i = NULL, *init_set = NULL, *uni = NULL;
+    uint8_t *has_def = NULL, *entry_i = NULL, *init_set = NULL;
     uint8_t *undef_set = NULL;
-    int init_cnt = 0, undef_cnt = 0, ret_sum = 0, uni_cnt = 0, uninit_ret = 0;
     int init_all = 0;
     int i, b, k, e, ne = 0, sp = 0, ok = 0;
-    int dump = 0;
     /* Owned by the IR once the analysis completes; js_regvm_encode frees it. */
     ir->own_init = NULL;
     ir->own_undef = NULL;
@@ -80750,12 +80748,11 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
     entry_i = js_malloc(ctx, nreg);
     init_set = js_malloc(ctx, nreg);
     undef_set = js_malloc(ctx, nreg);
-    uni = js_malloc(ctx, nreg);
     if (!blk || !ph || !pn || !pb || !queue || !bs || !be ||
         !blkin || !blkout || !inq || !tmp || !sx || !sxn || !ex_entry ||
         !blkin_i || !blkout_i || !init_i || !has_def || !entry_i ||
         !weak ||
-        !init_set || !undef_set || !uni)
+        !init_set || !undef_set)
         goto done;
     /* Both sets start empty: only registers proved to need a fill are marked. */
     memset(init_set, REG_INIT_UNINIT, nreg);
@@ -80986,7 +80983,7 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
     /* Report: replay each block to read the state before every definition, and
        collect the owned set at every return and throw. */
     {
-        int plain = 0, nret = 0, owned_max = 0;
+        int plain = 0, nret = 0;
         uint8_t *st = js_malloc(ctx, nreg);
         uint8_t *init_st = js_malloc(ctx, nreg);
         if (!st || !init_st) {
@@ -80994,7 +80991,6 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
             js_free(ctx, init_st);
             goto done;
         }
-        memset(uni, 0, nreg);
         /* Init-all functions: `eval`, `with` and a ref into the frame
            (`make_local_ref` / `make_var_ref`) read bindings by name, so every
            register is filled, as for a blob function. */
@@ -81071,66 +81067,26 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
                             init_set[d2] = REG_INIT_INIT;
                     }
                     if (d >= 0 && st[d] == REG_OWN_NONE &&
-                        (d2 < 0 || st[d2] == REG_OWN_NONE)) {
+                        (d2 < 0 || st[d2] == REG_OWN_NONE))
                         plain++;
-                        if (dump)
-                            fprintf(stderr, "##OWN## i=%d r=%d plain\n", i, d);
-                    }
                 } else if (rop == ROP_return || rop == ROP_return_async ||
                            rop == ROP_throw || rop == ROP_throw_error) {
-                    int cnt = 0;
-                    for (k = 0; k < nreg; k++)
-                        if (st[k] != REG_OWN_NONE)
-                            cnt++;
                     nret++;
-                    if (cnt > owned_max)
-                        owned_max = cnt;
-                    ret_sum += cnt;
                     /* The release walk at a return and the unwinder's walk read
                        every register, so a register that may be UNINIT here is
                        filled. */
                     for (k = 0; k < nreg; k++)
                         if (init_st[k] == REG_INIT_UNINIT)
                             init_set[k] = REG_INIT_INIT;
-                    for (k = 0; k < nreg; k++)
-                        if (init_st[k] == REG_INIT_UNINIT)
-                            uninit_ret++;
-                    if (dump) {
-                        fprintf(stderr, "##OWNRET## i=%d rop=%d n=%d:", i, rop,
-                                cnt);
-                        for (k = 0; k < nreg; k++)
-                            if (st[k] != REG_OWN_NONE)
-                                fprintf(stderr, " %d%c", k,
-                                        st[k] == REG_OWN_OWN ? 'o' : '?');
-                        fprintf(stderr, "\n");
-                    }
                 }
                 regvm_own_step(in, st, ireg, n_values, reg_count, cycle_reg,
                                weak[b]);
                 regvm_own_init_step(in, init_st, ireg, n_values, reg_count,
                                     cycle_reg, weak[b]);
-                for (k = 0; k < nreg; k++)
-                    if (st[k] != REG_OWN_NONE)
-                        uni[k] = 1;
             }
-        }
-        for (k = 0; k < nreg; k++) {
-            if (init_set[k] == REG_INIT_INIT)
-                init_cnt++;
-            if (undef_set[k] == REG_INIT_INIT)
-                undef_cnt++;
-            if (uni[k])
-                uni_cnt++;
         }
         js_free(ctx, st);
         js_free(ctx, init_st);
-        if (dump)
-            fprintf(stderr,
-                    "##OWNSUM## insns=%d regs=%d blocks=%d plain=%d returns=%d "
-                    "owned_max=%d ret_sum=%d init=%d undef=%d init_all=%d "
-                    "union=%d uninit_ret=%d\n",
-                    n, reg_count, n_blocks, plain, nret, owned_max, ret_sum,
-                    init_cnt, undef_cnt, init_all, uni_cnt, uninit_ret);
 #ifdef QJS_REGVM_COUNT
         js_regvm_own_plain += plain;
         js_regvm_own_returns += nret;
@@ -81168,7 +81124,6 @@ done:
     }
     js_free(ctx, init_set);
     js_free(ctx, undef_set);
-    js_free(ctx, uni);
 }
 
 
