@@ -82455,7 +82455,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
     const uint8_t *bc = fd->byte_code.buf;
     int bc_len = fd->byte_code.size;
     int *bof = NULL, *bstart = NULL, *succ = NULL, *exc = NULL;
-    int *in_depth = NULL, *out_depth = NULL;
+    int *in_depth = NULL, *out_depth = NULL, *bterm = NULL;
     int *pred_off = NULL, *pred = NULL, *n_pred = NULL;
     int *ent_off = NULL, *ent = NULL, *out_off = NULL, *out = NULL;
     int *phi_b = NULL, *phi_i = NULL, *scratch = NULL, *popbuf = NULL;
@@ -82592,8 +82592,18 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
     exc = js_malloc(ctx, n_blocks * sizeof(int));
     in_depth = js_malloc(ctx, n_blocks * sizeof(int));
     out_depth = js_malloc(ctx, n_blocks * sizeof(int));
-    if (!succ || !exc || !in_depth || !out_depth)
+    bterm = js_malloc(ctx, n_blocks * sizeof(int));
+    if (!succ || !exc || !in_depth || !out_depth || !bterm)
         goto done;
+    /* Each block's terminator, its last instruction (its start when it is
+       empty), found once for the passes below. */
+    for (b = 0; b < n_blocks; b++) {
+        int last = bstart[b];
+        for (pos = bstart[b]; pos < bstart[b + 1];
+             pos += short_opcode_info(bc[pos]).size)
+            last = pos;
+        bterm[b] = last;
+    }
     for (i = 0; i < 2 * n_blocks; i++)
         succ[i] = -1;
     for (b = 0; b < n_blocks; b++) {
@@ -82609,11 +82619,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
             continue;
         }
         /* the block's terminator is its last instruction */
-        last = bstart[b];
-        for (pos = bstart[b]; pos < bstart[b + 1];
-             pos += short_opcode_info(bc[pos]).size) {
-            last = pos;
-        }
+        last = bterm[b];
         regvm_control(bc, last, &fall, &target);
         if (target >= 0) {
             int tb = bof[target];
@@ -82685,10 +82691,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
             {
                 /* the with family's fall-through edge is one below the taken
                    one */
-                int term = bstart[b];
-                for (pos = bstart[b]; pos < bstart[b + 1];
-                     pos += short_opcode_info(bc[pos]).size)
-                    term = pos;
+                int term = bterm[b];
                 for (k = 0; k < 2; k++) {
                     int s = succ[b * 2 + k];
                     int dd = d + regvm_with_edge_delta(bc[term], k);
@@ -83803,10 +83806,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                     for (w = 0; w < words; w++)
                         OUT[w] |= PU[w];
                 }
-                last = bstart[b];
-                for (pos = bstart[b]; pos < bstart[b + 1];
-                     pos += short_opcode_info(bc[pos]).size)
-                    last = pos;
+                last = bterm[b];
                 if (bc[last] == OP_ret) {
                     for (k = 0; k < n_cont; k++) {
                         uint64_t *CI = live_in + (size_t)cont[k] * words;
@@ -84072,10 +84072,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
             int tpc;
             if (in_depth[b] < 0)
                 continue;
-            tpc = bstart[b];
-            for (pos = bstart[b]; pos < bstart[b + 1];
-                 pos += short_opcode_info(bc[pos]).size)
-                tpc = pos;
+            tpc = bterm[b];
             switch (bc[tpc]) {
             case OP_return:
             case OP_return_undef:
@@ -84851,6 +84848,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
     js_free(ctx, exc);
     js_free(ctx, in_depth);
     js_free(ctx, out_depth);
+    js_free(ctx, bterm);
     js_free(ctx, n_pred);
     js_free(ctx, pred_off);
     js_free(ctx, pred);
