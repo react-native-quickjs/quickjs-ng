@@ -106689,6 +106689,49 @@ static int json_fast_value(JSParseState *s, const uint8_t **pp, int depth, JSVal
                     if (*p != '"')
                         goto obj_fail;
                     p++;
+                    /* the expected next key, plain, with a primitive value: its bytes compared in place, the value read here and
+                       stored with the cached shape; the key atom is only borrowed from the chain, which nothing changes before the
+                       store (a string or number reader touches no shape cache) */
+                    if (jsc && matched && k < jsc->n && jsc->plain[k] && jsc->shapes[k] == jsobj->shape &&
+                        jsc->shapes[k + 1] != jsc->shapes[k]) {
+                        JSString *ap = ctx->rt->atom_array[jsc->atoms[k]];
+                        uint32_t n = ap->len;
+                        const uint8_t *q;
+                        if ((size_t)(s->buf_end - p) > n + 1 && p[n] == '"' && memcmp(json_str8(ap), p, n) == 0) {
+                            q = json_fast_ws(p + n + 1);
+                            if (*q == ':') {
+                                q = json_fast_ws(q + 1);
+                                if (*q == '"' || *q == '-' || is_digit(*q)) {
+                                    if (*q == '"') {
+                                        q++;
+                                        if (json_parse_string(s, &q))
+                                            goto obj_fail;
+                                        prop_val = s->token.u.str.str;
+                                    } else {
+                                        const uint8_t *d = q + (*q == '-');
+                                        if (!is_digit(*d) || (d[0] == '0' && is_digit(d[1])))
+                                            goto obj_fail;
+                                        if (json_parse_number(s, &q))
+                                            goto obj_fail;
+                                        prop_val = s->token.u.num.val;
+                                    }
+                                    s->token.val = ' ';
+                                    if (json_obj_adopt_shape(ctx, jsobj, jsc->shapes[k + 1], prop_val)) {
+                                        JS_FreeValue(ctx, prop_val);
+                                        goto obj_fail;
+                                    }
+                                    k++;
+                                    p = json_fast_ws(q);
+                                    if (*p == '}')
+                                        break;
+                                    if (*p != ',')
+                                        goto obj_fail;
+                                    p = json_fast_ws(p + 1);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     if (jsc && matched && jsc->atoms && k < jsc->n && jsc->plain[k])
                         s->json_key_hint = jsc->atoms[k];
                     if (json_parse_key_string(s, &p)) {
