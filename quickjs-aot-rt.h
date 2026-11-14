@@ -91,6 +91,10 @@ typedef struct JSAotGenLayout {
        object's bytecode, that bytecode's compiled entry, and its caches. */
     uint32_t off_object_func_bytecode, class_bytecode_function;
     uint32_t off_fnbc_aot_fn, off_fnbc_regvm_pic;
+    /* The array element read: a fast array's length and element vector, and
+       the class id of an ordinary array. Read inline so a compiled `a[i]` is
+       a class check, a bounds check and a load. */
+    uint32_t off_object_array_count, off_object_array_values, class_array;
 } JSAotGenLayout;
 
 /* Fold every field after `hash` (the hash field itself is excluded). Shared by
