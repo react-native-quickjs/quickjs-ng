@@ -65311,6 +65311,18 @@ static void aot_dump_shapes(FILE *f, JSRuntime *rt, JSContext *ctx)
     struct list_head *el;
     int id = 0;
 
+    /* A shape some live object of which is a prototype (a class's own prototype object, which gains its methods by
+       assignment) is never a layout: bit 1 of aot_prof_seen, printed as `isproto=1`. */
+    list_for_each(el, &rt->gc_obj_list) {
+        JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
+        JSObject *po;
+
+        if (JS_GC_TYPE(gp) != JS_GC_OBJ_TYPE_JS_OBJECT)
+            continue;
+        po = (JSObject *)gp;
+        if (po->is_prototype && po->shape->aot_prof_seen)
+            po->shape->aot_prof_seen |= 2;
+    }
     list_for_each(el, &rt->gc_obj_list) {
         JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
         JSShape *sh;
@@ -65372,6 +65384,8 @@ static void aot_dump_shapes(FILE *f, JSRuntime *rt, JSContext *ctx)
                     fprintf(f, "other:%p", (void *)po);
             }
         }
+        if (sh->aot_prof_seen & 2)
+            fprintf(f, " isproto=1");
         fprintf(f, " n=%d props=", (int)sh->prop_count);
         for (k = 0; k < (uint32_t)sh->prop_count; k++) {
             JSShapeProperty *pr = &get_shape_prop(sh)[k];
