@@ -3285,6 +3285,51 @@ JSValue JS_EvalInStackFrame(JSContext *ctx, int level,
     return ret;
 }
 
+/* Defined much later in the file; declared here so the debugger block, which
+   sits early enough to be next to the rest of the debug API, can use them. */
+static bool js_class_has_bytecode(JSClassID class_id);
+static int find_line_num(JSContext *ctx, JSFunctionBytecode *b,
+                         uint32_t pc_value, int *col);
+
+int JS_GetFrameInfoAtLevel(JSContext *ctx, int level, JSDebugFrameInfo *info)
+{
+    JSStackFrame *sf;
+    JSObject *p;
+    JSFunctionBytecode *b;
+
+    if (!info)
+        return -1;
+    memset(info, 0, sizeof(*info));
+    info->filename = JS_ATOM_NULL;
+    info->func_name = JS_ATOM_NULL;
+    info->line = -1;
+    info->col = -1;
+
+    sf = js_get_stack_frame_at_level(ctx, level);
+    if (sf == NULL)
+        return -1;
+
+    if (JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT) {
+        info->is_native = true;
+        return 0;
+    }
+    p = JS_VALUE_GET_OBJ(sf->cur_func);
+    if (!js_class_has_bytecode(p->class_id)) {
+        info->is_native = true;
+        return 0;
+    }
+
+    b = p->u.func.function_bytecode;
+    info->filename = b->filename;
+    info->func_name = b->func_name;
+    if (sf->cur_pc) {
+        /* cur_pc points just past the executing instruction */
+        uint32_t pc = (uint32_t)(sf->cur_pc - b->byte_code_buf - 1);
+        info->line = find_line_num(ctx, b, pc, &info->col);
+    }
+    return 0;
+}
+
 #else /* !JS_ENABLE_DEBUGGER */
 
 /* Stubs so an embedder built against the full header still links.  They fail
@@ -3331,6 +3376,19 @@ JSValue JS_EvalInStackFrame(JSContext *ctx, int level, const char *input,
     (void)level; (void)input; (void)input_len; (void)filename;
     return JS_ThrowInternalError(ctx,
                                  "debugger not compiled in (JS_ENABLE_DEBUGGER=0)");
+}
+
+int JS_GetFrameInfoAtLevel(JSContext *ctx, int level, JSDebugFrameInfo *info)
+{
+    (void)ctx; (void)level;
+    if (!info)
+        return -1;
+    memset(info, 0, sizeof(*info));
+    info->filename = JS_ATOM_NULL;
+    info->func_name = JS_ATOM_NULL;
+    info->line = -1;
+    info->col = -1;
+    return -1;
 }
 
 #endif /* JS_ENABLE_DEBUGGER */
@@ -18591,6 +18649,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     /* -2: step back over the flag operand and the opcode */
                     uint32_t pc_index = (uint32_t)(pc - b->byte_code_buf - 2);
                     line_num = find_line_num(ctx, b, pc_index, &col_num);
+
+                    /* JS_CallInternal keeps pc in a local and only writes
+                       sf->cur_pc where it can re-enter the engine; the trap
+                       is such a point, so publish it for the trapping frame. */
+                    sf->cur_pc = pc;
 
                     /* Pass the JSAtom values directly -- no heap allocation.
                        The atoms are valid for the lifetime of the bytecode

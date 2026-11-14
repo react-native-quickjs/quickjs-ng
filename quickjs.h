@@ -641,6 +641,23 @@ JS_EXTERN JSValue JS_EvalInStackFrame(JSContext *ctx, int level,
                                       const char *input, size_t input_len,
                                       const char *filename);
 
+/* Source location and function identity of one live stack frame. `filename`
+   and `func_name` are borrowed atoms, valid only while the frame is alive;
+   JS_DupAtom() to retain. `line`/`col` are -1 when unavailable. */
+typedef struct JSDebugFrameInfo {
+    JSAtom filename;   /* borrowed; JS_ATOM_NULL if unknown */
+    JSAtom func_name;  /* borrowed; JS_ATOM_NULL for anonymous functions */
+    int line;          /* 1-based, or -1 */
+    int col;           /* 1-based, or -1 */
+    bool is_native;    /* true for a C function frame */
+} JSDebugFrameInfo;
+
+/* Fill *info for the frame at `level` (0 = the innermost frame, 1 = its
+   caller).  Returns 0 on success and -1 if `level` is out of range, in which
+   case *info is zero-filled.  Never throws. */
+JS_EXTERN int JS_GetFrameInfoAtLevel(JSContext *ctx, int level,
+                                     JSDebugFrameInfo *info);
+
 /* the following functions are used to select the intrinsic object to
    save memory */
 JS_EXTERN JSContext *JS_NewContextRaw(JSRuntime *rt);
