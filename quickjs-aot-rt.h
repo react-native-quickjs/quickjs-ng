@@ -349,6 +349,10 @@ int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out);
 int qjs_aot_object_template(JSContext *ctx, JSRegRun *f, int index, JSValue *out);
 int qjs_aot_special_object(JSContext *ctx, JSRegRun *f, int kind, JSValue *out);
 int qjs_aot_array_from(JSContext *ctx, JSValue *argv, int na, JSValue *out);
+/* An exception leaves a compiled frame that has no handler: builds the error's stack
+   in this frame (at register pc `pc`, or the captured one for UINT32_MAX) unless it
+   has one. Returns JS_EXCEPTION. */
+QJS_AOT_STUB JSValue qjs_aot_throw_here(JSContext *ctx, JSRegRun *f, uint32_t pc);
 /* `put_global`: the engine's global store of a borrowed value (it duplicates).
    0, or -1 on an exception. */
 int qjs_aot_put_global(JSContext *ctx, int atom, JSValue v, int init);
