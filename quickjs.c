@@ -70000,6 +70000,10 @@ aot_call_record(JSContext *caller_ctx, JSObject *co, JSFunctionBytecode *cb,
     int slots = regvm_args_borrowable(cb, argc) ? 0
         : (argc > cb->arg_count ? argc : cb->arg_count);
 
+    /* an exit continues in the interpreter on this record, and the threaded interpreter cannot run every instruction of a
+       function that is not all-threaded: that function takes the full activation, whose monolith resumes at any pc */
+    if (unlikely(!cb->regvm_all_threaded))
+        return 0;
     /* the C stack the compiled body and its callees will use, as JS_CallInternal checks */
     if (js_check_stack_overflow(rt, sizeof(JSValue) * (size_t)(cb->var_count +
                                     regvm_frame_regs(cb) + REGVM_HS) + 1024)) {
