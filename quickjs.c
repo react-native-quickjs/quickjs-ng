@@ -69977,6 +69977,9 @@ aot_call_record(JSContext *caller_ctx, JSObject *co, JSFunctionBytecode *cb,
             JS_ThrowInternalError(cb->realm, "compiled function cannot be resumed");
             ret = JS_EXCEPTION;
         } else {
+            /* the record has no caller: a return from the interpreter leaves through regvm_t_return_common
+               (NULL), never through the trivial path, which moves the value into `caller`'s register */
+            rec->flags &= ~REGVM_FLAG_TRIVIAL_RET;
             regvm_t_dispatch(cb->regvm_code + pc, rec->fr, rec, cb->realm);
             ret = rec->ret;
         }
