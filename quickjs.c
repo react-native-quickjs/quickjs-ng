@@ -67338,6 +67338,80 @@ QJS_AOT_STUB int qjs_aot_slot_assign(JSContext *ctx, JSValue dst, JSValue dstc, 
     return 1;
 }
 
+/* A shell: a stack block of the caller's frame with room for `room` fields that is no object yet (shape NULL, every field undefined). A callee that returns an object of its own frame
+   fills it (qjs_aot_slot_fill) and the caller then owns a stack object; a shell nothing filled holds nothing and its release is the caller's no-op. JS_UNINITIALIZED when it does not fit. */
+QJS_AOT_STUB JSValue qjs_aot_stack_shell(void *buf, size_t bytes, uint32_t room)
+{
+    JSObject *p;
+    uint32_t i;
+    if (room == 0 || room > JS_OBJ_LEARNED_INLINE_MAX)
+        return JS_UNINITIALIZED;
+    p = js_stack_block(buf, bytes, offsetof(JSObject, u) + room * sizeof(JSProperty));
+    if (p == NULL)
+        return JS_UNINITIALIZED;
+    p->prop_inline_cap = room;
+    p->class_id = JS_CLASS_OBJECT;
+    p->arr_kind = JS_ARR_KIND_GENERIC;
+    p->extensible = true;
+    p->shape = NULL;
+    p->prop = (JSProperty *)((uint8_t *)p + offsetof(JSObject, u));
+    for (i = 0; i < room; i++)
+        p->prop[i].u.value = JS_UNDEFINED;
+    return JS_MKPTR(JS_TAG_OBJECT, p);
+}
+
+/* The stack object `src` of a returning function's frame (and the one stack object a field of it holds, `srcc`) becomes the object of the shell `slot` the caller gave: the shell takes the
+   shape and the field values (the references move), the stack child's contents move to a heap object that the shell's field holds, and `src` is left with undefined fields (its own release then
+   frees nothing). 1 when filled; 0 with nothing changed when `slot` is not an empty shell, the object does not fit its room, or `src` holds a stack object other than `srcc` (or `srcc` is
+   given and `src` does not hold it exactly once, or it holds a stack object); the caller then moves `src` to the heap as before. -1 on an out-of-memory, nothing changed. */
+QJS_AOT_STUB int qjs_aot_slot_fill(JSContext *ctx, JSValue slot, JSValue src, JSValue srcc)
+{
+    JSObject *d, *s, *sc = NULL;
+    JSValue hc = JS_UNDEFINED, ho, ha;
+    int i, sn, nsc = 0;
+    if (JS_VALUE_GET_TAG(slot) != JS_TAG_OBJECT || JS_VALUE_GET_TAG(src) != JS_TAG_OBJECT)
+        return 0;
+    d = JS_VALUE_GET_OBJ(slot);
+    s = JS_VALUE_GET_OBJ(src);
+    if (d == s || JS_REF_COUNT(d) < JS_STACK_BIAS / 2 || d->shape != NULL || JS_REF_COUNT(s) < JS_STACK_BIAS / 2 || s->shape == NULL)
+        return 0;
+    sn = s->shape->prop_count;
+    if (sn > d->prop_inline_cap)
+        return 0;
+    if (JS_VALUE_GET_TAG(srcc) == JS_TAG_OBJECT) {
+        sc = JS_VALUE_GET_OBJ(srcc);
+        if (JS_REF_COUNT(sc) < JS_STACK_BIAS / 2 || sc->shape == NULL)
+            return 0;
+        for (i = 0; i < sc->shape->prop_count; i++) {
+            JSValue v = sc->prop[i].u.value;
+            if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && JS_REF_COUNT(JS_VALUE_GET_OBJ(v)) >= JS_STACK_BIAS / 2)
+                return 0;
+        }
+    }
+    for (i = 0; i < sn; i++) {
+        JSValue v = s->prop[i].u.value;
+        if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && JS_REF_COUNT(JS_VALUE_GET_OBJ(v)) >= JS_STACK_BIAS / 2) {
+            if (JS_VALUE_GET_OBJ(v) != sc)
+                return 0;
+            nsc++;
+        }
+    }
+    if ((sc != NULL) != (nsc == 1) || nsc > 1)
+        return 0;
+    if (sc != NULL && !js_stack_migrate2(ctx, JS_UNDEFINED, JS_UNDEFINED, srcc, &ho, &ha, &hc))
+        return -1;
+    d->shape = js_dup_shape(s->shape);
+    d->extensible = s->extensible;
+    for (i = 0; i < sn; i++) {
+        JSValue v = s->prop[i].u.value;
+        if (sc != NULL && JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(v) == sc)
+            v = hc;
+        d->prop[i].u.value = v;
+        s->prop[i].u.value = JS_UNDEFINED;
+    }
+    return 1;
+}
+
 /* `a + b` where one side is a string and the other a string or a primitive whose string form runs no code (a number, a boolean,
    null, undefined). 1 with an owned *out, 0 for any other operands (nothing done), -1 with an exception pending. */
 QJS_AOT_STUB int qjs_aot_add_str(JSContext *ctx, JSValue a, JSValue b, JSValue *out)
