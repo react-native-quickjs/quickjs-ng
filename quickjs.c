@@ -25536,7 +25536,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 JSAtom atom = RD_U32();
                 int s = RD_REG();
                 int flags = RD_U8();
-                if (JS_DefineGlobalFunction(ctx, atom, js_dup(regs[s]), flags))
+                if (JS_DefineGlobalFunction(ctx, atom, regs[s], flags))
                     goto exception;
                 REGVM_NEXT();
             }
@@ -26000,11 +26000,11 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 ret = js_method_set_properties(ctx, regs[f], atom, flags, regs[o]);
                 if (ret >= 0) {
                     if (kind == 0)
-                        value = js_dup(regs[f]);
+                        value = regs[f];
                     else if (kind == 1)
-                        getter = js_dup(regs[f]);
+                        getter = regs[f];
                     else
-                        setter = js_dup(regs[f]);
+                        setter = regs[f];
                     ret = JS_DefineProperty(ctx, regs[o], atom, value, getter,
                                             setter, flags);
                 }
@@ -27998,7 +27998,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                     JSAtom atom = RD_U32();
                     int s = RD_REG();
                     int flags = RD_U8();
-                    if (JS_DefineGlobalFunction(ctx, atom, js_dup(regs[s]), flags))
+                    if (JS_DefineGlobalFunction(ctx, atom, regs[s], flags))
                         goto exception;
                     REGVM_NEXT();
                 }
@@ -54394,6 +54394,7 @@ static int regvm_perm_of(int op, int out)
     static const int8_t rot5l[]    = { 1, 2, 3, 4, 0 };
     static const int8_t swap[]     = { 1, 0 };
     static const int8_t swap2[]    = { 2, 3, 0, 1 };
+    static const int8_t nip[]      = { 1 };
     const int8_t *map = NULL;
     int n = 0;
 
@@ -54414,6 +54415,7 @@ static int regvm_perm_of(int op, int out)
     case OP_rot5l: map = rot5l; n = countof(rot5l); break;
     case OP_swap: map = swap; n = countof(swap); break;
     case OP_swap2: map = swap2; n = countof(swap2); break;
+    case OP_nip: map = nip; n = countof(nip); break;
     default: break;
     }
     return map && out >= 0 && out < n ? map[out] : -1;
@@ -54801,6 +54803,16 @@ typedef struct JSRegEncodeStep {
     const int32_t *stub_pc;
 } JSRegEncodeStep;
 
+/* Does `v` appear in stack[0..n)? */
+static int regvm_stack_has(const int *stack, int n, int v)
+{
+    int i;
+    for (i = 0; i < n; i++)
+        if (stack[i] == v)
+            return 1;
+    return 0;
+}
+
 static int regvm_encode_step_hook(void *opaque, const JSFunctionDef *fd,
                                   const uint8_t *bc, int pos, int *scratch,
                                   const int *push_base, JSRegSlotSim *sim,
@@ -54835,9 +54847,16 @@ static int regvm_encode_step_hook(void *opaque, const JSFunctionDef *fd,
             return -1;
     }
     def_begin = st->ir->n_insns;
+    /*
+     * A drop removes the control-stack entry only when it drops the last
+     * stack reference to the sentinel. Stack shapers alias their inputs, so
+     * `dup3; drop` (the for-await step) drops a copy while the loop's own
+     * sentinel is still below it; that drop is an ordinary no-op.
+     */
     if (bc[pos] == OP_drop && np == 1 && d >= 1 && st->sentinel_bits &&
         scratch[d - 1] >= 0 && scratch[d - 1] < st->n_values &&
-        st->sentinel_bits[scratch[d - 1]]) {
+        st->sentinel_bits[scratch[d - 1]] &&
+        !regvm_stack_has(scratch, d - 1, scratch[d - 1])) {
         if (regvm_ir_add(st->ctx, st->ir, ROP_sentinel_drop, pos, NULL, 0))
             return -1;
     } else if (regvm_lower_insn(st->ctx, st->ir, bc, pos,
@@ -56406,6 +56425,35 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                     stk[depth] = sval[slot];
                     depth += ns;
                     fwd_used[slot] = 1;
+                    continue;
+                }
+                /* Stack shapers and a kept receiver push aliases of their
+                   inputs (regvm_pushed). This model must name them the same
+                   way, or a forwarded read after a shaper sees a stale
+                   register. */
+                if (ns > 0 && ns <= 8 && np <= 8 && depth >= np &&
+                    (regvm_perm_of(op, 0) >= 0 ||
+                     (ns == 2 && regvm_keeps_receiver(op)))) {
+                    int popped[8];
+                    for (j = 0; j < np; j++)
+                        popped[j] = stk[depth - np + j];
+                    depth -= np;
+                    for (j = 0; j < ns; j++) {
+                        int src = regvm_perm_of(op, j);
+                        if (src >= 0)
+                            stk[depth + j] = popped[src];
+                        else if (j == 0 && regvm_keeps_receiver(op))
+                            stk[depth + j] = popped[0];
+                        else
+                            stk[depth + j] = -1;
+                    }
+                    if (regvm_perm_of(op, 0) < 0) {
+                        /* the kept receiver's result is a real definition */
+                        push_base[pos] = n_pushes;
+                        stk[depth + 1] = n_pushes + 1;
+                        n_pushes += ns;
+                    }
+                    depth += ns;
                     continue;
                 }
                 depth -= np;
