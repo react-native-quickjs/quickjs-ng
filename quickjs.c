@@ -61973,7 +61973,8 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
                                    uint8_t **out_code, int *out_len,
                                    int *out_regs, const int *rcc_canon,
                                    JSRegRCC **out_rcc,
-                                   int32_t **out_src_pc)
+                                   int32_t **out_src_pc,
+                                   const char **out_why)
 {
     uint8_t *code = NULL;
     int *insn_pc = NULL;
@@ -61984,6 +61985,9 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
     int i, k, p, code_len = 0, rc = -1;
     int di = 0;
     long long n_decoded = 0;
+
+    if (out_why)
+        *out_why = NULL;
 
     if (out_src_pc)
         *out_src_pc = NULL;
@@ -62001,6 +62005,8 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
     /* Register operands are byte offsets (register * sizeof(JSValue)); a
        function with more than 4096 registers is refused. */
     if (reg_count > REGVM_WIDE_REG_MAX + 1) {
+        if (out_why)
+            *out_why = "more registers than the register operand can encode";
         rc = REGVM_REFUSED;
         goto done;
     }
@@ -62127,12 +62133,16 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
                 ti = (in->ops[k] >= 0 && in->ops[k] < n_pcs)
                          ? pc_to_insn[in->ops[k]] : -1;
                 if (ti < 0 || ti >= ir->n_insns) {
+                    if (out_why)
+                        *out_why = "a branch target the CFG and the IR disagree on";
                     rc = REGVM_REFUSED;
                     goto done;
                 }
                 off = insn_pc[ti] - (insn_pc[i] + 1 + sz);
                 if (off < -128 || off > 127) {
                     if (regvm_widen(in)) {
+                        if (out_why)
+                            *out_why = "a branch target does not fit after widening";
                         rc = REGVM_REFUSED;
                         goto done;
                     }
@@ -62193,6 +62203,8 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
                 if (r < 0) {
                     /* A value the allocator never saw: a modelling gap, so
                        refuse. */
+                    if (out_why)
+                        *out_why = "a register operand names a value the allocator never saw";
                     rc = REGVM_REFUSED;
                     goto done;
                 }
@@ -62219,6 +62231,8 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
                 int32_t off;
                 if (ti < 0 || ti >= ir->n_insns) {
                     /* the CFG and the lowering disagree about a target: refuse */
+                    if (out_why)
+                        *out_why = "a branch target the CFG and the lowering disagree on";
                     rc = REGVM_REFUSED;
                     goto done;
                 }
@@ -65170,6 +65184,49 @@ static void regvm_rcc_free(JSContext *ctx, JSRegRCC *rcc)
 }
 #endif /* QJS_REGVM_RCCHECK */
 
+/*
+ * Item 1.3 of the no-refusals plan: make a refused function visible at compile
+ * time. Behind QJS_REGVM_KNOBS and the REGVM_REPORT_DEFERRED environment
+ * variable, so a normal run stays silent; the switch exists to keep the
+ * refusal inventory measurable over test262 and the corpus.
+ */
+#ifdef QJS_REGVM_KNOBS
+static int regvm_report_deferred_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("REGVM_REPORT_DEFERRED");
+        on = e && e[0] && e[0] != '0';
+    }
+    return on;
+}
+#else
+#define regvm_report_deferred_on() 0
+#endif
+
+/* Print "regvm: refused <name> (<file>:<line>): <why>" once per refusal. */
+static void regvm_report_refusal(JSContext *ctx, const JSFunctionDef *fd,
+                                 const char *why)
+{
+    const char *name, *file;
+
+    if (!regvm_report_deferred_on())
+        return;
+    name = fd->func_name != JS_ATOM_NULL ? JS_AtomToCString(ctx, fd->func_name)
+                                         : NULL;
+    file = fd->filename != JS_ATOM_NULL ? JS_AtomToCString(ctx, fd->filename)
+                                        : NULL;
+    fprintf(stderr, "regvm: refused %s (%s:%d): %s\n",
+            name ? name : "<anonymous>", file ? file : "?",
+            fd->line_num, why ? why : "?");
+    if (name)
+        JS_FreeCString(ctx, name);
+    if (file)
+        JS_FreeCString(ctx, file);
+}
+
+#define REGVM_UNENCODABLE(why) do { unc_why = (why); unencodable = 1; } while (0)
+
 static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                                        const uint8_t *bc, int bc_len,
                                        const uint8_t *reuse,
@@ -65204,6 +65261,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
     int *stub_edge = NULL, *stub_pc = NULL;
     int n_edges = 2 * n_blocks;
     int n_moves = 0, n_stubs = 0, n_stubs_used = 0, unencodable = 0, rc = -1;
+    const char *unc_why = "?";
     int enc_ok = 0;             /* the rcc table is handed to the bytecode */
     int cycle_reg = -1;
     uint8_t *phi_in = NULL;
@@ -65280,6 +65338,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                                             : senc[b * ns_ok + hk];
                         regvm_home_overlap_report(bstart[b], hk, expected, i);
                         js_free(ctx, seen);
+                        unc_why = "home overlap: a version's register holds another value";
                         goto refused;
                     }
                     seen[hk] = i;
@@ -65292,6 +65351,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                     if (seen[k] != expected) {
                         regvm_home_overlap_report(bstart[b], k, expected, seen[k]);
                         js_free(ctx, seen);
+                        unc_why = "home overlap: a slot's live version is not its current one";
                         goto refused;
                     }
                 }
@@ -65487,7 +65547,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                     e = p * 2 + 1;
                 else {
                     /* a predecessor that does not name this block as an edge */
-                    unencodable = 1;
+                    REGVM_UNENCODABLE("a predecessor does not name the edge (value phi)");
                     continue;
                 }
                 ev_cnt[e]++;
@@ -65517,7 +65577,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                 else if (succ[p * 2 + 1] == b)
                     e = p * 2 + 1;
                 else {
-                    unencodable = 1;
+                    REGVM_UNENCODABLE("a predecessor does not name the edge (slot phi)");
                     continue;
                 }
                 ev_cnt[e]++;
@@ -65707,13 +65767,13 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                 ops[0] = v;
                 ops[1] = u - fd->var_count;
                 if (regvm_ir_add(ctx, &ir, ROP_get_arg, 0, ops, 2)) {
-                    unencodable = 1;
+                    REGVM_UNENCODABLE("IR allocation failed (entry arg value)");
                     break;
                 }
             } else {
                 ops[0] = v;
                 if (regvm_ir_add(ctx, &ir, ROP_load_undefined, 0, ops, 1)) {
-                    unencodable = 1;
+                    REGVM_UNENCODABLE("IR allocation failed (entry undefined value)");
                     break;
                 }
             }
@@ -65775,7 +65835,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                     rc = -1;
                     goto done;
                 }
-                unencodable = 1;
+                REGVM_UNENCODABLE("the lowering has no register form for an instruction");
                 break;
             }
             if (home_mode >= 2 && ns_ok > 0) {
@@ -65784,7 +65844,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                     int hk = (v >= 0 && v < n_home_values) ? home_of[v] : -1;
                     if (hk >= 0 && hk < ns_ok && sval[hk] != v) {
                         regvm_home_overlap_report(pos, hk, sval[hk], v);
-                        unencodable = 1;
+                        REGVM_UNENCODABLE("home overlap: the slot's tracked value changed");
                         break;
                     }
                 }
@@ -65798,7 +65858,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
         if (!term_branch && pre_e >= 0 &&
             regvm_emit_edge_moves(ctx, &ir, ireg, bstart[b], ev_dst, ev_src,
                              ev_off[pre_e], ev_off[pre_e + 1], cycle_reg)) {
-            unencodable = 1;
+            REGVM_UNENCODABLE("IR allocation failed (fall-through edge moves)");
             break;
         }
         /* The fall-through edge's moves run right after the terminator: the
@@ -65808,7 +65868,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
             if (regvm_emit_edge_moves(ctx, &ir, ireg, bstart[b], ev_dst, ev_src,
                                  ev_off[b * 2 + 1], ev_off[b * 2 + 2], cycle_reg) ||
                 regvm_ir_add(ctx, &ir, ROP_branch, bstart[b], &br, 1)) {
-                unencodable = 1;
+                    REGVM_UNENCODABLE("IR allocation failed (fall-through branch)");
                 break;
             }
         }
@@ -66214,6 +66274,8 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
             fd->regvm_fill = NULL;
             fd->regvm_fill_count = 0;
             fd->regvm_src_pc = NULL;
+            const char *enc_why = NULL;
+
             er = regvm_encode_and_verify(ctx, &ir, 1 /* register operands
                                                               are two bytes */,
                                              reg_count,
@@ -66225,7 +66287,8 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                                              &fd->regvm_reg_count,
                                              rcc_canon,
                                              &fd->regvm_rcc,
-                                             &fd->regvm_src_pc);
+                                             &fd->regvm_src_pc,
+                                             &enc_why);
 
 #if QJS_REGVM_THREAD
             /* Whether every opcode has a threaded handler, read from the
@@ -66234,8 +66297,11 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
             fd->regvm_all_threaded =
                 regvm_code_all_threaded(fd->regvm_code, fd->regvm_len);
 #endif
-            if (er == REGVM_REFUSED)
+            if (er == REGVM_REFUSED) {
+                if (enc_why)
+                    unc_why = enc_why;
                 goto refused;
+            }
             if (er)
                 goto done;
             /* The `undefined` list. The area is zeroed first, so only registers
@@ -66287,6 +66353,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
     rc = 0;
     goto done;
  refused:
+    regvm_report_refusal(ctx, fd, unc_why);
     js_regvm_stats.unencodable++;
     *p_refused = 1;
     rc = 0;
@@ -66357,6 +66424,8 @@ static int regvm_is_const_push(int op)
     }
 }
 
+#define REGVM_DEFER(why) do { defer_why = (why); goto deferred; } while (0)
+
 static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                                           const uint8_t *is_leader,
                                           int *pdeferred)
@@ -66421,6 +66490,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
     int pushes = 0, phi_base = 0, n_pushes = 0, n_values = 0, words = 0;
     long long peak_live = 0;
     int b, i, k, w, pos, iter, changed, u, rc = -1, home_mode;
+    const char *defer_why = "?";
 
     if (bc_len <= 0)
         return 0;
@@ -66572,7 +66642,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                 regvm_effect(fd, bc, pos, &np, &ns);
                 if (d < np) {
                     /* the declared stack shape does not balance here */
-                    goto deferred;
+                    REGVM_DEFER("a block's stack depth does not balance");
                 }
                 d += ns - np;
                 /* the peak is interior to the block, not just its exit depth */
@@ -66598,7 +66668,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                     } else if (in_depth[s] != dd) {
                     /* two paths reach the block at different depths, which the
                        declared shape does not show */
-                    goto deferred;
+                    REGVM_DEFER("two paths reach a block at different stack depths");
                     }
                 }
             }
@@ -66609,7 +66679,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
     if (iter == REGVM_MAX_ITERS) {
         /* A fixed point that does not settle is a shape the model cannot
            express: refuse the function, as for a depth disagreement. */
-        goto deferred;
+        REGVM_DEFER("the depth dataflow did not settle");
     }
 
     for (b = 0; b < n_blocks; b++) {
@@ -67231,7 +67301,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                                      home_mode >= 1, 0 };
                 if (regvm_sim_step(fd, bc, pos, scratch, &d, push_base, &sim,
                                    pv, pdef, &ev, NULL, NULL))
-                    goto deferred;
+                    REGVM_DEFER("the stack-shape simulator refused an instruction (SSA)");
             }
             if (d != out_depth[b]) {
                 JS_ThrowInternalError(ctx, "regvm: CFG depth drifted at pc=%d", bstart[b]);
@@ -67264,7 +67334,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                  * would do.
                  */
                 if (out_depth[p] < depth) {
-                    goto deferred;
+                    REGVM_DEFER("a predecessor leaves fewer values than the block expects");
                 }
                 if (first < 0)
                     first = p;
@@ -67376,7 +67446,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
             break;
     }
     if (iter == REGVM_MAX_ITERS)
-        goto deferred;
+        REGVM_DEFER("the SSA did not settle");
 
     /* Every reachable block must have a complete promoted-slot entry state.
        Convergence guarantees it; this is a failsafe that refuses the function.
@@ -67386,10 +67456,10 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
             if (in_depth[b] < 0)
                 continue;
             if (!sset[b])
-                goto deferred;
+                REGVM_DEFER("a reachable block has no promoted-slot entry state");
             for (i = 0; i < ns_ok; i++)
                 if (senc[b * ns_ok + i] < 0)
-                    goto deferred;
+                    REGVM_DEFER("a promoted slot has no entry value");
         }
     }
 
@@ -67532,7 +67602,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                                      home_mode >= 1, 0 };
                 if (regvm_sim_step(fd, bc, pos, scratch, &d, push_base, &sim,
                                    pv, pdef, &ev, NULL, NULL))
-                    goto deferred;
+                    REGVM_DEFER("the stack-shape simulator refused an instruction (liveness)");
                 prom_role = ev.slot_role;
                 prom_k = ev.slot_k;
                 if (sim.apply_homes && ev.split_v >= 0) {
@@ -67557,7 +67627,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                     if (v < 0 || v >= n_values) {
                         /* not a value the SSA ever defined: refuse rather than
                            index a bitset with it */
-                        goto deferred;
+                        REGVM_DEFER("an operand names a value the SSA never defined");
                     }
                     /* Every read is a use for consumption; only a read no
                        earlier definition in this block reaches is
@@ -67746,7 +67816,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                 break;
         }
         if (iter == REGVM_MAX_ITERS)
-            goto deferred;
+            REGVM_DEFER("the liveness dataflow did not settle");
 
         for (b = 0; b < n_blocks; b++) {
             long long pc = 0, po = 0;
@@ -67835,7 +67905,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                                          home_slot_of_def, home_mode >= 1, 0 };
                     if (regvm_sim_step(fd, bc, pos, scratch, &d2, push_base,
                                        &sim, pv, pdef, &ev, NULL, NULL))
-                        goto deferred;
+                        REGVM_DEFER("the stack-shape simulator refused an instruction (value owners)");
                     if (ev.split_v >= 0 && ev.split_src >= 0 &&
                         ev.split_src < n_values &&
                         val_owner[ev.split_v] != val_owner[ev.split_src]) {
@@ -68082,7 +68152,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
         int n_vals_alloc = n_values > 0 ? n_values : 1;
 
         if (home_mode >= 2 && home_mode < 5 && ns_ok > n_values)
-            goto deferred;
+            REGVM_DEFER("more promoted slots than values (home mode 2-4)");
 
         lin = js_malloc(ctx, bc_len * sizeof(int));
         if (!lin)
@@ -68139,7 +68209,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                                      home_mode >= 1, 0 };
                 if (regvm_sim_step(fd, bc, pos, scratch, &d2, push_base, &sim,
                                    pv, pdef, &ev, NULL, NULL))
-                    goto deferred;
+                    REGVM_DEFER("the stack-shape simulator refused an instruction (intervals)");
                 if (sim.apply_homes && ev.split_v >= 0) {
                     if (lin[pos] < istart[ev.split_v])
                         istart[ev.split_v] = lin[pos];
@@ -68249,7 +68319,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                                      home_mode >= 1, 0 };
                 if (regvm_sim_step(fd, bc, pos, scratch, &dd, push_base, &sim,
                                    pv, pdef, &ev, NULL, NULL))
-                    goto deferred;
+                    REGVM_DEFER("the stack-shape simulator refused an instruction (last uses)");
                 if (sim.apply_homes && ev.split_v >= 0 &&
                     ev.split_src >= 0 && ev.split_src < n_values &&
                     last_use[ev.split_src] < lin[pos])
@@ -68742,6 +68812,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
     /* A shape the register model cannot express: counted, and the function is
        left without a register program so the interpreter refuses it at a call
        rather than running a program built from a guess. */
+    regvm_report_refusal(ctx, fd, defer_why);
     js_regvm_stats.deferred++;
     *pdeferred = 1;
     rc = 0;
