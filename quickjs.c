@@ -66447,7 +66447,8 @@ QJS_AOT_STUB JSValue qjs_aot_new_from_shape(JSContext *ctx, void *shape)
     JSObject *p;
     int i;
 
-    obj = JS_NewObjectFromShape(ctx, js_dup_shape(sh), JS_CLASS_OBJECT, NULL);
+    /* the slots live in the object's own block whatever their number (up to the learned maximum): one allocation, not two */
+    obj = JS_NewObjectFromShapeCap(ctx, js_dup_shape(sh), JS_CLASS_OBJECT, NULL, sh->prop_count);
     if (JS_IsException(obj))
         return obj;
     p = JS_VALUE_GET_OBJ(obj);
