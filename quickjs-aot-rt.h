@@ -132,6 +132,9 @@ typedef struct JSAotGenLayout {
     /* Where a closure cell keeps the pointer to its value, so a unit reads a
        captured variable through the function object's cell vector inline. */
     uint32_t off_varref_pvalue;
+    /* A C function object: its class id and where it keeps the function pointer
+       and the magic number, so a unit can tell a builtin from any other callee. */
+    uint32_t class_c_function, off_cfunc_c_function, off_cfunc_magic;
 } JSAotGenLayout;
 
 /* Fold every field after `hash` (the hash field itself is excluded). Shared by
@@ -270,6 +273,17 @@ void qjs_aot_set_reg_b(JSContext *ctx, JSValue *fr, int off, JSValue v);
 /* Mirror SET_REG_P: the store takes over an owned value (adopt in DRC, free the
    old and move in the owning build). Used where the handler uses SET_REG_P. */
 void qjs_aot_set_reg_p(JSContext *ctx, JSValue *fr, int off, JSValue v);
+
+/* The builtins a unit lowers inline. `qjs_aot_intrinsic_fn(id)` returns the C
+   function pointer the builtin's function object holds (`min` and `max` share
+   one, told apart by the magic number 0 and 1), or NULL for an unknown id. The
+   pointers are the same in every runtime and realm. */
+enum {
+    QJS_AOT_INTR_SQRT, QJS_AOT_INTR_ABS, QJS_AOT_INTR_FLOOR, QJS_AOT_INTR_CEIL,
+    QJS_AOT_INTR_ROUND, QJS_AOT_INTR_SIN, QJS_AOT_INTR_COS, QJS_AOT_INTR_MIN,
+    QJS_AOT_INTR_MAX, QJS_AOT_INTR_PARSEINT, QJS_AOT_INTR_COUNT
+};
+void *qjs_aot_intrinsic_fn(int id);
 
 /* Fill one site's polymorphic property cache from an object the compiled body
    just checked. Returns 1 with the slot offset, or 0 when the property is not
