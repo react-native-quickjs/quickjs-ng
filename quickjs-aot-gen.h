@@ -74,6 +74,12 @@ typedef struct JSAotGenFunc {
     char name[128];
     char file[256];
     int line, col;             /* the definition's source position, or 0 */
+    /* The closure-variable table: entry i is the variable behind get_var_ref / put_var_ref i. `closure_type[i]` is the engine's closure type (0 = a local of the
+       creating function, 1 = an argument of it, 2 = a closure variable of it, others = global / module forms) and `closure_idx[i]` the variable's index in that
+       function (locals and arguments are indexed apart). The generator follows a variable to its declaring function with these and the creators' `cpool_fn`. */
+    int closure_count;
+    const uint8_t *closure_type;
+    const uint16_t *closure_idx;
 } JSAotGenFunc;
 
 /* Collect every function bytecode in `rt`, eligible or not. Returns the count
