@@ -25441,6 +25441,23 @@ regvm_t_get_field_chain_slow(REGVM_ARGS)
         __attribute__((musttail)) return regvm_t_get_field_chain_free1(REGVM_PASS);
     }
 #endif
+    /* The second link's site may hold this shape even when the first's did not:
+       try its inline hit before `chain_second_slow`, and on a hit requicken
+       from both sites' kinds. */
+    {
+        int d2 = T_REG(11);
+        int site2 = T_REG(19);
+        JSValue v2;
+        if (site2 != REG_IC_NONE &&
+            regvm_own_read_hit(f->pic, f->b->regvm_pic_holder, FR(d1), site2, &v2)) {
+            if (f->pic != NULL && site1 != REG_IC_NONE &&
+                f->pic[site1].kind == REG_PIC_OWN && f->pic[site2].kind == REG_PIC_OWN)
+                *ip = (uint8_t)ROP_get_field_chain_own;
+            else
+                *ip = (uint8_t)ROP_get_field_chain;
+            T_SET_NEXT_B(d2, v2, T_SZ_CHAIN);
+        }
+    }
     __attribute__((musttail)) return regvm_t_get_field_chain_second_slow(REGVM_PASS);
 }
 
