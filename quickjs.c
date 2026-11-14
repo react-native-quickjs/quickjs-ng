@@ -33,8 +33,14 @@
 
 #if QJS_AOT_PROFILE && !defined(_WIN32)
 #include <dlfcn.h> /* dladdr */
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>   /* the main image's header and slide */
+#include <mach-o/loader.h> /* LC_SYMTAB / __LINKEDIT walk, for naming static C callees */
+#include <mach-o/nlist.h>
+#else
 #include <elf.h>   /* symbol table walk, for naming static C callees */
 #include <link.h>  /* dl_iterate_phdr, for the image load base */
+#endif
 #endif
 
 #ifndef QJS_FNSAMPLE
@@ -64833,7 +64839,7 @@ static void aot_type_str(uint16_t bits, char *out, int n)
         snprintf(out, (size_t)n, "none");
 }
 
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(__APPLE__)
 static int aot_phdr_base(struct dl_phdr_info *info, size_t size, void *data)
 {
     (void)size;
@@ -64847,7 +64853,63 @@ static int aot_phdr_base(struct dl_phdr_info *info, size_t size, void *data)
    builds are linked -no-pie. */
 static const char *aot_sym_name(JSRuntime *rt, void *p, char *buf, int n)
 {
-#if !defined(_WIN32)
+#if defined(__APPLE__)
+    /* dladdr sees exported symbols only; the main image's LC_SYMTAB (in
+       __LINKEDIT, mapped) also holds the static functions of an unstripped
+       binary: the nearest preceding defined section symbol names `p`. */
+    Dl_info di;
+    const struct mach_header_64 *mh;
+    const struct load_command *lc;
+    const struct symtab_command *st = NULL;
+    const struct segment_command_64 *le = NULL;
+    const struct nlist_64 *sym;
+    const char *str;
+    uintptr_t slide, lebase, off, bestv = 0;
+    uint32_t i, best = 0;
+    int have_best = 0;
+
+    (void)rt;
+    if (!p)
+        return NULL;
+    if (dladdr(p, &di) && di.dli_sname && di.dli_saddr == p) {
+        snprintf(buf, (size_t)n, "%s", di.dli_sname[0] == '_' ? di.dli_sname + 1 : di.dli_sname);
+        return buf;
+    }
+    mh = (const struct mach_header_64 *)_dyld_get_image_header(0);
+    slide = (uintptr_t)_dyld_get_image_vmaddr_slide(0);
+    if (!mh || mh->magic != MH_MAGIC_64)
+        return NULL;
+    lc = (const struct load_command *)(mh + 1);
+    for (i = 0; i < mh->ncmds; i++) {
+        if (lc->cmd == LC_SYMTAB)
+            st = (const struct symtab_command *)lc;
+        else if (lc->cmd == LC_SEGMENT_64 &&
+                 !strcmp(((const struct segment_command_64 *)lc)->segname, "__LINKEDIT"))
+            le = (const struct segment_command_64 *)lc;
+        lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+    }
+    if (!st || !le)
+        return NULL;
+    lebase = slide + le->vmaddr - le->fileoff;
+    sym = (const struct nlist_64 *)(lebase + st->symoff);
+    str = (const char *)(lebase + st->stroff);
+    off = (uintptr_t)p - slide;
+    for (i = 0; i < st->nsyms; i++) {
+        if ((sym[i].n_type & N_STAB) || (sym[i].n_type & N_TYPE) != N_SECT)
+            continue;
+        if (sym[i].n_value <= off && (!have_best || sym[i].n_value > bestv)) {
+            best = i;
+            bestv = sym[i].n_value;
+            have_best = 1;
+        }
+    }
+    if (have_best) {
+        const char *nm = str + sym[best].n_un.n_strx;
+        snprintf(buf, (size_t)n, "%s", nm[0] == '_' ? nm + 1 : nm);
+        return buf;
+    }
+    return NULL;
+#elif !defined(_WIN32)
     Dl_info di;
     unsigned char *img;
     Elf64_Ehdr *eh;
