@@ -336,6 +336,23 @@ QJS_AOT_STUB int qjs_aot_put_field_slow(JSContext *ctx, JSRegRun *f, uint8_t *ip
    exception. Runs no JavaScript. */
 int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out);
 
+/* The allocating ops a compiled body runs without stepping the handler. Each does
+   what the interpreter's handler does and returns 0 with an OWNED *out, or -1 on an
+   exception (`special_object` returns 1 for a kind it leaves to the handler).
+   `object_template` is an object literal (the template's shape is the
+   profiled final shape); `special_object` covers `arguments` (unmapped and mapped:
+   the frame is `f`), the function itself, new.target and most of the family;
+   `array_from` is an array literal of `na` registers. */
+int qjs_aot_object_template(JSContext *ctx, JSRegRun *f, int index, JSValue *out);
+int qjs_aot_special_object(JSContext *ctx, JSRegRun *f, int kind, JSValue *out);
+int qjs_aot_array_from(JSContext *ctx, JSValue *argv, int na, JSValue *out);
+/* `f.apply(this, arguments)`: with the builtin `apply` and this frame's arguments not
+   reified, calls the callee with the frame's own arguments. 1 with an owned *out when
+   it did; 0 when the case needs the handler (not the builtin, or the arguments
+   object exists); -1 on an exception. `window` is the three registers (callee, apply,
+   this). */
+int qjs_aot_apply_arguments(JSContext *ctx, JSRegRun *f, JSValue *window, JSValue *out);
+
 /* Mirror the int/float fast path of REGVM_CMP_BRANCH. Return 1 when the
    comparison is decided (*take), 0 when it needs the generic slow path. */
 int qjs_aot_branch_cmp(int sub, JSValue a, JSValue b, int *take);
