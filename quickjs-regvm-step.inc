@@ -4403,6 +4403,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_object_fill(uint8_t *ip, JSValue *fr, JSReg
                             vals[i2] = JS_UNDEFINED;
 #endif
                         }
+                        js_aot_content_enter(ctx->rt, po);
                         REGVM_NEXT();
                     }
                 }
@@ -4669,6 +4670,11 @@ static uint8_t *REGVM_CC regvm_s_ROP_put_field(uint8_t *ip, JSValue *fr, JSRegRu
                             JSValue *slot = (JSValue *)((char *)p->prop + e->slot_off);
                             JSValue old = *slot;
 
+#if JS_ENABLE_IC
+                            if (unlikely(p->is_prototype))
+                                ic_watchpoint_bump(ctx->rt);
+#endif
+                            js_aot_content_store(ctx->rt, p, e->slot_off / sizeof(JSProperty), regs[v]);
                             *slot = js_dup(regs[v]);
                             JS_FreeValue(ctx, old);
                             REGVM_NEXT();
