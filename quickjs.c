@@ -7470,6 +7470,11 @@ static void gc_free_cycles(JSRuntime *rt)
     init_list_head(&rt->gc_zero_ref_count_list);
 }
 
+size_t JS_GetMallocSize(JSRuntime *rt)
+{
+    return rt->malloc_state.malloc_size;
+}
+
 void JS_RunGC(JSRuntime *rt)
 {
     /* decrement the reference of the children of each object. mark =
