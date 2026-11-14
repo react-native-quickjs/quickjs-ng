@@ -73467,12 +73467,13 @@ QJS_AOT_STUB int qjs_aot_binary_rr(JSContext *ctx, JSRegRun *f, int sub, JSValue
                                    JSValue b, int d, int ra, JSValue *out)
 {
     int own1 = (sub & 0x100) != 0;
+    int unique = (sub & 0x200) != 0;   /* the generator has shown that no other register of the frame holds the string */
 
     sub &= 0xff;
     if (regvm_num_fast(sub, a, b, out))
         return 1;
     if (sub == REG_BIN_ADD) {
-        int ar = regvm_accum_append_u(ctx, f->b, f->fr, f->arg_buf, f->argc, d, ra, b, 0, own1);
+        int ar = regvm_accum_append_u(ctx, f->b, f->fr, f->arg_buf, f->argc, d, ra, b, unique, own1);
 
         ACC_NOTE();
         if (ar > 0)
