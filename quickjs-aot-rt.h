@@ -248,6 +248,7 @@ QJS_AOT_STUB int qjs_aot_global_put(JSContext *ctx, uint32_t atom, JSValue val, 
 QJS_AOT_STUB int qjs_aot_add_str(JSContext *ctx, JSValue a, JSValue b, JSValue *out);
 QJS_AOT_STUB JSValue qjs_aot_new_array_inline(JSContext *ctx, uint32_t n);
 QJS_AOT_STUB JSValue qjs_aot_stack_object_init(void *buf, size_t bytes, void *shape);
+QJS_AOT_STUB JSValue qjs_aot_stack_object_init_cap(void *buf, size_t bytes, void *shape, uint32_t cap);
 QJS_AOT_STUB JSValue qjs_aot_stack_array_init(JSContext *ctx, void *buf, size_t bytes, uint32_t n);
 QJS_AOT_STUB void qjs_aot_stack_release(JSContext *ctx, JSValue obj, JSValue arr);
 QJS_AOT_STUB int qjs_aot_stack_migrate(JSContext *ctx, JSValue obj, JSValue arr, JSValue *hobj, JSValue *harr);

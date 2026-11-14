@@ -66784,6 +66784,24 @@ QJS_AOT_STUB void *qjs_aot_class_shape(JSContext *ctx, JSValue proto, const uint
     return NULL;
 }
 
+/* The inline slots an object of `sh` is given when it is to hold `cap` fields: the property array of a shape doubles as fields are added, and the engine's add paths grow an object's array
+   only when the shape's size changes, so an object must have room for the whole array its shape names (an add that keeps the size writes the next slot in place) and for the size the shape
+   reaches when it holds `cap` fields (the generated code cannot grow an array). A `cap` not above the field count is the shape's own array size; a room above what the inline capacity can
+   name is the field count. */
+static uint32_t js_aot_inline_room(JSShape *sh, uint32_t cap)
+{
+    uint32_t n = sh->prop_count, size = sh->prop_size, cnt = n;
+
+    if (cap <= n || cap > JS_OBJ_LEARNED_INLINE_MAX)
+        return size > n && size <= JS_OBJ_LEARNED_INLINE_MAX ? size : n;
+    while (cnt < cap) {
+        cnt++;
+        if (cnt > size)
+            size = size * 2 > cnt ? size * 2 : cnt;
+    }
+    return size <= JS_OBJ_LEARNED_INLINE_MAX ? size : n;
+}
+
 /* A new ordinary object of a class shape (qjs_aot_class_shape), every field undefined. The caller writes the fields and then calls
    qjs_aot_object_filled, which checks the slot claims of a contracted layout as the last add of a field would.
    `cap` is the number of slots to reserve: the fields the object gains after its constructor then fit without growing the array. A cap
@@ -66805,20 +66823,7 @@ QJS_AOT_STUB JSValue qjs_aot_new_from_shape_cap(JSContext *ctx, void *shape, uin
             p->prop[i].u.value = JS_UNDEFINED;
         return obj;
     }
-    if (cap <= n || cap > JS_OBJ_LEARNED_INLINE_MAX) {
-        cap = n;
-    } else {
-        /* the property array of a shape doubles as fields are added, and an add that changes the shape's size needs the inline capacity to cover the
-           new size (the generated code cannot grow an array): the room is the size the shape has reached when it holds `cap` fields */
-        uint32_t size = sh->prop_size, cnt = n;
-
-        while (cnt < cap) {
-            cnt++;
-            if (cnt > size)
-                size = size * 2 > cnt ? size * 2 : cnt;
-        }
-        cap = size <= JS_OBJ_LEARNED_INLINE_MAX ? size : n;
-    }
+    cap = js_aot_inline_room(sh, cap);
     /* what JS_NewObjectFromShapeCapExtra does for a plain object, without its class switch: one block holding the body and the cap slots */
     js_trigger_gc(rt, sizeof(JSObject));
     p = js_malloc(ctx, offsetof(JSObject, u) + cap * sizeof(JSProperty));
@@ -66964,26 +66969,33 @@ static JSObject *js_stack_block(void *buf, size_t bytes, size_t body)
     return p;
 }
 
-/* An ordinary object of `shape`, every field undefined, in `buf` (aligned, `bytes` long). JS_UNINITIALIZED when it does not fit. */
-QJS_AOT_STUB JSValue qjs_aot_stack_object_init(void *buf, size_t bytes, void *shape)
+/* An ordinary object of `shape`, every field undefined, in `buf` (aligned, `bytes` long), with the room for `cap` fields (qjs_aot_new_from_shape_cap's rounding; a `cap` of 0 is the shape's own
+   field count). JS_UNINITIALIZED when it does not fit. */
+QJS_AOT_STUB JSValue qjs_aot_stack_object_init_cap(void *buf, size_t bytes, void *shape, uint32_t cap)
 {
     JSShape *sh = (JSShape *)shape;
-    int n = sh->prop_count, i;
+    int n = sh->prop_count, i, room;
     JSObject *p;
     if (n <= 0 || n > JS_OBJ_LEARNED_INLINE_MAX)
         return JS_UNINITIALIZED;
-    p = js_stack_block(buf, bytes, offsetof(JSObject, u) + n * sizeof(JSProperty));
+    room = (int)js_aot_inline_room(sh, cap);
+    p = js_stack_block(buf, bytes, offsetof(JSObject, u) + room * sizeof(JSProperty));
     if (p == NULL)
         return JS_UNINITIALIZED;
-    p->prop_inline_cap = n;
+    p->prop_inline_cap = room;
     p->class_id = JS_CLASS_OBJECT;
     p->arr_kind = JS_ARR_KIND_GENERIC;
     p->extensible = true;
     p->shape = js_dup_shape(sh);
     p->prop = (JSProperty *)((uint8_t *)p + offsetof(JSObject, u));
-    for (i = 0; i < n; i++)
+    for (i = 0; i < room; i++)
         p->prop[i].u.value = JS_UNDEFINED;
     return JS_MKPTR(JS_TAG_OBJECT, p);
+}
+
+QJS_AOT_STUB JSValue qjs_aot_stack_object_init(void *buf, size_t bytes, void *shape)
+{
+    return qjs_aot_stack_object_init_cap(buf, bytes, shape, 0);
 }
 
 /* An empty Array of the realm's array shape in `buf`, with room for `n` elements in the block itself (a push past `n` moves the elements to a heap block, as for
@@ -67073,7 +67085,7 @@ QJS_AOT_STUB int qjs_aot_stack_migrate(JSContext *ctx, JSValue obj, JSValue arr,
     }
     if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
         p = JS_VALUE_GET_OBJ(obj);
-        ho = qjs_aot_new_from_shape(ctx, p->shape);
+        ho = qjs_aot_new_from_shape_cap(ctx, p->shape, p->prop_inline_cap);   /* the room the stack block had: fields the object gains after the move fit as they did before it */
         if (JS_IsException(ho)) {
             JS_FreeValue(ctx, ha);
             return 0;
