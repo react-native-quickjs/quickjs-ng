@@ -18862,6 +18862,17 @@ static void js_aot_content_enter_slow(JSRuntime *rt, JSObject *p, bool filled)
         js_aot_layout_break(rt, id);
         return;
     }
+    /* (QJS_AOT_DIRECT_FIELDS builds only.) A compiled body addresses the slots of a contracted layout's object at a fixed offset from the object (no test per access), so the promise is
+       that every object of the layout keeps its properties in its own block. An object that enters the shape with its properties elsewhere (a
+       plain object whose block did not fit, or any other class) breaks the layout. Leaving the shape is already a break, so the promise cannot be
+       lost later. */
+#ifdef QJS_AOT_DIRECT_FIELDS
+    if (unlikely(p->class_id != JS_CLASS_OBJECT ||
+                 p->prop != (JSProperty *)((uint8_t *)p + offsetof(JSObject, u)))) {
+        js_aot_layout_break(rt, id);
+        return;
+    }
+#endif
     if (!((rt->aot_claimed >> (id - 1)) & 1))
         return;
     n = p->shape->prop_count;
@@ -30124,8 +30135,51 @@ static const JSAotRatEnt *rat_find(uintptr_t ra)
     }
     return NULL;
 }
+/* Every bound bytecode by its unit digest, so a frame of the return-address table finds the function even when the unit holds no entry for it (a function only
+   inlined into others) or another bytecode took its table slot. Open addressing on the first digest word; a removed entry is a tombstone. */
+typedef struct JSAotRbcEnt { uint8_t d[16]; JSFunctionBytecode *b; } JSAotRbcEnt;
+static JSAotRbcEnt *rbc_tab;
+static uint32_t rbc_cap, rbc_n, rbc_used;
+#define RBC_TOMB ((JSFunctionBytecode *)1)
+static uint32_t rbc_hash(const uint8_t *d) { uint64_t h; memcpy(&h, d, 8); return (uint32_t)((h * 0x9E3779B97F4A7C15ull) >> 40); }
+static void rbc_add(const uint8_t *d, JSFunctionBytecode *b)
+{
+    uint32_t i;
+    if ((rbc_used + 1) * 2 > rbc_cap) {
+        uint32_t nc = rbc_cap ? (rbc_n * 4 > rbc_cap ? rbc_cap * 2 : rbc_cap) : 64, k;
+        JSAotRbcEnt *nt = (malloc)(nc * sizeof(*nt));
+        if (!nt) return;
+        memset(nt, 0, nc * sizeof(*nt));
+        for (k = 0; k < rbc_cap; k++) {
+            if (rbc_tab[k].b && rbc_tab[k].b != RBC_TOMB) {
+                for (i = rbc_hash(rbc_tab[k].d) & (nc - 1); nt[i].b; i = (i + 1) & (nc - 1)) ;
+                nt[i] = rbc_tab[k];
+            }
+        }
+        if (rbc_tab) (free)(rbc_tab);
+        rbc_tab = nt; rbc_cap = nc; rbc_used = rbc_n;
+    }
+    for (i = rbc_hash(d) & (rbc_cap - 1); rbc_tab[i].b && rbc_tab[i].b != RBC_TOMB; i = (i + 1) & (rbc_cap - 1)) ;
+    if (!rbc_tab[i].b) rbc_used++;
+    memcpy(rbc_tab[i].d, d, 16); rbc_tab[i].b = b; rbc_n++;
+}
+static void rbc_del(JSFunctionBytecode *b)
+{
+    uint32_t k;
+    for (k = 0; k < rbc_cap; k++)
+        if (rbc_tab[k].b == b) { rbc_tab[k].b = RBC_TOMB; rbc_n--; }
+}
+static JSFunctionBytecode *rbc_find(const uint8_t *d)
+{
+    uint32_t i;
+    if (!rbc_cap) return NULL;
+    for (i = rbc_hash(d) & (rbc_cap - 1); rbc_tab[i].b; i = (i + 1) & (rbc_cap - 1))
+        if (rbc_tab[i].b != RBC_TOMB && memcmp(rbc_tab[i].d, d, 16) == 0) return rbc_tab[i].b;
+    return NULL;
+}
 static JSFunctionBytecode *rat_bc(const uint8_t *d)
 {
+    { JSFunctionBytecode *rb = rbc_find(d); if (rb) return rb; }
     uint32_t lo = 0, hi = qjs_aot_count;
     while (lo < hi) {
         uint32_t mid = lo + (hi - lo) / 2;
@@ -68765,6 +68819,7 @@ static void js_aot_bind(JSFunctionBytecode *b)
     uint8_t digest[16];
     uint32_t lo, hi;
 
+    if (rbc_n) rbc_del(b);
     if (b->aot_fn != NULL && b->aot_index != UINT32_MAX && b->realm->rt->aot_bound != NULL) {
         b->realm->rt->aot_bound[b->aot_index] = 0;
         if (aot_bc_tab && aot_bc_tab[b->aot_index] == b) aot_bc_tab[b->aot_index] = NULL;
@@ -68785,6 +68840,7 @@ static void js_aot_bind(JSFunctionBytecode *b)
     if (!b->regvm_compiled || b->regvm_len <= 0 || b->is_lazy)
         return;
     js_aot_digest(b, digest);
+    rbc_add(digest, b);
     /* A constructor of a contracted layout is marked whether or not the unit
        compiled it: its function object is what the layout's chain is built from. */
     if (&qjs_aot_layout_ctor != NULL && qjs_aot_layout_ctor(digest))
@@ -84337,6 +84393,7 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
 #if QJS_AOT || QJS_AOT_GEN
     /* After the register PIC went (every entry reset moves aot_pic_epoch), the unit index is free for
        another bytecode to bind. */
+    if (rbc_n) rbc_del(b);
     if (b->aot_fn != NULL && b->aot_index != UINT32_MAX && rt->aot_bound != NULL) {
         rt->aot_bound[b->aot_index] = 0;
         if (aot_bc_tab && aot_bc_tab[b->aot_index] == b) aot_bc_tab[b->aot_index] = NULL;
