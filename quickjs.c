@@ -21307,12 +21307,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_get_arg2): *sp++ = js_dup(arg_buf[2]); BREAK;
         CASE(OP_get_arg3): *sp++ = js_dup(arg_buf[3]); BREAK;
         CASE(OP_put_arg0): set_value(ctx, &arg_buf[0], *--sp); BREAK;
-        CASE(OP_put_arg2): set_value(ctx, &arg_buf[2], *--sp); BREAK;
-        CASE(OP_put_arg3): set_value(ctx, &arg_buf[3], *--sp); BREAK;
         CASE(OP_set_arg0): set_value(ctx, &arg_buf[0], js_dup(sp[-1])); BREAK;
-        CASE(OP_set_arg1): set_value(ctx, &arg_buf[1], js_dup(sp[-1])); BREAK;
-        CASE(OP_set_arg2): set_value(ctx, &arg_buf[2], js_dup(sp[-1])); BREAK;
-        CASE(OP_set_arg3): set_value(ctx, &arg_buf[3], js_dup(sp[-1])); BREAK;
+        CASE(OP_reserved1):
+        CASE(OP_reserved2):
+        CASE(OP_reserved3):
+            JS_ThrowInternalError(ctx, "invalid opcode (retired slot)");
+            goto exception;
         CASE(OP_get_var_ref0): *sp++ = js_dup(*var_refs[0]->pvalue); BREAK;
         CASE(OP_get_var_ref1): *sp++ = js_dup(*var_refs[1]->pvalue); BREAK;
         CASE(OP_get_var_ref2): *sp++ = js_dup(*var_refs[2]->pvalue); BREAK;
@@ -21531,6 +21531,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto exception;
             }
             BREAK;
+        CASE(OP_for_in_next_if_false):
+            sf->cur_pc = pc;
+            if (js_for_in_next(ctx, sp))
+                goto exception;
+            sp += 2;
+            /* fall through */
         CASE(OP_if_false):
             {
                 int res;
@@ -22678,6 +22684,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             }
             BREAK;
 
+        CASE(OP_get_arg8_loc8_array_el):
+            *sp++ = js_dup(arg_buf[*pc++]);
+            /* fall through */
         CASE(OP_get_loc8_array_el):
             {
                 JSValue val;
@@ -36644,6 +36653,9 @@ static void dump_byte_code(JSContext *ctx, int pass,
         case OP_FMT_none_loc:
             idx = (op - OP_get_loc0) % 4;
             goto has_loc;
+        case OP_FMT_loc8_loc8:
+            idx = get_u8(tab + pos + 1);
+            goto has_loc;
         case OP_FMT_loc8:
             idx = get_u8(tab + pos);
             goto has_loc;
@@ -39084,8 +39096,11 @@ static void put_short_code(DynBuf *bc_out, int op, int idx)
             }
             break;
         case OP_set_arg:
-            dbuf_putc(bc_out, OP_set_arg0 + idx);
-            return;
+            if (idx == 0) {
+                dbuf_putc(bc_out, OP_set_arg0);
+                return;
+            }
+            break;
         case OP_get_var_ref:
             dbuf_putc(bc_out, OP_get_var_ref0 + idx);
             return;
@@ -39964,6 +39979,17 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
             }
             goto no_change;
 
+        case OP_for_in_next:
+            if (code_match(&cc, pos_next, OP_if_false, -1)) {
+                if (cc.line_num >= 0) line_num = cc.line_num;
+                if (cc.col_num >= 0) col_num = cc.col_num;
+                pos_next = cc.pos;
+                label = cc.label;
+                op = OP_for_in_next_if_false;
+                goto has_label;
+            }
+            goto no_change;
+
         case OP_swap:
             // transformation: swap swap -> nothing!
             if (code_match(&cc, pos_next, OP_swap, -1, -1)) {
@@ -40131,6 +40157,18 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
             {
                 int idx;
                 idx = get_u16(bc_buf + pos + 1);
+                if (op == OP_get_arg && idx < 256 &&
+                    code_match(&cc, pos_next, OP_get_loc, -1, OP_get_array_el, -1) &&
+                    cc.idx < 256) {
+                    if (cc.line_num >= 0) line_num = cc.line_num;
+                    if (cc.col_num >= 0) col_num = cc.col_num;
+                    add_pc2line_info(s, bc_out.size, line_num, col_num);
+                    dbuf_putc(&bc_out, OP_get_arg8_loc8_array_el);
+                    dbuf_putc(&bc_out, idx);
+                    dbuf_putc(&bc_out, cc.idx);
+                    pos_next = cc.pos;
+                    break;
+                }
                 add_pc2line_info(s, bc_out.size, line_num, col_num);
                 put_short_code(&bc_out, op, idx);
             }
@@ -40546,6 +40584,12 @@ static __exception int compute_stack_size(JSContext *ctx,
             break;
         case OP_if_true:
         case OP_if_false:
+            diff = get_u32(bc_buf + pos + 1);
+            if (ss_check(ctx, s, pos + 1 + diff, op, stack_len, catch_pos))
+                goto fail;
+            break;
+        case OP_for_in_next_if_false:
+            stack_len--;
             diff = get_u32(bc_buf + pos + 1);
             if (ss_check(ctx, s, pos + 1 + diff, op, stack_len, catch_pos))
                 goto fail;
@@ -43874,9 +43918,6 @@ static bool js_argv_safe_opcode(const uint8_t *bc, int pos, int op)
     switch (op) {
     case OP_put_arg:  case OP_set_arg:
     case OP_put_arg0: case OP_set_arg0:
-    case OP_set_arg1:
-    case OP_put_arg2: case OP_set_arg2:
-    case OP_put_arg3: case OP_set_arg3:
     case OP_make_arg_ref:
     case OP_eval:     case OP_apply_eval:
     case OP_get_arg_el:
