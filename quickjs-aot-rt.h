@@ -173,6 +173,8 @@ typedef struct JSAotGenLayout {
     /* A rope whose linearised form is memoised holds the flat string on the left and the
        empty string on the right: where those two values sit. */
     uint32_t off_rope_left, off_rope_right;
+    /* The epoch at which the typed-array `length` accessor was last validated. */
+    uint32_t off_ctx_ta_len_epoch;
 } JSAotGenLayout;
 
 /* Fold every field after `hash` (the hash field itself is excluded). Shared by
@@ -435,6 +437,9 @@ int qjs_aot_object_fill_b(JSContext *ctx, struct JSFunctionBytecode *b, JSValue 
    unchanged. */
 int qjs_aot_strproto_slot(JSContext *ctx, uint32_t atom, const void **shape,
                           const void **prs, uint32_t *off);
+/* 1 when every typed-array class reads `length` from the builtin accessor (no class
+   prototype shadows it); revalidates after a watched change. */
+int qjs_aot_ta_len_valid(JSContext *ctx);
 /* Stores a number into an in-range element of a typed array; 0 when the case is not that. */
 int qjs_aot_typed_put(JSValue recv, uint32_t idx, JSValue v);
 /* `f.apply(this, arguments)`: with the builtin `apply` and this frame's arguments not
