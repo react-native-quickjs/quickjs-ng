@@ -11735,7 +11735,7 @@ free_plain_object(JSRuntime *rt, JSObject *p, JSFreeAcc *acc)
                 JSValue v = p->prop[i].u.value;
                 if (JS_VALUE_HAS_REF_COUNT(v) && (SPL_K(7), 1) &&
                     --JS_REF_COUNT(JS_VALUE_GET_PTR(v)) <= 0) {
-                    if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && Y_IS(JS_VALUE_GET_PTR(v))) {
+                    if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && (Y_IS(JS_VALUE_GET_PTR(v)) || Y_NEGCHK(v))) {
                         pr++;
                         continue;
                     }
