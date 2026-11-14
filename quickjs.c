@@ -9259,6 +9259,7 @@ void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
 
     list_for_each(el, &rt->gc_notrace_list) {
         JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
+        s->notrace_count++;
         if (JS_GC_TYPE(gp) == JS_GC_OBJ_TYPE_FUNCTION_BYTECODE)
             compute_bytecode_size((JSFunctionBytecode *)gp, hp);
     }
@@ -9267,6 +9268,18 @@ void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
         JSObject *p;
         JSShape *sh;
         JSShapeProperty *prs;
+
+        /* Counted before the `continue`s below: obj_count is only JSObjects,
+           not the traced population. */
+        s->traced_count++;
+        switch (JS_GC_TYPE(gp)) {
+        case JS_GC_OBJ_TYPE_JS_OBJECT:         s->traced_js_object++; break;
+        case JS_GC_OBJ_TYPE_FUNCTION_BYTECODE: s->traced_fnbc++;      break;
+        case JS_GC_OBJ_TYPE_SHAPE:             s->traced_shape++;     break;
+        case JS_GC_OBJ_TYPE_VAR_REF:           s->traced_var_ref++;   break;
+        case JS_GC_OBJ_TYPE_ASYNC_FUNCTION:    s->traced_async++;     break;
+        default:                               s->traced_other++;     break;
+        }
 
         /* XXX: could count the other GC object types too */
         if (JS_GC_TYPE(gp) == JS_GC_OBJ_TYPE_FUNCTION_BYTECODE) {

@@ -733,6 +733,11 @@ typedef struct JSMemoryUsage {
     int64_t c_func_count, array_count;
     int64_t fast_array_count, fast_array_elements;
     int64_t binary_object_count, binary_object_size;
+    /* The population the cycle collector walks (gc_obj_list), by type.
+       `obj_count` counts only JSObjects, so it is a strict subset. */
+    int64_t traced_count, notrace_count;
+    int64_t traced_js_object, traced_fnbc, traced_shape, traced_var_ref,
+            traced_async, traced_other;
 } JSMemoryUsage;
 
 JS_EXTERN void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s);
