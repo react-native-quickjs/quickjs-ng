@@ -30421,7 +30421,9 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
         ast->fresh = 0;
 #endif
         if (!b->regvm_compiled) {
-            JS_ThrowInternalError(caller_ctx, "register VM: function was not lowered");
+            JS_ThrowInternalError(caller_ctx,
+                                  "register VM: function was not lowered "
+                                  "(engine bug: the compile-time refusal was not raised)");
             goto exception;
         }
         /*
@@ -41598,6 +41600,9 @@ typedef struct JSFunctionDef {
        retried with the frame authoritative: no slot promotion, reuse,
        frame-read folding, hoisting or light frame. */
     uint8_t regvm_conservative;
+    /* Why the backend refused this function (a static string), for the
+       compile-time error. NULL when it lowered. */
+    const char *regvm_defer_why;
     uint8_t regvm_all_threaded; /* every opcode has a threaded handler */
     JSRegRCC *regvm_rcc;    /* section 6.2 side table, moved to the bytecode */
     uint16_t *regvm_fill;   /* fill list, moved to the bytecode */
@@ -65304,11 +65309,12 @@ static int regvm_report_deferred_on(void)
 #endif
 
 /* Print "regvm: refused <name> (<file>:<line>): <why>" once per refusal. */
-static void regvm_report_refusal(JSContext *ctx, const JSFunctionDef *fd,
+static void regvm_report_refusal(JSContext *ctx, JSFunctionDef *fd,
                                  const char *why)
 {
     const char *name, *file;
 
+    fd->regvm_defer_why = why;
     if (!regvm_report_deferred_on())
         return;
     name = fd->func_name != JS_ATOM_NULL ? JS_AtomToCString(ctx, fd->func_name)
@@ -65328,9 +65334,17 @@ static void regvm_report_refusal(JSContext *ctx, const JSFunctionDef *fd,
 /*
  * The final refusal (after the conservative retry) is not supposed to happen:
  * every deferral site carries a comment naming the invariant that makes it
- * unreachable. Under QJS_REGVM_VERIFY, reaching one is a failure.
+ * unreachable. Under QJS_REGVM_VERIFY, reaching one is a failure; the site's
+ * reason is printed so the invariant that broke is named.
+ *
+ * (Not `assert`: the reason is a runtime string, and `assert`'s argument must
+ * still be valid when it is compiled out -- a debug build without NDEBUG would
+ * not accept a non-literal there.)
  */
-#define REGVM_VERIFY_DEAD_END(why) assert(0 && "unreachable refusal: " why)
+#define REGVM_VERIFY_DEAD_END(why) do { \
+        fprintf(stderr, "regvm: unreachable refusal reached: %s\n", (why)); \
+        abort(); \
+    } while (0)
 #else
 #define REGVM_VERIFY_DEAD_END(why) ((void)0)
 #endif
@@ -66617,6 +66631,8 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
     int b, i, k, w, pos, iter, changed, u, rc = -1, home_mode;
     int retry = 0;
     const char *defer_why = "?";
+    if (REGVM_KNOB("REGVM_FORCE_DEFER"))
+        REGVM_DEFER("forced by REGVM_FORCE_DEFER");
     const char *enc_why = NULL;
 
     if (bc_len <= 0)
@@ -69792,6 +69808,20 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
        decodes exactly, is fully classified, and has coherent targets. */
     if (js_regvm_scan(ctx, fd))
         goto fail;
+    if (!fd->regvm_compiled) {
+        /* No stack interpreter can run this function, so it must not be
+           created: the error belongs at the function's source position, not the
+           first call. */
+        const char *fname = fd->filename != JS_ATOM_NULL
+                                ? JS_AtomToCString(ctx, fd->filename) : NULL;
+        JS_ThrowInternalError(ctx,
+                              "register VM: this function cannot be lowered: %s (%s:%d)",
+                              fd->regvm_defer_why ? fd->regvm_defer_why : "unknown",
+                              fname ? fname : "?", fd->line_num);
+        if (fname)
+            JS_FreeCString(ctx, fname);
+        goto fail;
+    }
 #endif
 
     function_size = sizeof(*b);
@@ -74598,6 +74628,12 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
         uint8_t compiled;
         if (bc_get_u8(s, &compiled))
             goto fail;
+        if (!compiled) {
+            /* No stack interpreter can run a function without a register
+               program, so reject the blob at load. */
+            JS_ThrowSyntaxError(ctx, "bytecode without a register program");
+            goto fail;
+        }
         if (compiled) {
             int reg_count, ctl_count, pic_count, regvm_len;
             uint8_t version;
