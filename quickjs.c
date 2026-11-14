@@ -85181,6 +85181,11 @@ regvm_wire_decode(BCReaderState *s, JSFunctionBytecode *b,
             JS_ThrowSyntaxError(ctx, "invalid register constant kind %d", ops[1]);
             goto fail_ins;
         }
+        if (op == ROP_make_closure &&
+            JS_VALUE_GET_TAG(b->cpool[ops[1]]) != JS_TAG_FUNCTION_BYTECODE) {
+            JS_ThrowSyntaxError(ctx, "register closure constant is not a function");
+            goto fail_ins;
+        }
         if (!regvm_slot_operands_ok(b, op, ops)) {
             JS_ThrowSyntaxError(ctx, "register slot out of range");
             goto fail_ins;
@@ -85371,6 +85376,21 @@ static int JS_ReadFunctionBytecode(BCReaderState *s, JSFunctionBytecode *b,
                 return -1;
             }
             put_u32(bc_buf + pos + 1, atom);
+            break;
+        case OP_FMT_const:
+        case OP_FMT_const8:
+            /* The constant pool was read before the code: an operand must name
+               an entry, and a closure must name function bytecode, which the
+               interpreter takes as such. */
+            idx = short_opcode_info(op).fmt == OP_FMT_const ?
+                get_u32(bc_buf + pos + 1) : bc_buf[pos + 1];
+            if (idx >= (uint32_t)b->cpool_count ||
+                ((op == OP_fclosure || op == OP_fclosure8) &&
+                 JS_VALUE_GET_TAG(b->cpool[idx]) != JS_TAG_FUNCTION_BYTECODE)) {
+                JS_ThrowSyntaxError(s->ctx, "invalid constant operand");
+                b->byte_code_len = pos;
+                return -1;
+            }
             break;
         default:
             break;
@@ -85693,6 +85713,11 @@ static int regvm_validate_code(JSContext *ctx, const JSFunctionBytecode *b)
         if (op == ROP_load_const &&
             ops[1] != REG_CONST_CPOOL && ops[1] != REG_CONST_ATOM) {
             JS_ThrowSyntaxError(ctx, "invalid register constant kind %d", ops[1]);
+            goto done;
+        }
+        if (op == ROP_make_closure &&
+            JS_VALUE_GET_TAG(b->cpool[ops[1]]) != JS_TAG_FUNCTION_BYTECODE) {
+            JS_ThrowSyntaxError(ctx, "register closure constant is not a function");
             goto done;
         }
         for (m = 0; fmt[m]; m++) {
@@ -86354,6 +86379,8 @@ static JSValue JS_ReadModule(BCReaderState *s)
             } else {
                 if (bc_get_leb128_int(s, &me->u.req_module_idx))
                     goto fail;
+                if ((uint32_t)me->u.req_module_idx >= (uint32_t)m->req_module_entries_count)
+                    goto fail_index;
                 if (bc_get_atom(s, &me->local_name))
                     goto fail;
             }
@@ -86374,6 +86401,8 @@ static JSValue JS_ReadModule(BCReaderState *s)
             JSStarExportEntry *se = &m->star_export_entries[i];
             if (bc_get_leb128_int(s, &se->req_module_idx))
                 goto fail;
+            if ((uint32_t)se->req_module_idx >= (uint32_t)m->req_module_entries_count)
+                goto fail_index;
         }
     }
 
@@ -86393,6 +86422,8 @@ static JSValue JS_ReadModule(BCReaderState *s)
                 goto fail;
             if (bc_get_leb128_int(s, &mi->req_module_idx))
                 goto fail;
+            if ((uint32_t)mi->req_module_idx >= (uint32_t)m->req_module_entries_count)
+                goto fail_index;
         }
     }
 
@@ -86411,7 +86442,24 @@ static JSValue JS_ReadModule(BCReaderState *s)
         JS_ThrowSyntaxError(ctx, "invalid module function");
         goto fail;
     }
+    /* The variable indices select entries of the body's closure variables
+       (the module's var_refs array). */
+    {
+        const JSFunctionBytecode *mb = JS_VALUE_GET_PTR(m->func_obj);
+        for(i = 0; i < m->export_entries_count; i++) {
+            const JSExportEntry *me = &m->export_entries[i];
+            if (me->export_type == JS_EXPORT_TYPE_LOCAL &&
+                (uint32_t)me->u.local.var_idx >= (uint32_t)mb->closure_var_count)
+                goto fail_index;
+        }
+        for(i = 0; i < m->import_entries_count; i++) {
+            if ((uint32_t)m->import_entries[i].var_idx >= (uint32_t)mb->closure_var_count)
+                goto fail_index;
+        }
+    }
     return obj;
+ fail_index:
+    JS_ThrowSyntaxError(ctx, "invalid module entry index");
  fail:
     if (m) {
         js_free_module_def(ctx, m);
