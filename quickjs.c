@@ -4896,6 +4896,8 @@ static void drc_st_site_dump(void)
 #define DRC_ST(x) ((void)0)
 #endif
 
+/* Set while the runtime is torn down: the final collection scans no native stack (every word on it is stale). */
+static int ss_final;
 void JS_FreeRuntime(JSRuntime *rt)
 {
 #ifdef QJS_DRC_STATS
@@ -5006,6 +5008,7 @@ void JS_FreeRuntime(JSRuntime *rt)
     js_gc_promote_all_code(rt);
 
     /* Nothing is live on the machine stack any more: a stale word in a frame slot must not pin an object (and its cycle) through the collection below. */
+    ss_final = 1;
     JS_RunGC(rt);
 
 #if QJS_DRC
@@ -11969,7 +11972,7 @@ static void js_drc_pin(JSRuntime *rt)
     js_drc_pend_flush(rt);
     regvm_for_each_root_range(rt, js_drc_pin_range, NULL);
     if (ss_on < 0) ss_on = (qjs_aot_form_v & 1) || getenv("QJS_STACKSCAN") != NULL;
-    if (ss_on) ss_scan(rt); else ss_n = 0;
+    if (ss_on && !ss_final) ss_scan(rt); else ss_n = 0;
 }
 
 static void js_drc_unpin_range(void *opaque, JSValue *regs, uint32_t nregs)
