@@ -23637,6 +23637,9 @@ static inline __attribute__((always_inline)) __exception int js_regvm_binary(JSC
     ops[1] = js_dup(b);
     switch (subop) {
     case REG_BIN_ADD:
+        /* As in the stack VM: a concatenation result that is the left operand
+           of the next add gets headroom so that add can extend it in place. */
+        js_scat_hint = 1;
         if (js_add_slow(ctx, ops + 2))
             goto fail;
         break;
@@ -26280,6 +26283,18 @@ static uint8_t *REGVM_CC regvm_t_binary_cpool(REGVM_ARGS)
         JSValue cst = JS_AtomToValue(ctx, idx);
         if (JS_IsException(cst))
             T_FAIL();
+        if (sub == REG_BIN_ADD) {
+            int ar = regvm_accum_append(ctx, f->b, fr, f->arg_buf, f->argc,
+                                        d >> 4, a >> 4, cst);
+            if (ar > 0) {
+                JS_FreeValue(ctx, cst);
+                T_NEXT(11);
+            }
+            if (ar < 0) {
+                JS_FreeValue(ctx, cst);
+                T_FAIL();
+            }
+        }
         if (!regvm_num_fast(sub, FR(a), cst, &out) &&
             js_regvm_binary(ctx, sub, FR(a), cst, &out)) {
             JS_FreeValue(ctx, cst);
@@ -31978,6 +31993,18 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                     JSValue cst = JS_AtomToValue(ctx, idx);
                     if (JS_IsException(cst))
                         goto exception;
+                    if (sub == REG_BIN_ADD) {
+                        int _ar = regvm_accum_append(ctx, b, regs, arg_buf,
+                                                     argc, d, a, cst);
+                        if (_ar > 0) {
+                            JS_FreeValue(ctx, cst);
+                            REGVM_NEXT();
+                        }
+                        if (_ar < 0) {
+                            JS_FreeValue(ctx, cst);
+                            goto exception;
+                        }
+                    }
                     if (!regvm_num_fast(sub, regs[a], cst, &out) &&
                         js_regvm_binary(ctx, sub, regs[a], cst, &out)) {
                         JS_FreeValue(ctx, cst);
