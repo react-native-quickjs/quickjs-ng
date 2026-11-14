@@ -63,7 +63,8 @@ FMT(label_u16)
 #define def(id, size, n_pop, n_push, f) DEF(id, size, n_pop, n_push, f)
 #endif
 
-DEF(invalid, 1, 0, 0, none) /* never emitted */
+/* Escape prefix. Subcode 0/1 are the debugger trap variants. */
+DEF(      esc1, 2, 0, 0, u8)
 
 /* push values */
 DEF(       push_i32, 5, 0, 1, i32)
@@ -376,10 +377,6 @@ DEF(   is_undefined, 1, 1, 1, none)
 DEF(        is_null, 1, 1, 1, none)
 DEF(typeof_is_undefined, 1, 1, 1, none)
 DEF( typeof_is_function, 1, 1, 1, none)
-
-/* Debugger trap. The u8 operand carries JS_DEBUG_TRACE_* flags. Defined
-   unconditionally so opcode numbering never depends on JS_ENABLE_DEBUGGER. */
-DEF(          debug, 2, 0, 0, u8)
 
 #undef DEF
 #undef def

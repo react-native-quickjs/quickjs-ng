@@ -1320,6 +1320,8 @@ typedef enum OPCodeEnum {
     OP_TEMP_END,
 } OPCodeEnum;
 
+#define OP_invalid OP_esc1
+
 static int JS_InitAtoms(JSRuntime *rt);
 static JSAtom __JS_NewAtomInit(JSRuntime *rt, const char *str, int len,
                                int atom_type);
@@ -18856,10 +18858,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         JSValue *call_argv;
 
         SWITCH(pc) {
-        CASE(OP_debug):
+        CASE(OP_esc1):
 #if JS_ENABLE_DEBUGGER
             {
                 int flags = *pc++;
+                if (unlikely(flags > JS_DEBUG_TRACE_DEBUGGER_STMT)) {
+                    JS_ThrowInternalError(ctx, "invalid escape subopcode: %d", flags);
+                    goto exception;
+                }
                 /* Armed, not merely installed: an attached-but-idle debugger
                    would otherwise pay find_line_num() on every statement. */
                 if (unlikely(ctx->debug_trace &&
@@ -21639,7 +21645,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JS_FreeValue(ctx, sp[-1]);
             sp[-1] = JS_FALSE;
             BREAK;
-        CASE(OP_invalid):
         DEFAULT:
             JS_ThrowInternalError(ctx, "invalid opcode: pc=%u opcode=0x%02x",
                                   (int)(pc - b->byte_code_buf - 1), opcode);
@@ -37031,7 +37036,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                record pc2line, so the debugger can resolve the source location
                when OP_debug is hit at runtime. */
             add_pc2line_info(s, bc_out.size, line_num, col_num);
-            dbuf_putc(&bc_out, OP_debug);
+            dbuf_putc(&bc_out, OP_esc1);
             dbuf_putc(&bc_out, bc_buf[pos + 1]);   /* flag operand */
             break;
 
