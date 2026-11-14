@@ -31738,6 +31738,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
             L_ROP_get_local_field_1:
             L_ROP_get_local_field_2:
             L_ROP_get_local_field_3: {
+                const uint8_t *i_start = rpc - 1;
                 int d = RD_REG();
                 int slot = op - ROP_get_local_field_0;   /* the slot is the opcode */
                 JSAtom atom = RD_U32();
@@ -31748,6 +31749,10 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                     SET_REG_B(d, val);
                     REGVM_NEXT();
                 }
+                /* A slow read may run a getter that throws; the fused receiver
+                   read has no separate get_field to capture this frame's line.
+                   */
+                REGVM_CAPTURE_IP_MONO(i_start);
                 if (site == REG_IC_NONE)
                     val = JS_GetProperty(ctx, recv, atom);
                 else
@@ -31759,6 +31764,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
             }
             L_ROP_get_local_field:
             L_ROP_get_arg_field: {
+                const uint8_t *i_start = rpc - 1;
                 int d = RD_REG();
                 int slot = RD_U16();
                 JSAtom atom = RD_U32();
@@ -31770,6 +31776,10 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                     SET_REG_B(d, val);
                     REGVM_NEXT();
                 }
+                /* A slow read may run a getter that throws; the fused receiver
+                   read has no separate get_field to capture this frame's line.
+                   */
+                REGVM_CAPTURE_IP_MONO(i_start);
                 if (site == REG_IC_NONE)
                     val = JS_GetProperty(ctx, recv, atom);
                 else
@@ -34643,6 +34653,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
         case ROP_get_local_field_2:
         case ROP_get_local_field_3:
      {
+                    const uint8_t *i_start = rpc - 1;
                     int d = RD_REG();
                     int slot = op - ROP_get_local_field_0;   /* the slot is the opcode */
                     JSAtom atom = RD_U32();
@@ -34653,6 +34664,10 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                         SET_REG_B(d, val);
                         REGVM_NEXT();
                     }
+                    /* A slow read may run a getter that throws; the fused
+                       receiver read has no separate get_field to capture this
+                       frame's line. */
+                    REGVM_CAPTURE_IP_MONO(i_start);
                     if (site == REG_IC_NONE)
                         val = JS_GetProperty(ctx, recv, atom);
                     else
@@ -34666,6 +34681,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
         case ROP_get_arg_field:
         case ROP_get_local_field:
      {
+                    const uint8_t *i_start = rpc - 1;
                     int d = RD_REG();
                     int slot = RD_U16();
                     JSAtom atom = RD_U32();
@@ -34677,6 +34693,10 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                         SET_REG_B(d, val);
                         REGVM_NEXT();
                     }
+                    /* A slow read may run a getter that throws; the fused
+                       receiver read has no separate get_field to capture this
+                       frame's line. */
+                    REGVM_CAPTURE_IP_MONO(i_start);
                     if (site == REG_IC_NONE)
                         val = JS_GetProperty(ctx, recv, atom);
                     else
