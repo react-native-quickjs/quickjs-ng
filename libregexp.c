@@ -3664,6 +3664,9 @@ typedef enum {
     RE_EXEC_STATE_SPLIT,
     RE_EXEC_STATE_LOOKAHEAD,
     RE_EXEC_STATE_NEGATIVE_LOOKAHEAD,
+    /* a greedy run of a single-character atom: four slots (run start, exit
+       pc, current end, link) that give back one character per backtrack */
+    RE_EXEC_STATE_RUN,
 } REExecStateEnum;
 
 #if INTPTR_MAX >= INT64_MAX
@@ -3704,6 +3707,97 @@ static int lre_poll_timeout(REExecContext *s)
             return LRE_RET_TIMEOUT;
     }
     return 0;
+}
+
+/* ASCII fast path of lre_canonicalize(), called per character by the
+   case-insensitive opcodes. */
+static inline __attribute__((always_inline)) uint32_t lre_canon_fast(uint32_t c, bool is_unicode)
+{
+    if (c < 128) {
+        if (is_unicode) {
+            if (c - 'A' < 26u)
+                c += 'a' - 'A';
+        } else {
+            if (c - 'a' < 26u)
+                c -= 'a' - 'A';
+        }
+        return c;
+    }
+    return lre_canonicalize(c, is_unicode);
+}
+
+/* Length of the bytecode of a single-character atom that a loop can run
+   without saving a state per iteration, or 0 for any other opcode. */
+static inline __attribute__((always_inline)) int lre_simple_atom_len(const uint8_t *p)
+{
+    switch (p[0]) {
+    case REOP_dot:
+    case REOP_any:
+    case REOP_space:
+    case REOP_not_space:
+        return 1;
+    case REOP_char:
+    case REOP_char_i:
+        return 3;
+    case REOP_range:
+    case REOP_range_i:
+        return 3 + 4 * get_u16(p + 1);
+    default:
+        return 0;
+    }
+}
+
+/* Test c against the n ranges of a REOP_range operand. */
+static inline __attribute__((always_inline)) bool lre_range_has(const uint8_t *pc, int n, uint32_t c)
+{
+    uint32_t low, high, idx_min, idx_max, idx;
+
+    low = get_u16(pc);
+    if (c < low)
+        return false;
+    idx_max = n - 1;
+    high = get_u16(pc + idx_max * 4 + 2);
+    /* 0xffff in for last value means +infinity */
+    if (unlikely(c >= 0xffff) && high == 0xffff)
+        return true;
+    if (c > high)
+        return false;
+    idx_min = 0;
+    while (idx_min <= idx_max) {
+        idx = (idx_min + idx_max) / 2;
+        low = get_u16(pc + idx * 4);
+        high = get_u16(pc + idx * 4 + 2);
+        if (c < low)
+            idx_max = idx - 1;
+        else if (c > high)
+            idx_min = idx + 1;
+        else
+            return true;
+    }
+    return false;
+}
+
+/* Bitmap of the code units below 256 that a REOP_range operand accepts. */
+static void lre_range_bitmap(uint64_t bm[4], const uint8_t *pc, int n)
+{
+    int i;
+    bm[0] = bm[1] = bm[2] = bm[3] = 0;
+    for (i = 0; i < n; i++) {
+        uint32_t lo = get_u16(pc + i * 4), hi = get_u16(pc + i * 4 + 2);
+        uint32_t w;
+        if (lo > 255)
+            break;
+        if (hi > 255)
+            hi = 255;
+        for (w = lo >> 6; w <= (hi >> 6); w++) {
+            uint64_t m = ~(uint64_t)0;
+            if (w == (lo >> 6))
+                m &= ~(uint64_t)0 << (lo & 63);
+            if (w == (hi >> 6))
+                m &= ~(uint64_t)0 >> (63 - (hi & 63));
+            bm[w] |= m;
+        }
+    }
 }
 
 /* The backtrack stack that outgrew the in-frame buffer. The buffer is kept
@@ -3767,6 +3861,10 @@ static void stack_release(REExecContext *s)
         free(s->stack_buf);
     }
 }
+
+/* Address stored in the first slot of a run frame while a lookahead copies
+   the stack, so that the copy can tell its four slots from three. */
+static const char lre_run_frame_mark = 0;
 
 /* return 1 if match, 0 if not match or < 0 if error. */
 #define LRE_BT_FUNC lre_exec_backtrack
