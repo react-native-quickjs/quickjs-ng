@@ -234,6 +234,7 @@ QJS_AOT_STUB int qjs_aot_should_deopt(JSContext *ctx, uint32_t site);
    an interpreted one share the same budget. Returns 0 to continue, -1 after
    throwing. */
 QJS_AOT_STUB int qjs_aot_poll(JSContext *ctx);
+QJS_AOT_STUB int qjs_aot_poll_fl(JSContext *ctx);
 
 /* Sentinels returned by qjs_aot_step; they mirror REGVM_COLD_RET and
    REGVM_STEP_SUSPEND in quickjs.c. */
