@@ -561,6 +561,11 @@ typedef enum JSRegOpcode {
        an own data slot, and back when it does not. */
     ROP_get_field_own, ROP_get_field2_own,
 
+    /* Fused chain read: both reads and both destinations, one dispatch. The
+       `_own` spelling is produced only by the threaded interpreter's
+       quickening; both alias the generic monolith label. */
+    ROP_get_field_chain, ROP_get_field_chain_own,
+
     ROP_COUNT
 } JSRegOpcode;
 
