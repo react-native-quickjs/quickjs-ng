@@ -531,6 +531,13 @@ JS_EXTERN void JS_MarkValue(JSRuntime *rt, JSValueConst val,
                             JS_MarkFunc *mark_func);
 JS_EXTERN void JS_RunGC(JSRuntime *rt);
 JS_EXTERN size_t JS_GetMallocSize(JSRuntime *rt);
+/* Defer collections triggered while JS is running; JS_RunPendingGC then runs
+   them at a safepoint. `limit` bytes is a hard ceiling past which the engine
+   collects anyway; 0 derives one from the current threshold. */
+JS_EXTERN void JS_SetGCDeferred(JSRuntime *rt, bool deferred, size_t limit);
+JS_EXTERN bool JS_HasPendingGC(JSRuntime *rt);
+/* Must be called with an empty JS stack. */
+JS_EXTERN void JS_RunPendingGC(JSRuntime *rt);
 JS_EXTERN bool JS_IsLiveObject(JSRuntime *rt, JSValueConst obj);
 
 JS_EXTERN JSContext *JS_NewContext(JSRuntime *rt);

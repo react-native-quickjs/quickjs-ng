@@ -351,6 +351,9 @@ struct JSRuntime {
     struct list_head tmp_obj_list; /* used during GC */
     JSGCPhaseEnum gc_phase : 8;
     size_t malloc_gc_threshold;
+    bool gc_deferred; /* see JS_SetGCDeferred */
+    bool gc_pending;
+    size_t gc_deferred_limit;
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
     struct list_head string_list; /* list of JSString.link */
 #endif
@@ -1689,12 +1692,21 @@ static void js_trigger_gc(JSRuntime *rt, size_t size)
                 rt->malloc_gc_threshold);
 #endif
     if (force_gc) {
+        /* deferred: collect at the next safepoint, not under running JS */
+        if (rt->gc_deferred && rt->current_stack_frame != NULL &&
+            (rt->malloc_state.malloc_size + size) < rt->gc_deferred_limit) {
+            rt->gc_pending = true;
+            rt->malloc_gc_threshold = rt->malloc_state.malloc_size +
+                (rt->malloc_state.malloc_size >> 1);
+            return;
+        }
 #ifdef ENABLE_DUMPS // JS_DUMP_GC
         if (check_dump_flag(rt, JS_DUMP_GC)) {
             printf("GC: size=%zd\n", rt->malloc_state.malloc_size);
         }
 #endif
         JS_RunGC(rt);
+        rt->gc_pending = false;
         rt->malloc_gc_threshold = rt->malloc_state.malloc_size +
             (rt->malloc_state.malloc_size >> 1);
     }
@@ -7468,6 +7480,35 @@ static void gc_free_cycles(JSRuntime *rt)
     }
 
     init_list_head(&rt->gc_zero_ref_count_list);
+}
+
+void JS_SetGCDeferred(JSRuntime *rt, bool deferred, size_t limit)
+{
+    rt->gc_deferred = deferred;
+    /* 0: derive a ceiling from the current threshold */
+    rt->gc_deferred_limit = limit != 0 ? limit : rt->malloc_gc_threshold * 4;
+    if (!deferred && rt->gc_pending) {
+        rt->gc_pending = false;
+        JS_RunGC(rt);
+        rt->malloc_gc_threshold = rt->malloc_state.malloc_size +
+            (rt->malloc_state.malloc_size >> 1);
+    }
+}
+
+bool JS_HasPendingGC(JSRuntime *rt)
+{
+    return rt->gc_pending;
+}
+
+void JS_RunPendingGC(JSRuntime *rt)
+{
+    if (!rt->gc_pending)
+        return;
+    assert(rt->current_stack_frame == NULL);
+    rt->gc_pending = false;
+    JS_RunGC(rt);
+    rt->malloc_gc_threshold = rt->malloc_state.malloc_size +
+        (rt->malloc_state.malloc_size >> 1);
 }
 
 size_t JS_GetMallocSize(JSRuntime *rt)
