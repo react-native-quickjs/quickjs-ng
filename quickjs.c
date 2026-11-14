@@ -31936,7 +31936,11 @@ static int regvm_fill_backtrace_frames(JSRuntime *rt, JSRegBtFrame *bt, int max)
         nb++;
     }
 #if QJS_AOT || QJS_AOT_GEN || QJS_AOT_PROFILE
-    if ((qjs_aot_form_v & 4) || rt->aot_fl_top != NULL || rec_scan > 0 || (rec_scan < 0 && ((qjs_aot_form_v & 2) || getenv("QJS_RECSCAN"))))
+    /* rec_scan is decided once (the form bits are set by the units' constructors, before any code runs): an unset QJS_RECSCAN was
+       looked up again on every backtrace. */
+    if (rec_scan < 0)
+        rec_scan = (qjs_aot_form_v & 2) || getenv("QJS_RECSCAN") != NULL;
+    if ((qjs_aot_form_v & 4) || rt->aot_fl_top != NULL || rec_scan > 0)
         nb = regvm_merge_fl_records(rt, bt, anc, nb, max);
 #endif
     return nb;
