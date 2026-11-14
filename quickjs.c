@@ -81443,7 +81443,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
         if (!seen)
             goto done;
         for (b = 0; b < n_blocks; b++) {
-            int side;
+            int side, w;
             if (in_depth[b] < 0)
                 continue;
             for (side = 0; side < 2; side++) {
@@ -81451,21 +81451,28 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                                        (size_t)b * live_words;
                 for (k = 0; k < ns_ok; k++)
                     seen[k] = -1;
-                for (i = 0; i < n_values; i++) {
-                    int hk = home_of[i];
-                    if (hk < 0 || hk >= ns_ok)
-                        continue;
-                    if (!regvm_bitset_test(bits, i))
-                        continue;
-                    if (seen[hk] >= 0) {
-                        int expected = side ? sout[b * ns_ok + hk]
-                                            : senc[b * ns_ok + hk];
-                        regvm_home_overlap_report(bstart[b], hk, expected, i);
-                        js_free(ctx, seen);
-                        unc_why = "home overlap: a version's register holds another value";
-                        goto refused;
+                /* Only live values matter: visit the set bits, in ascending
+                   value order as a full scan would. */
+                for (w = 0; w < live_words; w++) {
+                    uint64_t word = bits[w];
+                    for (; word; word &= word - 1) {
+                        int hk;
+                        i = w * 64 + ctz64(word);
+                        if (i >= n_values)
+                            break;
+                        hk = home_of[i];
+                        if (hk < 0 || hk >= ns_ok)
+                            continue;
+                        if (seen[hk] >= 0) {
+                            int expected = side ? sout[b * ns_ok + hk]
+                                                : senc[b * ns_ok + hk];
+                            regvm_home_overlap_report(bstart[b], hk, expected, i);
+                            js_free(ctx, seen);
+                            unc_why = "home overlap: a version's register holds another value";
+                            goto refused;
+                        }
+                        seen[hk] = i;
                     }
-                    seen[hk] = i;
                 }
                 for (k = 0; k < ns_ok; k++) {
                     int expected;
