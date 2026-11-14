@@ -30753,6 +30753,7 @@ typedef struct FnSampleEntry {
     const JSFunctionBytecode *b;
     char name[120];
     char pos[80];
+    char dg[33];
     uint32_t samples;
     uint32_t in_unit;
     uint8_t named;
@@ -30988,6 +30989,14 @@ static void fn_sample_name(const struct JSFunctionBytecode *b)
         JS_AtomGetStrRT(fn_sample_rt, e->name, sizeof(e->name), b->func_name);
     else
         snprintf(e->name, sizeof(e->name), "<anon>");
+    {
+        uint8_t d[16];
+        int di;
+
+        js_aot_digest((JSFunctionBytecode *)b, d);
+        for (di = 0; di < 16; di++)
+            snprintf(e->dg + di * 2, 3, "%02x", d[di]);
+    }
     e->named = 1;
 }
 
@@ -31061,8 +31070,8 @@ static void fn_sample_stop(JSRuntime *rt)
 #else
                 st = "absent";
 #endif
-                fprintf(f, "F %u %u key=%d state=%s %s %s\n", e->samples,
-                        e->in_unit, i, st,
+                fprintf(f, "F %u %u key=%d state=%s dg=%s %s %s\n", e->samples,
+                        e->in_unit, i, st, e->dg,
                         e->named ? e->name : "<anon>", e->pos);
             }
             /* P <key> <pc hex>, one per in-JS sample, in sample order. */
