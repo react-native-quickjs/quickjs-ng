@@ -3898,6 +3898,14 @@ static uint8_t *REGVM_CC regvm_s_ROP_put_field(uint8_t *ip, JSValue *fr, JSRegRu
                             JS_FreeValue(ctx, old);
                             REGVM_NEXT();
                         }
+                        {
+                            int ah = regvm_put_field_add_hit(ctx, b, pic, p,
+                                                             regs[v], site);
+                            if (ah > 0)
+                                REGVM_NEXT();
+                            if (ah < 0)
+                                goto exception;
+                        }
                     }
                     if (regvm_put_field_ic(ctx, b, &pic, regs[r], atom, regs[v], site) < 0)
                         goto exception;
@@ -4555,7 +4563,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_sub_imm_s(uint8_t *ip, JSValue *fr, JSRegRu
                         SET_REG_P(d, js_int32((int32_t)sum));
                         REGVM_NEXT();
                     }
-                    SET_REG_P(d, js_float64((double)((int64_t)JS_VALUE_GET_INT(v) + imm)));
+                    SET_REG_P(d, js_float64((double)((int64_t)JS_VALUE_GET_INT(v) - imm)));
                     REGVM_NEXT();
                 }
                 if (!regvm_num_fast(REG_BIN_SUB, v, js_int32(imm), &out) &&
@@ -4595,7 +4603,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_sub_imm_self_s(uint8_t *ip, JSValue *fr, JS
                         regs[d] = js_int32((int32_t)sum);
                         REGVM_NEXT();
                     }
-                    regs[d] = js_float64((double)((int64_t)JS_VALUE_GET_INT(v) + imm));
+                    regs[d] = js_float64((double)((int64_t)JS_VALUE_GET_INT(v) - imm));
                     REGVM_NEXT();
                 }
                 if (!regvm_num_fast(REG_BIN_SUB, v, js_int32(imm), &out) &&

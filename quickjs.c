@@ -7642,6 +7642,7 @@ _Static_assert(sizeof(struct JSRegPIC) == 16, "register PIC entry is 16 bytes");
 #define REG_PIC_OWN   1
 #define REG_PIC_PROTO 2
 #define REG_PIC_OWN_W 3   /* own writable data slot: the store's hit */
+#define REG_PIC_ADD_W 4   /* add-transition store: shape -> holder, fresh slot */
 
 /* Release one entry's shape references and clear it. Also used by a refill
    before storing the new shapes. */
@@ -23411,7 +23412,7 @@ uint64_t js_regvm_put_hit, js_regvm_put_direct, js_regvm_put_slow, js_regvm_put_
  */
 static void regvm_put_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
                                JSRegPIC **ppic, JSValue recv, JSAtom atom,
-                               int site)
+                               int site, JSShape *pre_sh, uint32_t pre_count)
 {
     JSRuntime *rt = ctx->rt;
     JSObject *p;
@@ -23445,21 +23446,95 @@ static void regvm_put_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
     regvm_pic_install(rt, &pic[site], &b->regvm_pic_holder[site],
                       REG_PIC_OWN_W, p->shape, NULL,
                       (uint32_t)(pr - p->prop));
+    /* Add-transition fill, in the secondary way. When the store created `atom`
+       as a fresh plain writable own data slot (one more property than the
+       snapshotted pre-add shape), cache pre_sh -> p->shape. The prototype
+       watchpoint epoch goes in the spare `misses` field: the replay is sound
+       only while no interceptor has appeared on a prototype since. */
+    if (pre_sh != NULL) {
+        JSShape *nsh = p->shape;
+        if (nsh != pre_sh && nsh->is_hashed && nsh->prop_count == pre_count + 1) {
+            int s2 = b->regvm_pic_count + site;
+            regvm_pic_install(rt, &pic[s2], &b->regvm_pic_holder[s2],
+                              REG_PIC_ADD_W, pre_sh, nsh,
+                              (uint32_t)(pr - p->prop));
+            pic[s2].misses = (uint16_t)rt->ic_watchpoint_epoch;
+        }
+    }
 }
 
-/*
- * The register store, for a site-bearing instruction. The engine performs the
- * write; the fill records where it landed. `*ppic` is the running frame's cache
- * base, updated here when the first fill allocates it.
- */
+/* Replay a cached add-transition store: the receiver is still in the
+   pre-add shape, extensible and non-exotic, and no prototype interceptor has
+   appeared. Grow the property array if needed, install the new shape, and
+   write the slot with a duplicated value. Returns 1 on a hit, 0 on a miss, -1
+   after an allocation threw. */
+static int regvm_put_field_add_hit(JSContext *ctx, JSFunctionBytecode *b,
+                                   JSRegPIC *pic, JSObject *p, JSValue v,
+                                   int site)
+{
+    JSRegPIC *e;
+    JSShape *nsh, *osh;
+    uint32_t off;
+
+    if (b->regvm_pic == NULL || b->regvm_pic_count == 0)
+        return 0;
+    e = &pic[b->regvm_pic_count + site];
+    if (e->shape != p->shape || e->kind != REG_PIC_ADD_W)
+        return 0;
+    if (!p->extensible || p->is_exotic)
+        return 0;
+    if (e->misses != (uint16_t)ctx->rt->ic_watchpoint_epoch)
+        return 0;                   /* a prototype interceptor appeared */
+    nsh = b->regvm_pic_holder[b->regvm_pic_count + site];
+    off = e->slot_off / (uint32_t)sizeof(JSValue);
+    osh = p->shape;
+    if (nsh->prop_size != osh->prop_size) {
+        JSProperty *np = js_prop_grow(ctx, p,
+                                      sizeof(p->prop[0]) * nsh->prop_size);
+        if (unlikely(!np))
+            return -1;              /* js_prop_grow threw */
+        p->prop = np;
+    }
+    p->shape = js_dup_shape(nsh);
+    js_free_shape(ctx->rt, osh);
+    p->prop[off].u.value = js_dup(v);
+    return 1;
+}
+
+/* The register store for a site-bearing instruction. The pre-add shape is
+   snapshotted before the store so a fresh add can be cached as a
+   transition. */
 static int regvm_put_field_ic(JSContext *ctx, JSFunctionBytecode *b,
                               JSRegPIC **ppic, JSValue recv, JSAtom atom,
                               JSValue val, int site)
 {
-    int ret = JS_SetPropertyInternal2(ctx, recv, atom, js_dup(val), recv,
-                                      JS_PROP_THROW_STRICT);
+    JSRuntime *rt = ctx->rt;
+    JSShape *pre_sh = NULL;
+    uint32_t pre_count = 0;
+    int ret;
+
+    if (JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT) {
+        JSObject *po = JS_VALUE_GET_OBJ(recv);
+        JSRegPIC *e2 = NULL;
+        if (*ppic != NULL && b->regvm_pic_count != 0)
+            e2 = &(*ppic)[b->regvm_pic_count + site];
+        /* Snapshot only when the site has no transition yet or holds this exact
+           pre-add shape; a polymorphic site is left alone. */
+        if ((e2 == NULL || e2->kind == REG_PIC_EMPTY || e2->shape == po->shape) &&
+            po->extensible && !po->is_exotic && po->shape->is_hashed) {
+            JSProperty *pr0;
+            if (!find_own_property(&pr0, po, atom)) {
+                pre_sh = js_dup_shape(po->shape);
+                pre_count = po->shape->prop_count;
+            }
+        }
+    }
+    ret = JS_SetPropertyInternal2(ctx, recv, atom, js_dup(val), recv,
+                                  JS_PROP_THROW_STRICT);
     if (likely(ret >= 0))
-        regvm_put_pic_fill(ctx, b, ppic, recv, atom, site);
+        regvm_put_pic_fill(ctx, b, ppic, recv, atom, site, pre_sh, pre_count);
+    if (pre_sh)
+        js_free_shape(rt, pre_sh);
     return ret;
 }
 
@@ -26705,6 +26780,18 @@ static uint8_t *REGVM_CC regvm_t_put_field(REGVM_ARGS)
                         return regvm_t_free_slow(ip + T_SZ_RASR, fr, f, ctx);
                 }
                 T_NEXT(T_SZ_RASR);
+            }
+            {
+                int ah = regvm_put_field_add_hit(ctx, f->b, f->pic, p, FR(v),
+                                                 site);
+                if (ah > 0) {
+#ifdef QJS_REGVM_COUNT
+                    js_regvm_put_direct++;
+#endif
+                    T_NEXT(T_SZ_RASR);
+                }
+                if (ah < 0)
+                    T_FAIL();
             }
         }
     }
@@ -30039,6 +30126,14 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                             *slot = js_dup(regs[v]);
                             JS_FreeValue(ctx, old);
                             REGVM_NEXT();
+                        }
+                        {
+                            int ah = regvm_put_field_add_hit(ctx, b, pic, p,
+                                                             regs[v], site);
+                            if (ah > 0)
+                                REGVM_NEXT();
+                            if (ah < 0)
+                                goto exception;
                         }
                     }
                     if (regvm_put_field_ic(ctx, b, &pic, regs[r], atom, regs[v], site) < 0)
