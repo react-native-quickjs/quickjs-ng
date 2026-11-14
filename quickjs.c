@@ -1346,6 +1346,8 @@ typedef struct JSGVCell {
                                    bumps the generation, like every other change) */
 } JSGVCell;
 
+#define JS_RE_SNAP_N 16
+
 struct JSContext {
     JSGCObjectHeader header; /* must come first */
     JSRuntime *rt;
@@ -1419,6 +1421,18 @@ struct JSContext {
        as a stale read only costs one more statement before the pause. */
     _Atomic bool debug_trace_armed;
 #endif
+
+    /* What RegExp.prototype and RegExp looked like when they were built: the
+       shapes and the functions of the properties the pristine fast paths
+       would otherwise look up (see js_regexp_fast). */
+    JSShape *re_proto_shape;
+    JSShape *re_ctor_shape;
+    JSValue re_snap[JS_RE_SNAP_N];
+    uint16_t re_snap_idx[JS_RE_SNAP_N];
+    uint8_t re_snap_getter[JS_RE_SNAP_N];
+    int re_snap_n;
+    int re_species_idx;
+    JSValue re_species;
 
     /* LAST FIELD ON PURPOSE: 8 KB, allocated once per context. */
     JSGVCell gv_cells[JS_GV_CELL_SETS][JS_GV_CELL_WAYS]; /* zeroed */
@@ -6151,6 +6165,14 @@ static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
 
     if (ctx->regexp_result_shape)
         mark_func(rt, &ctx->regexp_result_shape->header);
+    if (ctx->re_proto_shape)
+        mark_func(rt, &ctx->re_proto_shape->header);
+    if (ctx->re_ctor_shape)
+        mark_func(rt, &ctx->re_ctor_shape->header);
+    for (i = 0; i < ctx->re_snap_n; i++)
+        JS_MarkValue(rt, ctx->re_snap[i], mark_func);
+    if (ctx->re_snap_n)
+        JS_MarkValue(rt, ctx->re_species, mark_func);
     for (i = 0; i < (int)countof(ctx->closure_shape); i++)
         if (ctx->closure_shape[i])
             mark_func(rt, &ctx->closure_shape[i]->header);
@@ -6234,6 +6256,12 @@ void JS_FreeContext(JSContext *ctx)
     js_free_shape_null(ctx->rt, ctx->mapped_arguments_shape);
     js_free_shape_null(ctx->rt, ctx->regexp_shape);
     js_free_shape_null(ctx->rt, ctx->regexp_result_shape);
+    js_free_shape_null(ctx->rt, ctx->re_proto_shape);
+    js_free_shape_null(ctx->rt, ctx->re_ctor_shape);
+    for (i = 0; i < ctx->re_snap_n; i++)
+        JS_FreeValue(ctx, ctx->re_snap[i]);
+    if (ctx->re_snap_n)
+        JS_FreeValue(ctx, ctx->re_species);
     for (i = 0; i < (int)countof(ctx->closure_shape); i++)
         js_free_shape_null(ctx->rt, ctx->closure_shape[i]);
 
@@ -101930,6 +101958,531 @@ js_regexp_exec_prepare(JSContext *ctx, JSRegExp *re, uint8_t **capture_stack,
     return true;
 }
 
+/* ==== Pristine RegExp fast paths ========================================= *
+ * A RegExp object that still has the shape it was created with (one own
+ * property, lastIndex, holding an integer), whose prototype still has the
+ * shape and the functions it was built with for every property the
+ * algorithms below would read (exec, flags and the flag getters, source,
+ * constructor, Symbol.match), behaves as the specification says without a
+ * property lookup: the flags come from the compiled bytecode and lastIndex
+ * is the slot itself. The checks must run after anything that can run user
+ * code (ToString of an argument, a callback). */
+
+static const char * const js_re_snap_names[] = {
+    "exec", "constructor", "flags", "global", "ignoreCase", "multiline",
+    "dotAll", "unicode", "unicodeSets", "sticky", "hasIndices", "source",
+};
+
+/* Find the slot of an own property of 'p' after making sure it is not a
+   lazily initialised one. Returns the slot or -1. */
+static int js_regexp_snap_slot(JSContext *ctx, JSObject *p, JSAtom atom,
+                               int *pgetter)
+{
+    JSPropertyDescriptor desc;
+    JSProperty *pr;
+    JSShapeProperty *prs;
+    int r;
+
+    r = JS_GetOwnPropertyInternal(ctx, &desc, p, atom);
+    if (r <= 0)
+        return -1;
+    JS_FreeValue(ctx, desc.value);
+    JS_FreeValue(ctx, desc.getter);
+    JS_FreeValue(ctx, desc.setter);
+    prs = find_own_property(&pr, p, atom);
+    if (!prs)
+        return -1;
+    switch (prs->flags & JS_PROP_TMASK) {
+    case JS_PROP_NORMAL:
+        if (JS_VALUE_GET_TAG(pr->u.value) != JS_TAG_OBJECT)
+            return -1;
+        *pgetter = 0;
+        break;
+    case JS_PROP_GETSET:
+        if (!pr->u.getset.getter)
+            return -1;
+        *pgetter = 1;
+        break;
+    default:
+        return -1;
+    }
+    return (int)(pr - p->prop);
+}
+
+static JSValue js_regexp_snap_value(JSObject *p, int idx, int getter)
+{
+    JSProperty *pr = &p->prop[idx];
+    if (getter)
+        return JS_MKPTR(JS_TAG_OBJECT, pr->u.getset.getter);
+    return pr->u.value;
+}
+
+/* Called once when RegExp.prototype and RegExp are complete. */
+static void js_regexp_snapshot(JSContext *ctx)
+{
+    JSObject *proto = JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_REGEXP]);
+    JSObject *ctor = JS_VALUE_GET_OBJ(ctx->regexp_ctor);
+    JSAtom atoms[JS_RE_SNAP_N];
+    int idx[JS_RE_SNAP_N], getter[JS_RE_SNAP_N];
+    int i, n = 0, sidx, sgetter;
+
+    for (i = 0; i < (int)countof(js_re_snap_names); i++) {
+        atoms[n] = JS_NewAtom(ctx, js_re_snap_names[i]);
+        if (atoms[n] == JS_ATOM_NULL)
+            goto fail;
+        n++;
+    }
+    atoms[n++] = JS_ATOM_Symbol_match;
+    for (i = 0; i < n; i++) {
+        idx[i] = js_regexp_snap_slot(ctx, proto, atoms[i], &getter[i]);
+        if (idx[i] < 0)
+            goto fail;
+    }
+    sidx = js_regexp_snap_slot(ctx, ctor, JS_ATOM_Symbol_species, &sgetter);
+    if (sidx < 0 || !sgetter)
+        goto fail;
+    /* the slots may have moved while later properties were initialised */
+    for (i = 0; i < n; i++) {
+        idx[i] = js_regexp_snap_slot(ctx, proto, atoms[i], &getter[i]);
+        if (idx[i] < 0)
+            goto fail;
+    }
+    for (i = 0; i < n; i++) {
+        ctx->re_snap_idx[i] = (uint16_t)idx[i];
+        ctx->re_snap_getter[i] = (uint8_t)getter[i];
+        ctx->re_snap[i] = js_dup(js_regexp_snap_value(proto, idx[i], getter[i]));
+    }
+    ctx->re_species_idx = sidx;
+    ctx->re_species = js_dup(js_regexp_snap_value(ctor, sidx, 1));
+    ctx->re_proto_shape = js_dup_shape(proto->shape);
+    ctx->re_ctor_shape = js_dup_shape(ctor->shape);
+    ctx->re_snap_n = n;
+fail:
+    for (i = 0; i < (int)countof(js_re_snap_names); i++)
+        if (i < n && atoms[i] != JS_ATOM_NULL)
+            JS_FreeAtom(ctx, atoms[i]);
+}
+
+static inline bool js_regexp_same_obj(JSValue a, JSValue b)
+{
+    return JS_VALUE_GET_TAG(a) == JS_TAG_OBJECT &&
+           JS_VALUE_GET_PTR(a) == JS_VALUE_GET_PTR(b);
+}
+
+static bool js_regexp_proto_pristine(JSContext *ctx)
+{
+    JSObject *proto = JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_REGEXP]);
+    int i;
+
+    if (proto->shape != ctx->re_proto_shape)
+        return false;
+    for (i = 0; i < ctx->re_snap_n; i++) {
+        JSProperty *pr = &proto->prop[ctx->re_snap_idx[i]];
+        if (ctx->re_snap_getter[i]) {
+            if ((void *)pr->u.getset.getter != JS_VALUE_GET_PTR(ctx->re_snap[i]))
+                return false;
+        } else if (!js_regexp_same_obj(pr->u.value, ctx->re_snap[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* RegExp[Symbol.species] and RegExp.prototype.constructor are the originals,
+   so the species constructor of a pristine RegExp is RegExp itself */
+static bool js_regexp_ctor_pristine(JSContext *ctx)
+{
+    JSObject *ctor = JS_VALUE_GET_OBJ(ctx->regexp_ctor);
+    JSProperty *pr;
+
+    if (ctor->shape != ctx->re_ctor_shape)
+        return false;
+    pr = &ctor->prop[ctx->re_species_idx];
+    return (void *)pr->u.getset.getter == JS_VALUE_GET_PTR(ctx->re_species);
+}
+
+/* The slot holding lastIndex when it can be read and written directly. */
+static inline JSValue *js_regexp_lastindex_slot(JSContext *ctx, JSValueConst v)
+{
+    JSObject *p;
+
+    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
+        return NULL;
+    p = JS_VALUE_GET_OBJ(v);
+    if (p->class_id != JS_CLASS_REGEXP || p->shape != ctx->regexp_shape ||
+        p->gv_watched || JS_VALUE_GET_TAG(p->prop[0].u.value) != JS_TAG_INT)
+        return NULL;
+    return &p->prop[0].u.value;
+}
+
+/* The RegExp behind 'v' when it is pristine, else NULL */
+static JSRegExp *js_regexp_fast(JSContext *ctx, JSValueConst v)
+{
+    if (!js_regexp_lastindex_slot(ctx, v) || !ctx->re_snap_n ||
+        !js_regexp_proto_pristine(ctx))
+        return NULL;
+    return &JS_VALUE_GET_OBJ(v)->u.regexp;
+}
+
+static void js_regexp_throw_rc(JSContext *ctx, int rc)
+{
+    switch (rc) {
+    case LRE_RET_TIMEOUT:
+        JS_ThrowInterrupted(ctx);
+        break;
+    case LRE_RET_MEMORY_ERROR:
+        JS_ThrowInternalError(ctx, "out of memory in regexp execution");
+        break;
+    case LRE_RET_BYTECODE_ERROR:
+        JS_ThrowInternalError(ctx, "corrupted bytecode in regexp execution");
+        break;
+    default:
+        JS_ThrowInternalError(ctx, "regexp execution error");
+        break;
+    }
+}
+
+/* lastIndex as RegExpBuiltinExec reads it (ToLength of an integer) */
+static inline int64_t js_regexp_lastindex_value(JSValue v)
+{
+    int32_t i = JS_VALUE_GET_INT(v);
+    return i < 0 ? 0 : i;
+}
+
+/* Store lastIndex: the slot itself when it can be, else a Set */
+static inline int js_regexp_set_lastindex(JSContext *ctx, JSValueConst v, int32_t x)
+{
+    JSValue *li = js_regexp_lastindex_slot(ctx, v);
+    if (li) {
+        *li = js_int32(x);
+        return 0;
+    }
+    return JS_SetProperty(ctx, v, JS_ATOM_lastIndex, js_int32(x));
+}
+
+typedef struct JSReMatches {
+    JSContext *ctx;
+    int32_t *v;          /* stride ints per match: start,end per group, -1 if unset */
+    size_t n, cap;
+    int stride;
+    int32_t sbuf[96];
+} JSReMatches;
+
+static void js_re_matches_init(JSReMatches *m, JSContext *ctx, int ncap)
+{
+    m->ctx = ctx;
+    m->v = m->sbuf;
+    m->n = 0;
+    m->cap = countof(m->sbuf) / (2 * ncap);
+    m->stride = 2 * ncap;
+}
+
+static void js_re_matches_free(JSReMatches *m)
+{
+    if (m->v != m->sbuf)
+        js_free(m->ctx, m->v);
+}
+
+/* Record the groups of the match in 'capture'; -1 on out of memory */
+static int js_re_matches_push(JSReMatches *m, uint8_t **capture,
+                              const uint8_t *base, int shift)
+{
+    int i;
+    int32_t *e;
+
+    if (m->n >= m->cap) {
+        size_t ncap = m->cap ? m->cap * 2 : 8;
+        int32_t *nv;
+        if (m->v == m->sbuf) {
+            nv = js_malloc(m->ctx, ncap * m->stride * sizeof(int32_t));
+            if (!nv)
+                return -1;
+            memcpy(nv, m->sbuf, m->n * m->stride * sizeof(int32_t));
+        } else {
+            nv = js_realloc(m->ctx, m->v, ncap * m->stride * sizeof(int32_t));
+            if (!nv)
+                return -1;
+        }
+        m->v = nv;
+        m->cap = ncap;
+    }
+    e = m->v + m->n * m->stride;
+    for (i = 0; i < m->stride / 2; i++) {
+        if (capture[2 * i] && capture[2 * i + 1]) {
+            e[2 * i] = (int32_t)((capture[2 * i] - base) >> shift);
+            e[2 * i + 1] = (int32_t)((capture[2 * i + 1] - base) >> shift);
+        } else {
+            e[2 * i] = e[2 * i + 1] = -1;
+        }
+    }
+    m->n++;
+    return 0;
+}
+
+/* Run the matcher from the start of 'sp' the way the global loops of match
+   and replace do (an empty match advances by one character, two for a
+   surrogate pair under /u). Returns 0, or -1 with an exception pending. */
+static int js_regexp_match_loop(JSContext *ctx, JSRegExp *re, JSString *sp,
+                                bool global, bool full_unicode,
+                                JSReMatches *out)
+{
+    uint8_t *capture_stack[JS_REGEXP_CAPTURE_STACK_SIZE];
+    uint8_t **capture = capture_stack;
+    JSRegExpExecData ed;
+    int64_t last = 0;
+    int rc, ret = -1;
+
+    if (!js_regexp_exec_prepare(ctx, re, capture_stack, &capture, &ed))
+        return -1;
+    for (;;) {
+        if (last > sp->len)
+            break;
+        rc = js_regexp_match(ctx, capture, &ed, re, sp, (int)last);
+        if (rc == 0)
+            break;
+        if (rc < 0) {
+            js_regexp_throw_rc(ctx, rc);
+            goto done;
+        }
+        if (js_re_matches_push(out, capture, str8(sp), sp->is_wide_char))
+            goto done;
+        if (!global)
+            break;
+        {
+            const int32_t *e = out->v + (out->n - 1) * out->stride;
+            last = e[1];
+            if (e[1] == e[0])
+                last = string_advance_index(sp, last, full_unicode);
+        }
+    }
+    ret = 0;
+done:
+    if (capture != capture_stack)
+        js_free(ctx, capture);
+    return ret;
+}
+
+/* RegExp.prototype[Symbol.match] of a pristine global RegExp */
+static JSValue js_regexp_match_global_fast(JSContext *ctx, JSObject *rxo,
+                                           JSValueConst S)
+{
+    JSRegExp *re = &rxo->u.regexp;
+    const uint8_t *bc = str8(re->bytecode);
+    int flags = lre_get_flags(bc);
+    JSString *sp = JS_VALUE_GET_STRING(S);
+    JSReMatches m;
+    JSValue A = JS_EXCEPTION, sub;
+    size_t i;
+
+    js_re_matches_init(&m, ctx, lre_get_capture_count(bc));
+    rxo->prop[0].u.value = js_int32(0);
+    if (js_regexp_match_loop(ctx, re, sp, true,
+                             (flags & (LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)) != 0,
+                             &m))
+        goto done;
+    if (m.n == 0) {
+        A = JS_NULL;
+        goto done;
+    }
+    A = JS_NewArray(ctx);
+    if (JS_IsException(A))
+        goto done;
+    for (i = 0; i < m.n; i++) {
+        const int32_t *e = m.v + i * m.stride;
+        sub = js_sub_string(ctx, sp, e[0], e[1]);
+        if (JS_IsException(sub) ||
+            JS_DefinePropertyValueInt64(ctx, A, i, sub,
+                                        JS_PROP_C_W_E | JS_PROP_THROW) < 0) {
+            JS_FreeValue(ctx, A);
+            A = JS_EXCEPTION;
+            goto done;
+        }
+    }
+done:
+    js_re_matches_free(&m);
+    return A;
+}
+
+/* RegExp.prototype[Symbol.search] of a pristine RegExp: lastIndex is left as
+   it was found */
+static JSValue js_regexp_search_fast(JSContext *ctx, JSRegExp *re,
+                                     JSValueConst S)
+{
+    uint8_t *capture_stack[JS_REGEXP_CAPTURE_STACK_SIZE];
+    uint8_t **capture = capture_stack;
+    JSRegExpExecData ed;
+    JSString *sp = JS_VALUE_GET_STRING(S);
+    JSValue ret = JS_EXCEPTION;
+    int rc;
+
+    if (!js_regexp_exec_prepare(ctx, re, capture_stack, &capture, &ed))
+        return JS_EXCEPTION;
+    rc = js_regexp_match(ctx, capture, &ed, re, sp, 0);
+    if (rc == 1)
+        ret = js_int32((capture[0] - str8(sp)) >> sp->is_wide_char);
+    else if (rc == 0)
+        ret = js_int32(-1);
+    else
+        js_regexp_throw_rc(ctx, rc);
+    if (capture != capture_stack)
+        js_free(ctx, capture);
+    return ret;
+}
+
+/* The expansion of $-patterns of a replacement string for match 'e'
+   (GetSubstitution without named groups) */
+static void js_regexp_substitute(StringBuffer *b, JSString *rp, JSString *sp,
+                                 const int32_t *e, int ncap)
+{
+    uint32_t len = rp->len;
+    int i = 0, j, j0, k, k1, c, c1;
+
+    for (;;) {
+        j = string_indexof_char(rp, '$', i);
+        if (j < 0 || (uint32_t)j + 1 >= len)
+            break;
+        string_buffer_concat(b, rp, i, j);
+        j0 = j++;
+        c = string_get(rp, j++);
+        if (c == '$') {
+            string_buffer_putc8(b, '$');
+        } else if (c == '&') {
+            string_buffer_concat(b, sp, e[0], e[1]);
+        } else if (c == '`') {
+            string_buffer_concat(b, sp, 0, e[0]);
+        } else if (c == '\'') {
+            string_buffer_concat(b, sp, e[1], sp->len);
+        } else if (c >= '0' && c <= '9') {
+            k = c - '0';
+            if ((uint32_t)j < len) {
+                c1 = string_get(rp, j);
+                if (c1 >= '0' && c1 <= '9') {
+                    k1 = k * 10 + c1 - '0';
+                    if (k1 >= 1 && k1 < ncap) {
+                        k = k1;
+                        j++;
+                    }
+                }
+            }
+            if (k >= 1 && k < ncap) {
+                if (e[2 * k] >= 0)
+                    string_buffer_concat(b, sp, e[2 * k], e[2 * k + 1]);
+            } else {
+                string_buffer_concat(b, rp, j0, j);
+            }
+        } else {
+            string_buffer_concat(b, rp, j0, j);
+        }
+        i = j;
+    }
+    string_buffer_concat(b, rp, i, rp->len);
+}
+
+/* RegExp.prototype[Symbol.replace] of a pristine RegExp with a string
+   replacement ('rep' a string) or a function. Returns JS_UNINITIALIZED,
+   with nothing done, for a RegExp with named groups or a sticky one that is
+   not global. */
+static JSValue js_regexp_replace_fast(JSContext *ctx, JSObject *rxo,
+                                      JSValueConst S, JSValueConst rep,
+                                      bool functional)
+{
+    JSRegExp *re = &rxo->u.regexp;
+    const uint8_t *bc = str8(re->bytecode);
+    int flags = lre_get_flags(bc), ncap = lre_get_capture_count(bc);
+    bool global = (flags & LRE_FLAG_GLOBAL) != 0;
+    JSString *sp = JS_VALUE_GET_STRING(S);
+    JSString *rp = functional ? NULL : JS_VALUE_GET_STRING(rep);
+    bool has_dollar;
+    JSReMatches m;
+    StringBuffer b_s, *b = &b_s;
+    JSValue res = JS_EXCEPTION, args_stack[16], *args = args_stack;
+    size_t mi;
+    int next = 0, k;
+
+    if ((flags & LRE_FLAG_NAMED_GROUPS) ||
+        ((flags & LRE_FLAG_STICKY) && !global))
+        return JS_UNINITIALIZED;
+
+    js_re_matches_init(&m, ctx, ncap);
+    if (global)
+        rxo->prop[0].u.value = js_int32(0);
+    if (js_regexp_match_loop(ctx, re, sp, global,
+                             (flags & (LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)) != 0,
+                             &m)) {
+        js_re_matches_free(&m);
+        return JS_EXCEPTION;
+    }
+    if (m.n == 0) {
+        js_re_matches_free(&m);
+        return js_dup(S);
+    }
+    has_dollar = !functional && string_indexof_char(rp, '$', 0) >= 0;
+    string_buffer_init(ctx, b, 0);
+    if (functional && ncap + 2 > (int)countof(args_stack)) {
+        args = js_malloc(ctx, sizeof(args[0]) * (ncap + 2));
+        if (!args) {
+            string_buffer_free(b);
+            js_re_matches_free(&m);
+            return JS_EXCEPTION;
+        }
+    }
+    for (mi = 0; mi < m.n; mi++) {
+        const int32_t *e = m.v + mi * m.stride;
+        int pos = e[0];
+        JSValue repl = JS_UNDEFINED;
+
+        if (functional) {
+            int na = 0;
+            for (k = 0; k < ncap; k++) {
+                JSValue v = JS_UNDEFINED;
+                if (e[2 * k] >= 0) {
+                    v = js_sub_string(ctx, sp, e[2 * k], e[2 * k + 1]);
+                    if (JS_IsException(v))
+                        goto fail_args;
+                }
+                args[na++] = v;
+            }
+            args[na++] = js_int32(pos);
+            args[na++] = js_dup(S);
+            repl = JS_Call(ctx, rep, JS_UNDEFINED, na, args);
+            for (k = 0; k < na; k++)
+                JS_FreeValue(ctx, args[k]);
+            repl = JS_ToStringFree(ctx, repl);
+            if (JS_IsException(repl))
+                goto fail;
+            if (pos >= next) {
+                string_buffer_concat(b, sp, next, pos);
+                string_buffer_concat_value(b, repl);
+                next = e[1];
+            }
+            JS_FreeValue(ctx, repl);
+            continue;
+        fail_args:
+            for (k = 0; k < na; k++)
+                JS_FreeValue(ctx, args[k]);
+            goto fail;
+        }
+        if (pos >= next) {
+            string_buffer_concat(b, sp, next, pos);
+            if (has_dollar)
+                js_regexp_substitute(b, rp, sp, e, ncap);
+            else
+                string_buffer_concat(b, rp, 0, rp->len);
+            next = e[1];
+        }
+    }
+    string_buffer_concat(b, sp, next, sp->len);
+    res = string_buffer_end(b);
+    goto done;
+fail:
+    string_buffer_free(b);
+done:
+    if (args != args_stack)
+        js_free(ctx, args);
+    js_re_matches_free(&m);
+    return res;
+}
+
 /* Preallocate a freshly created JS_CLASS_ARRAY result object's fast-array
    storage as BOXED for 'n' elements, so the exec capture loop can store each
    match/capture directly (values[i] = owned JSValue; bump count) instead of
@@ -101994,9 +102547,16 @@ static JSValue js_regexp_exec_body(JSContext *ctx, JSValueConst this_val,
     group_name = JS_ATOM_NULL;
     capture = capture_stack;
 
-    val = JS_GetProperty(ctx, this_val, JS_ATOM_lastIndex);
-    if (JS_IsException(val) || JS_ToLengthFree(ctx, &last_index, val))
-        goto fail;
+    {
+        JSValue *li = js_regexp_lastindex_slot(ctx, this_val);
+        if (li) {
+            last_index = js_regexp_lastindex_value(*li);
+        } else {
+            val = JS_GetProperty(ctx, this_val, JS_ATOM_lastIndex);
+            if (JS_IsException(val) || JS_ToLengthFree(ctx, &last_index, val))
+                goto fail;
+        }
+    }
 
     re_bytecode = str8(re->bytecode);
     re_flags = lre_get_flags(re_bytecode);
@@ -102024,8 +102584,7 @@ static JSValue js_regexp_exec_body(JSContext *ctx, JSValueConst this_val,
     if (rc != 1) {
         if (rc >= 0) {
             if (rc == 2 || (re_flags & (LRE_FLAG_GLOBAL | LRE_FLAG_STICKY))) {
-                if (JS_SetProperty(ctx, this_val, JS_ATOM_lastIndex,
-                                   js_int32(0)) < 0)
+                if (js_regexp_set_lastindex(ctx, this_val, 0) < 0)
                     goto fail;
             }
         } else {
@@ -102046,8 +102605,7 @@ static JSValue js_regexp_exec_body(JSContext *ctx, JSValueConst this_val,
         }
     } else {
         if (re_flags & (LRE_FLAG_GLOBAL | LRE_FLAG_STICKY)) {
-            if (JS_SetProperty(ctx, this_val, JS_ATOM_lastIndex,
-                               js_int32((capture[1] - str_buf) >> shift)) < 0)
+            if (js_regexp_set_lastindex(ctx, this_val, (capture[1] - str_buf) >> shift) < 0)
                 goto fail;
         }
         group_name_ptr = lre_get_groupnames(re_bytecode, re->bytecode->len);
@@ -102219,9 +102777,16 @@ static JSValue js_regexp_exec_bool(JSContext *ctx, JSValueConst this_val,
     if (JS_IsException(str_val))
         return JS_EXCEPTION;
 
-    val = JS_GetProperty(ctx, this_val, JS_ATOM_lastIndex);
-    if (JS_IsException(val) || JS_ToLengthFree(ctx, &last_index, val))
-        goto done;
+    {
+        JSValue *li = js_regexp_lastindex_slot(ctx, this_val);
+        if (li) {
+            last_index = js_regexp_lastindex_value(*li);
+        } else {
+            val = JS_GetProperty(ctx, this_val, JS_ATOM_lastIndex);
+            if (JS_IsException(val) || JS_ToLengthFree(ctx, &last_index, val))
+                goto done;
+        }
+    }
 
     re_bytecode = str8(re->bytecode);
     re_flags = lre_get_flags(re_bytecode);
@@ -102257,12 +102822,12 @@ static JSValue js_regexp_exec_bool(JSContext *ctx, JSValueConst this_val,
         result = true;
         if (re_flags & (LRE_FLAG_GLOBAL | LRE_FLAG_STICKY)) {
             shift = str->is_wide_char;
-            if (JS_SetProperty(ctx, this_val, JS_ATOM_lastIndex,
-                               js_int32((capture[1] - str8(str)) >> shift)) < 0)
+            if (js_regexp_set_lastindex(ctx, this_val,
+                                        (capture[1] - str8(str)) >> shift) < 0)
                 goto done;
         }
     } else if (rc == 2 || (re_flags & (LRE_FLAG_GLOBAL | LRE_FLAG_STICKY))) {
-        if (JS_SetProperty(ctx, this_val, JS_ATOM_lastIndex, js_int32(0)) < 0)
+        if (js_regexp_set_lastindex(ctx, this_val, 0) < 0)
             goto done;
     }
     ret = js_bool(result);
@@ -102325,8 +102890,7 @@ static JSValue JS_RegExpDelete(JSContext *ctx, JSValueConst this_val, JSValue ar
         if (ret != 1) {
             if (ret >= 0) {
                 if (ret == 2 || (re_flags & (LRE_FLAG_GLOBAL | LRE_FLAG_STICKY))) {
-                    if (JS_SetProperty(ctx, this_val, JS_ATOM_lastIndex,
-                                       js_int32(0)) < 0)
+                    if (js_regexp_set_lastindex(ctx, this_val, 0) < 0)
                         goto fail;
                 }
             } else {
@@ -102356,8 +102920,7 @@ static JSValue JS_RegExpDelete(JSContext *ctx, JSValueConst this_val, JSValue ar
         }
         next_src_pos = end;
         if (!(re_flags & LRE_FLAG_GLOBAL)) {
-            if (JS_SetProperty(ctx, this_val, JS_ATOM_lastIndex,
-                               js_int32(end)) < 0)
+            if (js_regexp_set_lastindex(ctx, this_val, end) < 0)
                 goto fail;
             break;
         }
@@ -102431,6 +102994,9 @@ static JSValue js_regexp_test_body(JSContext *ctx, JSValueConst this_val,
 
     /* Fast path: a native RegExp whose 'exec' is the unmodified builtin needs
        neither the generic RegExpExec dispatch nor a match-result object. */
+    re = js_regexp_fast(ctx, this_val);
+    if (re)
+        return js_regexp_exec_bool(ctx, this_val, re, argv[0]);
     re = js_get_regexp(ctx, this_val, false);
     if (re) {
         val = JS_GetProperty(ctx, this_val, JS_ATOM_exec);
@@ -102487,6 +103053,15 @@ static JSValue js_regexp_Symbol_match_body(JSContext *ctx, JSValueConst this_val
     if (JS_IsException(S))
         goto exception;
 
+    if (js_regexp_fast(ctx, rx) &&
+        (lre_get_flags(str8(JS_VALUE_GET_OBJ(rx)->u.regexp.bytecode)) &
+         LRE_FLAG_GLOBAL)) {
+        A = js_regexp_match_global_fast(ctx, JS_VALUE_GET_OBJ(rx), S);
+        if (JS_IsException(A))
+            goto exception;
+        JS_FreeValue(ctx, S);
+        return A;
+    }
     flags = JS_GetProperty(ctx, rx, JS_ATOM_flags);
     if (JS_IsException(flags))
         goto exception;
@@ -102856,6 +103431,16 @@ static JSValue js_regexp_Symbol_replace_body(JSContext *ctx, JSValueConst this_v
         rp = JS_VALUE_GET_STRING(rep_val);
     }
 
+    if (js_regexp_fast(ctx, rx)) {
+        res = js_regexp_replace_fast(ctx, JS_VALUE_GET_OBJ(rx), str,
+                                     functionalReplace ? rep : rep_val,
+                                     functionalReplace);
+        if (!JS_IsUninitialized(res)) {
+            if (JS_IsException(res))
+                goto exception;
+            goto done;
+        }
+    }
     flags = JS_GetProperty(ctx, rx, JS_ATOM_flags);
     if (JS_IsException(flags))
         goto exception;
@@ -103040,6 +103625,14 @@ static JSValue js_regexp_Symbol_search_body(JSContext *ctx, JSValueConst this_va
     if (JS_IsException(str))
         goto exception;
 
+    {
+        JSRegExp *fre = js_regexp_fast(ctx, rx);
+        if (fre) {
+            result = js_regexp_search_fast(ctx, fre, str);
+            JS_FreeValue(ctx, str);
+            return result;
+        }
+    }
     previousLastIndex = JS_GetProperty(ctx, rx, JS_ATOM_lastIndex);
     if (JS_IsException(previousLastIndex))
         goto exception;
@@ -103220,6 +103813,47 @@ done:
 }
 #endif /* JS_RE_PREFILTER -- js_regexp_split_fast */
 
+#if JS_RE_PREFILTER
+/* RegExp.prototype[Symbol.split] of a pristine non-sticky RegExp, whose
+   species constructor is RegExp: the splitter object the specification
+   builds is unobservable, so the scan runs on the receiver itself. 'A' is the
+   result array. */
+static int js_regexp_split_pristine(JSContext *ctx, JSRegExp *re,
+                                    JSString *strp, uint32_t lim, JSValue A)
+{
+    int flags = lre_get_flags(str8(re->bytecode));
+    bool unicode_matching = (flags & (LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)) != 0;
+    JSValue sub;
+
+    if (lim == 0)
+        return 0;
+    if (strp->len == 0) {
+        uint8_t *capture_stack[JS_REGEXP_CAPTURE_STACK_SIZE];
+        uint8_t **capture = capture_stack;
+        JSRegExpExecData ed;
+        int rc;
+
+        if (!js_regexp_exec_prepare(ctx, re, capture_stack, &capture, &ed))
+            return -1;
+        rc = js_regexp_match(ctx, capture, &ed, re, strp, 0);
+        if (capture != capture_stack)
+            js_free(ctx, capture);
+        if (rc < 0) {
+            js_regexp_throw_rc(ctx, rc);
+            return -1;
+        }
+        if (rc == 1)
+            return 0;
+        sub = js_sub_string(ctx, strp, 0, 0);
+        if (JS_IsException(sub))
+            return -1;
+        return JS_DefinePropertyValueInt64(ctx, A, 0, sub,
+                                           JS_PROP_C_W_E | JS_PROP_THROW) < 0 ? -1 : 0;
+    }
+    return js_regexp_split_fast(ctx, A, re, strp, lim, unicode_matching);
+}
+#endif /* JS_RE_PREFILTER */
+
 static JSValue js_regexp_Symbol_split_body(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv);
 
@@ -103260,6 +103894,29 @@ static JSValue js_regexp_Symbol_split_body(JSContext *ctx, JSValueConst this_val
     str = JS_ToString(ctx, argv[0]);
     if (JS_IsException(str))
         goto exception;
+#if JS_RE_PREFILTER
+    /* A pristine, non-sticky RegExp (see js_regexp_fast) whose species
+       constructor is RegExp: no splitter object is needed. A limit that is
+       not a number could run user code, so it takes the general path. */
+    {
+        JSRegExp *fre = js_regexp_fast(ctx, rx);
+        if (fre && js_regexp_ctor_pristine(ctx) &&
+            !(lre_get_flags(str8(fre->bytecode)) & LRE_FLAG_STICKY) &&
+            (JS_IsUndefined(argv[1]) || JS_IsNumber(argv[1]))) {
+            if (JS_IsUndefined(argv[1]))
+                lim = 0xffffffff;
+            else if (JS_ToUint32(ctx, &lim, argv[1]) < 0)
+                goto exception;
+            A = JS_NewArray(ctx);
+            if (JS_IsException(A))
+                goto exception;
+            if (js_regexp_split_pristine(ctx, fre, JS_VALUE_GET_STRING(str),
+                                         lim, A) < 0)
+                goto exception;
+            goto done;
+        }
+    }
+#endif
     ctor = JS_SpeciesConstructor(ctx, rx, ctx->regexp_ctor);
     if (JS_IsException(ctor))
         goto exception;
@@ -103505,6 +104162,7 @@ int JS_AddIntrinsicRegExp(JSContext *ctx)
                                    countof(js_regexp_string_iterator_proto_funcs))) {
         return -1;
     }
+    js_regexp_snapshot(ctx);
     JS_AddIntrinsicRegExpCompiler(ctx);
     return 0;
 }

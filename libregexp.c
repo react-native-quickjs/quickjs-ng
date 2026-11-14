@@ -3706,6 +3706,17 @@ static int lre_poll_timeout(REExecContext *s)
     return 0;
 }
 
+/* The backtrack stack that outgrew the in-frame buffer. The buffer is kept
+   between matches (one per thread, handed out by moving it) so a pattern
+   that needs a deep stack on every call does not allocate and regrow it each
+   time. It comes from the C library, not the context's allocator, because
+   it outlives the context that grew it. */
+#define LRE_SCRATCH_MAX_ELEMS ((size_t)1 << 20)
+static _Thread_local struct {
+    StackElem *buf;
+    size_t size;
+} lre_scratch;
+
 static no_inline int stack_realloc(REExecContext *s, size_t n)
 {
     StackElem *new_stack;
@@ -3713,20 +3724,48 @@ static no_inline int stack_realloc(REExecContext *s, size_t n)
     new_size = s->stack_size * 3 / 2;
     if (new_size < n)
         new_size = n;
-    if (s->stack_buf == s->static_stack_buf) {
-        new_stack = lre_realloc(s->opaque, NULL, new_size * sizeof(StackElem));
-        if (!new_stack)
+    if (!(s->stack_buf == s->static_stack_buf && lre_scratch.buf &&
+          lre_scratch.size >= new_size)) {
+        /* the block is not charged to the context's allocator, so ask it
+           whether a block of this size would fit under its limit */
+        void *probe = lre_realloc(s->opaque, NULL, new_size * sizeof(StackElem));
+        if (!probe)
             return -1;
+        lre_realloc(s->opaque, probe, 0);
+    }
+    if (s->stack_buf == s->static_stack_buf) {
+        if (lre_scratch.buf && lre_scratch.size >= new_size) {
+            new_stack = lre_scratch.buf;
+            new_size = lre_scratch.size;
+            lre_scratch.buf = NULL;
+            lre_scratch.size = 0;
+        } else {
+            new_stack = malloc(new_size * sizeof(StackElem));
+            if (!new_stack)
+                return -1;
+        }
         /* XXX: could use correct size */
         memcpy(new_stack, s->stack_buf, s->stack_size * sizeof(StackElem));
     } else {
-        new_stack = lre_realloc(s->opaque, s->stack_buf, new_size * sizeof(StackElem));
+        new_stack = realloc(s->stack_buf, new_size * sizeof(StackElem));
         if (!new_stack)
             return -1;
     }
     s->stack_size = new_size;
     s->stack_buf = new_stack;
     return 0;
+}
+
+static void stack_release(REExecContext *s)
+{
+    if (s->stack_buf == s->static_stack_buf)
+        return;
+    if (!lre_scratch.buf && s->stack_size <= LRE_SCRATCH_MAX_ELEMS) {
+        lre_scratch.buf = s->stack_buf;
+        lre_scratch.size = s->stack_size;
+    } else {
+        free(s->stack_buf);
+    }
 }
 
 /* return 1 if match, 0 if not match or < 0 if error. */
@@ -3776,8 +3815,7 @@ static int lre_exec_internal(uint8_t **capture, const uint8_t *bc_buf,
     ret = lre_exec_backtrack(s, capture,
                              bc_buf + RE_HEADER_LEN + bytecode_offset, cptr);
 
-    if (s->stack_buf != s->static_stack_buf)
-        lre_realloc(s->opaque, s->stack_buf, 0);
+    stack_release(s);
     return ret;
 }
 
