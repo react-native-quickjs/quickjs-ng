@@ -28692,6 +28692,11 @@ static int regvm_put_field_add_hit(JSContext *ctx, JSFunctionBytecode *b,
         return 0;
     if (e->misses != (uint16_t)ctx->rt->ic_watchpoint_epoch)
         return 0;                   /* a prototype interceptor appeared */
+    /* a nursery cell owns no shape reference and counts none of its edges until
+       it is promoted; the swap below moves counted references, so it is the
+       ordinary object's to make */
+    if (Y_IS(p))
+        y_promote_now(p);
     nsh = b->regvm_pic_holder[b->regvm_pic_count + site];
     off = e->slot_off / (uint32_t)sizeof(JSProperty);
     osh = p->shape;
