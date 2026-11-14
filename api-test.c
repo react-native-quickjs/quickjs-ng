@@ -1479,6 +1479,17 @@ static void bulk_free_macros(void) {
     JSAtom atom4 = JS_NewAtom(ctx, "BELONG!!");
     JSAtom atom5 = JS_NewAtom(ctx, "TO US!!");
 
+    /* COLLECT BEFORE COUNTING.  This assertion requires three freed objects to
+       have LEFT the object count, and under the tracing collector releasing the
+       last reference does not reclaim -- deferred reclamation is the entire
+       point of it, and a promise of synchronous accounting would forbid every
+       mechanism built on top of it, the minor cycle included.  So the frees are
+       followed by a collection and the requirement stays EXACT: after the GC
+       the count must be lower by EXACTLY three, not "at most" three and not
+       "within a tolerance".  On the reference-counted build the GC is a no-op
+       for this purpose -- the objects were already gone -- so the arm that
+       always passed still passes for the same reason it did before. */
+    JS_RunGC(rt);
     JS_ComputeMemoryUsage(rt, &mem_usage);
     assert((obj_count - 3) == mem_usage.obj_count);
     int atom_count = mem_usage.atom_count;

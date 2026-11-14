@@ -6,6 +6,14 @@
 #include <string.h>
 #include "libregexp.h"
 
+/* Keep bytecode fixtures tied to the opcode table used by the matcher. */
+typedef enum {
+#define DEF(id, size) REOP_ ## id,
+#include "libregexp-opcode.h"
+#undef DEF
+    REOP_COUNT,
+} REOPCodeEnum;
+
 // If >= 0, the next 'alloc_countdown' allocations succeed and the one after
 // that fails. Used to inject out-of-memory conditions in the compiler.
 // When alloc_fail_persist is true, every subsequent allocation fails too.
@@ -44,19 +52,20 @@ static void oob_save_index(void)
 {
     // Bytecode with REOP_save_start index=100, but capture_count=1.
     // Without validation this causes a heap-buffer-overflow in lre_exec_backtrack.
+    // Use symbolic opcodes so inserting an opcode cannot stale this fixture.
     uint8_t bc[] = {
         0x00, 0x00,              // RE_HEADER_FLAGS = 0
         0x01,                    // RE_HEADER_CAPTURE_COUNT = 1
         0x00,                    // RE_HEADER_REGISTER_COUNT = 0
         0x04, 0x00, 0x00, 0x00, // RE_HEADER_BYTECODE_LEN = 4 (little-endian)
-        0x06,                    // REOP_any
-        0x13, 0x64,             // REOP_save_start, index=100
-        0x10,                    // REOP_match
+        REOP_any,
+        REOP_save_start, 100,    // index=100, out of range for capture_count=1
+        REOP_match,
     };
 
     uint8_t *capture[2] = {NULL, NULL};
     int ret = lre_exec(capture, bc, (const uint8_t *)"a", 0, 1, 0, NULL);
-    assert(ret < 0);
+    assert(ret == LRE_RET_BYTECODE_ERROR);
 }
 
 static void oom_no_oob_write(void)
