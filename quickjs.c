@@ -77,6 +77,20 @@
 #define CONFIG_ATOMICS
 #endif
 
+/* Relaxed atomic access; quickjs-c-atomics.h only provides seq_cst, which
+   would put a barrier on the statement-trap path. */
+#if defined(CONFIG_ATOMICS) && !defined(GCC_BUILTIN_ATOMICS)
+#define js_atomic_load_relaxed(p)       atomic_load_explicit(p, memory_order_relaxed)
+#define js_atomic_store_relaxed(p, v)   atomic_store_explicit(p, v, memory_order_relaxed)
+#elif defined(GCC_BUILTIN_ATOMICS)
+#define js_atomic_load_relaxed(p)       __atomic_load_n(p, __ATOMIC_RELAXED)
+#define js_atomic_store_relaxed(p, v)   __atomic_store_n(p, v, __ATOMIC_RELAXED)
+#else
+/* tcc, emscripten and wasi are single-threaded here */
+#define js_atomic_load_relaxed(p)       (*(p))
+#define js_atomic_store_relaxed(p, v)   (*(p) = (v))
+#endif
+
 /* Compile in the debugger trap, frame inspection and statement instrumentation. */
 #ifndef JS_ENABLE_DEBUGGER
 #define JS_ENABLE_DEBUGGER 1
@@ -629,6 +643,10 @@ struct JSContext {
 #if JS_ENABLE_DEBUGGER
     JSDebugTraceFunc *debug_trace;
     void *debug_trace_opaque;
+    /* When false, OP_debug consumes its operand and does nothing else.
+       Atomic because arming happens off the JS thread; relaxed is correct,
+       as a stale read only costs one more statement before the pause. */
+    _Atomic bool debug_trace_armed;
 #endif
 };
 
@@ -2986,6 +3004,14 @@ void JS_SetDebugTraceHandler(JSContext *ctx, JSDebugTraceFunc *cb, void *opaque)
 {
     ctx->debug_trace = cb;
     ctx->debug_trace_opaque = opaque;
+    /* Installing a handler arms it; clearing it disarms, so the flag is
+       never armed with nothing to call. */
+    js_atomic_store_relaxed(&ctx->debug_trace_armed, cb != NULL);
+}
+
+void JS_SetDebugTraceArmed(JSContext *ctx, bool armed)
+{
+    js_atomic_store_relaxed(&ctx->debug_trace_armed, armed);
 }
 
 static JSStackFrame *js_get_stack_frame_at_level(JSContext *ctx, int level)
@@ -18643,7 +18669,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #if JS_ENABLE_DEBUGGER
             {
                 int flags = *pc++;
-                if (unlikely(ctx->debug_trace)) {
+                /* Armed, not merely installed: an attached-but-idle debugger
+                   would otherwise pay find_line_num() on every statement. */
+                if (unlikely(ctx->debug_trace &&
+                             (js_atomic_load_relaxed(&ctx->debug_trace_armed) ||
+                              (flags & JS_DEBUG_TRACE_DEBUGGER_STMT)))) {
                     int col_num = 0;
                     int line_num = -1;
                     /* -2: step back over the flag operand and the opcode */

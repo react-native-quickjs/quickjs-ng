@@ -589,6 +589,16 @@ typedef int JSDebugTraceFunc(JSContext *ctx,
    disable.  Works with any context, including those created with
    JS_NewContextRaw.  See JSDebugTraceFunc above for the parse-time
    instrumentation contract. */
+/* Arm or disarm the statement trace hook. Installing a handler is what causes
+   traps to be emitted at parse time and cannot be undone; this is the cheap
+   switch for whether they do anything when executed. A freshly installed
+   handler is armed. Disarmed, OP_debug falls through, except for a trap
+   carrying JS_DEBUG_TRACE_DEBUGGER_STMT, which always reaches the handler.
+
+   Arming may be called from any thread; disarming is JS thread only. Only
+   this flag is thread-safe, not ctx as a whole. */
+JS_EXTERN void JS_SetDebugTraceArmed(JSContext *ctx, bool armed);
+
 JS_EXTERN void JS_SetDebugTraceHandler(JSContext *ctx,
                                        JSDebugTraceFunc *cb,
                                        void *opaque);
