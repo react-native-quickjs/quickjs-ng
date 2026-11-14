@@ -107889,6 +107889,74 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
             JSPropertyEnum *ptab;
             uint32_t plen, pi;
 
+            if (JS_VALUE_GET_OBJ(val)->class_id == JS_CLASS_OBJECT) {
+                /* A plain object whose keys are all strings that are not array indices: its enumerable keys in shape order are the
+                   list JS_GetOwnPropertyNames gives. Walk the shape held at the start (the key list is fixed then, as the general
+                   path's is) and read each value from its slot while the object keeps that shape and the property is a plain data
+                   one, else with JS_GetProperty, as the general path does. */
+                JSObject *op = JS_VALUE_GET_OBJ(val);
+                JSShape *sh = op->shape;
+                JSShapeProperty *prs = get_shape_prop(sh);
+                int si, nsp = sh->prop_count;
+                uint32_t idx_;
+                for (si = 0; si < nsp; si++)
+                    if (prs[si].atom != JS_ATOM_NULL &&
+                        (JS_AtomGetKind(ctx, prs[si].atom) != JS_ATOM_KIND_STRING || JS_AtomIsArrayIndex(ctx, &idx_, prs[si].atom) ||
+                         (prs[si].flags & JS_PROP_TMASK) == JS_PROP_VARREF))
+                        break;
+                if (si == nsp) {
+                    js_dup_shape(sh);
+                    string_buffer_putc8(jsc->b, '{');
+                    has_content = false;
+                    for (si = 0; si < nsp; si++) {
+                        JSAtom atom = prs[si].atom;
+                        if (atom == JS_ATOM_NULL || !(prs[si].flags & JS_PROP_ENUMERABLE))
+                            continue;
+                        JS_FreeValue(ctx, prop);
+                        prop = JS_UNDEFINED;
+                        if (op->shape == sh && (prs[si].flags & JS_PROP_TMASK) == JS_PROP_NORMAL)
+                            v = js_dup(op->prop[si].u.value);
+                        else
+                            v = JS_GetProperty(ctx, val, atom);
+                        if (JS_IsException(v))
+                            goto exception_sh;
+                        if (!JS_IsUndefined(jsc->replacer_func) || (JS_IsObject(v) || JS_IsBigInt(v))) {
+                            prop = JS_AtomToString(ctx, atom);
+                            if (JS_IsException(prop)) {
+                                JS_FreeValue(ctx, v);
+                                goto exception_sh;
+                            }
+                        }
+                        v = js_json_check(ctx, jsc, val, v, prop);
+                        if (JS_IsException(v))
+                            goto exception_sh;
+                        if (!JS_IsUndefined(v)) {
+                            if (has_content)
+                                string_buffer_putc8(jsc->b, ',');
+                            string_buffer_concat_value(jsc->b, sep);
+                            if (json_quote_str(jsc->b, ctx->rt->atom_array[atom])) {
+                                JS_FreeValue(ctx, v);
+                                goto exception_sh;
+                            }
+                            string_buffer_putc8(jsc->b, ':');
+                            string_buffer_concat_value(jsc->b, sep1);
+                            if (js_json_to_str(ctx, jsc, val, v, indent1))
+                                goto exception_sh;
+                            has_content = true;
+                        }
+                    }
+                    js_free_shape(ctx->rt, sh);
+                    if (has_content && JS_VALUE_GET_STRING(jsc->gap)->len != 0) {
+                        string_buffer_putc8(jsc->b, '\n');
+                        string_buffer_concat_value(jsc->b, indent);
+                    }
+                    string_buffer_putc8(jsc->b, '}');
+                    goto done_object;
+                exception_sh:
+                    js_free_shape(ctx->rt, sh);
+                    goto exception;
+                }
+            }
             if (JS_GetOwnPropertyNamesInternal(ctx, &ptab, &plen,
                                                JS_VALUE_GET_OBJ(val),
                                                JS_GPN_STRING_MASK |
