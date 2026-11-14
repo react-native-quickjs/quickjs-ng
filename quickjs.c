@@ -20083,6 +20083,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     uint8_t *pc;
     int opcode, arg_allocated_size, i;
     JSValue *local_buf, *stack_buf, *var_buf, *arg_buf, *sp, ret_val, *pval;
+    /* which register file the borrow fusion reads; shared so the argument
+       and local forms have one handler body */
+    JSValue *nr_buf;
     JSVarRef **var_refs;
     size_t alloca_size;
 
@@ -21139,7 +21142,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         // Observation: get_loc0 and get_loc1 are individually very
         // frequent opcodes _and_ they are very often paired together,
         // making them ideal candidates for opcode fusion.
+        CASE(OP_get_arg_field_nr):
+            nr_buf = arg_buf;
+            goto field_nr_common;
         CASE(OP_get_loc_field_nr):
+            nr_buf = var_buf;
+        field_nr_common:
             /* Borrow-fusion: get_loc(n) get_field(atom).
                The receiver is the local var_buf[loc] and is NEVER pushed to the
                stack, so nothing else can free it — we borrow it (no dup) and never
@@ -21164,7 +21172,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 8;
 
                 {
-                    JSValue obj = var_buf[loc];   /* borrowed, not dup'd */
+                    JSValue obj = nr_buf[loc];    /* borrowed, not dup'd */
                     if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
                         p = JS_VALUE_GET_OBJ(obj);
 #if JS_ENABLE_IC
@@ -21318,7 +21326,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_get_var_ref2): *sp++ = js_dup(*var_refs[2]->pvalue); BREAK;
         CASE(OP_get_var_ref3): *sp++ = js_dup(*var_refs[3]->pvalue); BREAK;
         CASE(OP_put_var_ref0): set_value(ctx, var_refs[0]->pvalue, *--sp); BREAK;
-        CASE(OP_put_var_ref3): set_value(ctx, var_refs[3]->pvalue, *--sp); BREAK;
         CASE(OP_set_var_ref0): set_value(ctx, var_refs[0]->pvalue, js_dup(sp[-1])); BREAK;
         CASE(OP_set_var_ref1): set_value(ctx, var_refs[1]->pvalue, js_dup(sp[-1])); BREAK;
         CASE(OP_set_var_ref2): set_value(ctx, var_refs[2]->pvalue, js_dup(sp[-1])); BREAK;
@@ -40285,6 +40292,27 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     pos_next = cc.pos;
                     break;
                 }
+#if JS_ENABLE_IC
+                /* Borrow-fusion: get_arg(n) get_field(atom) ->
+                   get_arg_field_nr(atom, n, ic). The receiver is the
+                   argument register and is never pushed, so the dup/free
+                   round trip and the push/pop both disappear. Plain
+                   get_field only, and not `.length`, which becomes
+                   OP_get_length further down. */
+                if (op == OP_get_arg && s->ic_count < 0xffff &&
+                    code_match(&cc, pos_next, OP_get_field, -1) &&
+                    cc.atom != JS_ATOM_length) {
+                    if (cc.line_num >= 0) line_num = cc.line_num;
+                    if (cc.col_num >= 0) col_num = cc.col_num;
+                    add_pc2line_info(s, bc_out.size, line_num, col_num);
+                    dbuf_putc(&bc_out, OP_get_arg_field_nr);
+                    dbuf_put_u32(&bc_out, cc.atom);      /* atom at pos+1 */
+                    dbuf_put_u16(&bc_out, idx);          /* arg  at pos+5 */
+                    dbuf_put_u16(&bc_out, s->ic_count++);/* ic   at pos+7 */
+                    pos_next = cc.pos;
+                    break;
+                }
+#endif
                 add_pc2line_info(s, bc_out.size, line_num, col_num);
                 put_short_code(&bc_out, op, idx);
             }
@@ -44399,6 +44427,18 @@ static int js_validate_ic_bytecode(JSContext *ctx, JSFunctionBytecode *b)
             {
                 uint32_t ic_idx = get_u16(buf + pc + 7);
                 if (get_u16(buf + pc + 5) >= (uint32_t)b->var_count + b->arg_count ||
+                    ic_idx >= b->ic_count || ic_seen[ic_idx]) {
+                    JS_ThrowSyntaxError(ctx, "invalid inline-cache metadata: non-canonical fused operands");
+                    goto fail;
+                }
+                ic_seen[ic_idx] = 1;
+                ic_seen_count++;
+            }
+            break;
+        case OP_get_arg_field_nr:
+            {
+                uint32_t ic_idx = get_u16(buf + pc + 7);
+                if (get_u16(buf + pc + 5) >= (uint32_t)b->arg_count ||
                     ic_idx >= b->ic_count || ic_seen[ic_idx]) {
                     JS_ThrowSyntaxError(ctx, "invalid inline-cache metadata: non-canonical fused operands");
                     goto fail;
