@@ -65991,6 +65991,87 @@ QJS_AOT_STUB int qjs_aot_shape_slot(const void *shape, uint32_t atom, uint32_t *
     return 0;
 }
 
+/* The two forms below are for a table that HOLDS the shape (qjs_aot_shape_hold): they do not mark it observed, since a held shape can be neither
+   freed nor edited in place (an edit of a shape somebody else references clones it first), so no epoch has to guard the table.
+   Like qjs_aot_shape_slot: 1 with the byte offset of an own data property; `rslot` for a read, `wslot` for a store (also writable, not the array length). */
+QJS_AOT_STUB int qjs_aot_shape_rslot(const void *shape, uint32_t atom, uint32_t *off)
+{
+    JSShape *sh = (JSShape *)shape;
+    JSShapeProperty *pr, *prop;
+    intptr_t h;
+
+    if (sh == NULL)
+        return 0;
+    h = (uintptr_t)atom & sh->prop_hash_mask;
+    h = prop_hash_end(sh)[-h - 1];
+    prop = get_shape_prop(sh);
+    while (h) {
+        pr = &prop[h - 1];
+        if (pr->atom == (JSAtom)atom) {
+            if ((pr->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+                return 0;
+            *off = (uint32_t)((pr - prop) * sizeof(JSProperty));
+            return 1;
+        }
+        h = pr->hash_next;
+    }
+    return 0;
+}
+
+QJS_AOT_STUB int qjs_aot_shape_wslot(const void *shape, uint32_t atom, uint32_t *off)
+{
+    JSShape *sh = (JSShape *)shape;
+    JSShapeProperty *pr, *prop;
+    intptr_t h;
+
+    if (sh == NULL)
+        return 0;
+    h = (uintptr_t)atom & sh->prop_hash_mask;
+    h = prop_hash_end(sh)[-h - 1];
+    prop = get_shape_prop(sh);
+    while (h) {
+        pr = &prop[h - 1];
+        if (pr->atom == (JSAtom)atom) {
+            if ((pr->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE | JS_PROP_LENGTH)) != JS_PROP_WRITABLE)
+                return 0;
+            *off = (uint32_t)((pr - prop) * sizeof(JSProperty));
+            return 1;
+        }
+        h = pr->hash_next;
+    }
+    return 0;
+}
+
+/* A counted reference to a shape for a compiled table keyed by its address, and its release (at the unit's teardown, while the runtime lives). */
+QJS_AOT_STUB void *qjs_aot_shape_hold(const void *shape)
+{
+    return js_dup_shape((JSShape *)shape);
+}
+
+QJS_AOT_STUB void qjs_aot_shape_release(JSRuntime *rt, void *shape)
+{
+    js_free_shape(rt, (JSShape *)shape);
+}
+
+/* The digest of the bytecode function `fnv` (the key the unit binds functions by), without needing the function to have been called: 1 and 16 bytes in *out,
+   or 0 when it is not a function the unit can know (not a bytecode function, lazy, or without a register program). */
+QJS_AOT_STUB int qjs_aot_function_digest(JSValue fnv, uint8_t out[16])
+{
+    JSObject *p;
+    JSFunctionBytecode *b;
+
+    if (JS_VALUE_GET_TAG(fnv) != JS_TAG_OBJECT)
+        return 0;
+    p = JS_VALUE_GET_OBJ(fnv);
+    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION)
+        return 0;
+    b = p->u.func.function_bytecode;
+    if (b->is_lazy || !b->regvm_compiled || b->regvm_len <= 0)
+        return 0;
+    js_aot_digest(b, out);
+    return 1;
+}
+
 /* The method a receiver of shape `shape` finds as `atom`: 1 with the value when the shape has no own property of that name and the first
    object of its prototype chain that has one holds it as a plain data property (ordinary objects only, at most eight links), else 0.
    Like qjs_aot_shape_slot it reads the shape and the prototype objects only, so the caller keeps the answer while shape_free_epoch

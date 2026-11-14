@@ -229,6 +229,14 @@ QJS_AOT_STUB const void *qjs_aot_array_builtin_fn(int which);
 QJS_AOT_STUB int qjs_aot_array_push_slow(JSContext *ctx, JSValue arr, JSValue v, JSValue *out);
 /* the byte offset of the own data property `atom` in objects of `shape`, or 0 when it is not one (a compiled copy resolves its receiver's slots from the shape) */
 QJS_AOT_STUB int qjs_aot_shape_slot(const void *shape, uint32_t atom, uint32_t *off);
+/* For a table that holds the shape (qjs_aot_shape_hold): the offset of an own data property for a read (rslot) or a store (wslot: also writable), without marking the shape observed. */
+QJS_AOT_STUB int qjs_aot_shape_rslot(const void *shape, uint32_t atom, uint32_t *off);
+QJS_AOT_STUB int qjs_aot_shape_wslot(const void *shape, uint32_t atom, uint32_t *off);
+/* A counted reference to a shape, and its release (at the unit's teardown). */
+QJS_AOT_STUB void *qjs_aot_shape_hold(const void *shape);
+QJS_AOT_STUB void qjs_aot_shape_release(JSRuntime *rt, void *shape);
+/* The digest of a bytecode function (the unit's binding key), whether or not it has been called: 1 with 16 bytes, or 0. */
+QJS_AOT_STUB int qjs_aot_function_digest(JSValue fnv, uint8_t out[16]);
 /* the function a receiver of `shape` finds as `atom` on its prototype chain, when it is a plain data property (a compiled copy resolves its receiver's methods from the shape) */
 QJS_AOT_STUB int qjs_aot_shape_method(const void *shape, uint32_t atom, JSValue *out);
 /* The function pointer of the builtin `Function.prototype.apply`, which a C function object holds,
