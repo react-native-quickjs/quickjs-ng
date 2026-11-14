@@ -16804,6 +16804,7 @@ struct JSAotFact {
     JSValue proto;          /* the expected [[prototype]] when QJS_AOT_FACT_PROTO is set */
     uint32_t flags;
     uint8_t state;
+    uint32_t layout;        /* a constructor-layout watch: the layout this group's break breaks (0: none) */
     int nprops;
     struct JSAotFactProp *props;
     int ndep, depcap;
@@ -16813,6 +16814,7 @@ typedef struct JSAotFacts {
     JSAotFact **g;
     int n, cap;
     uint32_t breaks;
+    uint32_t fresh_pending; /* FRESH groups still PENDING: only they care about a construct */
     struct JSAotLayoutDep *ld;      /* the facts_valid bits that depend on a layout */
     int nld, ldcap;
 } JSAotFacts;
@@ -16920,9 +16922,14 @@ static void js_aot_fact_break_now(JSAotFacts *F, JSAotFact *g)
 {
     if (g->state == QJS_AOT_FACT_BROKEN)
         return;
+    if (g->state == QJS_AOT_FACT_PENDING && (g->flags & QJS_AOT_FACT_FRESH))
+        F->fresh_pending--;
     g->state = QJS_AOT_FACT_BROKEN;
     F->breaks++;
     js_aot_fact_set_deps(g, 0);
+    /* a constructor-layout watch: the layout was built on this `prototype` value */
+    if (g->layout != 0)
+        js_aot_layout_break(g->rt, g->layout);
 }
 
 static void js_aot_obj_event(JSRuntime *rt, JSObject *p, int ev, JSAtom atom, JSValueConst val)
@@ -17056,6 +17063,8 @@ JSAotFact *qjs_aot_fact_new(JSContext *ctx, JSValueConst obj, JSValueConst proto
     g->obj = p;
     g->flags = flags;
     g->proto = JS_UNDEFINED;
+    if (flags & QJS_AOT_FACT_FRESH)
+        F->fresh_pending++;
     if (flags & QJS_AOT_FACT_PROTO)
         g->proto = js_dup(JS_VALUE_GET_TAG(proto) == JS_TAG_OBJECT ? proto : JS_NULL);
     for (i = 0; i < natoms; i++) {
@@ -17135,6 +17144,8 @@ int qjs_aot_fact_validate(JSContext *ctx, JSAotFact *g)
 {
     (void)ctx;
     if (g->state == QJS_AOT_FACT_PENDING && js_aot_fact_matches(g)) {
+        if (g->flags & QJS_AOT_FACT_FRESH)
+            g->rt->aot_facts->fresh_pending--;
         g->state = QJS_AOT_FACT_VALID;
         js_aot_fact_set_deps(g, 1);
     }
@@ -25037,12 +25048,9 @@ static JSValue js_closure(JSContext *ctx, JSValue bfunc,
                           JSVarRef **cur_var_refs,
                           JSStackFrame *sf)
 {
-    bool ctor = JS_AOT_LAYOUT_CTOR((JSFunctionBytecode *)JS_VALUE_GET_PTR(bfunc));
-    JSValue fn = js_closure_impl(ctx, bfunc, cur_var_refs, sf);
-
-    if (unlikely(ctor) && !JS_IsException(fn))
-        js_aot_layout_fn_hook(ctx, fn);
-    return fn;
+    /* A layout's chain is no longer built here: `F.prototype = X` usually follows the
+       closure. See js_create_from_ctor_cap. */
+    return js_closure_impl(ctx, bfunc, cur_var_refs, sf);
 }
 
 #define JS_DEFINE_CLASS_HAS_HERITAGE     (1 << 0)
@@ -44338,7 +44346,7 @@ static JSValue js_create_from_ctor_cap(JSContext *ctx, JSValueConst ctor,
     JSProperty *ppr = NULL;
     JSFunctionBytecode *fb = NULL;
 
-    if (unlikely(ctx->rt->aot_facts != NULL) && JS_VALUE_GET_TAG(ctor) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(ctor)->gv_watched)
+    if (unlikely(ctx->rt->aot_facts != NULL) && ctx->rt->aot_facts->fresh_pending != 0 && JS_VALUE_GET_TAG(ctor) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(ctor)->gv_watched)
         js_aot_obj_event(ctx->rt, JS_VALUE_GET_OBJ(ctor), JS_AOT_EV_CONSTRUCT, JS_ATOM_NULL, JS_UNDEFINED);
     if (JS_IsUndefined(ctor)) {
         proto = js_dup(ctx->class_proto[class_id]);
@@ -44356,6 +44364,12 @@ static JSValue js_create_from_ctor_cap(JSContext *ctx, JSValueConst ctor,
                 JSValue pv;
 
                 fb = cp->u.func.function_bytecode;
+                /* The first construct of a function whose bytecode has a layout still to build: the
+                   chain is built against `ctor.prototype` as it is NOW, after any ES5-style
+                   `F.prototype = X`, and before this construct reads it. One byte of fb, already
+                   loaded; clear for every other function and, once tried, for this one. */
+                if (unlikely(JS_AOT_LAYOUT_CTOR(fb)))
+                    js_aot_layout_fn_hook(ctx, ctor);
                 if (fb->ctor_fn_shape == cp->shape) {
                     ppr = &cp->prop[fb->ctor_proto_slot];
                 } else {
@@ -66408,10 +66422,36 @@ static void js_aot_layout_fn_hook(JSContext *ctx, JSValueConst fn)
        allocation failure there refuses the layout and is dropped here. */
     if (unlikely(JS_HasException(ctx)))
         JS_FreeValue(ctx, JS_GetException(ctx));
-    /* Once the unit has nothing left to build for this digest the mark is
-       dropped, so later closures of the same function skip the hash. */
-    if (&qjs_aot_layout_ctor != NULL && !qjs_aot_layout_ctor(dg))
-        b->aot_layout_ctor = 0;
+    /* One attempt per bytecode: the layout is built (or refused) from the first
+       constructor object that constructs, so the mark is dropped whatever the
+       answer and every later construct skips the hash. */
+    b->aot_layout_ctor = 0;
+}
+
+/* The unit built layout `layout_id` on `proto`, which is `fn`'s own `prototype` right now.
+   Watch that property: a store, a redefinition or a delete of it, by any path, breaks the
+   layout (a fact group on `fn` listing `prototype`, whose break calls js_aot_layout_break).
+   Costs nothing on the construct path of any other function, and for a watched one the
+   construct event is only looked at while a FRESH group is pending. Returns 0, with the
+   layout already broken, when the watch cannot be made. */
+QJS_AOT_STUB int qjs_aot_layout_watch_proto(JSContext *ctx, JSValueConst fn, uint32_t layout_id)
+{
+    JSAtom atoms[1];
+    JSAotFact *g;
+
+    atoms[0] = JS_ATOM_prototype;
+    g = qjs_aot_fact_new(ctx, fn, JS_UNDEFINED, 0, atoms, 1);
+    if (g == NULL) {
+        if (layout_id != 0 && layout_id <= 63)
+            js_aot_layout_break(ctx->rt, layout_id);
+        return 0;
+    }
+    g->layout = layout_id;
+    if (qjs_aot_fact_validate(ctx, g) != QJS_AOT_FACT_VALID) {
+        js_aot_fact_break_now(ctx->rt->aot_facts, g);
+        return 0;
+    }
+    return 1;
 }
 
 /* Object.prototype, for a layout whose instances are plain object literals. The
