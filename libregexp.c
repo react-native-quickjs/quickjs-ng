@@ -3878,6 +3878,180 @@ int lre_check_bytecode(const uint8_t *bc_buf, int bc_buf_len, void *opaque)
     return 0;
 }
 
+/* ==== Static analysis of compiled bytecode ================================ *
+ * What every match of a pattern must contain, derived from the instruction
+ * stream without changing it: a literal run that every path executes, how far
+ * before it a match can start, and whether a match can only start at index 0. */
+
+#define LRE_ANALYZE_MAX_CODE 4096
+
+static bool lre_op_target(const uint8_t *code, size_t pos, int *ptarget)
+{
+    switch (code[pos]) {
+    case REOP_goto:
+    case REOP_split_goto_first:
+    case REOP_split_next_first:
+    case REOP_lookahead:
+    case REOP_negative_lookahead:
+        *ptarget = (int)pos + 5 + (int32_t)get_u32(code + pos + 1);
+        return true;
+    case REOP_loop:
+        *ptarget = (int)pos + 6 + (int32_t)get_u32(code + pos + 2);
+        return true;
+    case REOP_loop_split_goto_first:
+    case REOP_loop_split_next_first:
+    case REOP_loop_check_adv_split_goto_first:
+    case REOP_loop_check_adv_split_next_first:
+        *ptarget = (int)pos + 10 + (int32_t)get_u32(code + pos + 6);
+        return true;
+    default:
+        return false;
+    }
+}
+
+int lre_analyze(const uint8_t *bc_buf, size_t bc_buf_len, LRERequired *out)
+{
+    int32_t cover[LRE_ANALYZE_MAX_CODE + 2];
+    int32_t maxw[LRE_ANALYZE_MAX_CODE + 2];
+    const uint8_t *code;
+    size_t code_len, pos, len, entry = 11;
+    int best_pos = -1, best_len = 0, run_pos = -1, run_len = 0;
+    uint16_t run[LRE_REQ_MAX];
+    int unit, flags, c, i;
+
+    memset(out, 0, sizeof(*out));
+    out->prefix_max = -1;
+    if (bc_buf_len < RE_HEADER_LEN)
+        return 0;
+    code_len = get_u32(bc_buf + RE_HEADER_BYTECODE_LEN);
+    if (code_len > bc_buf_len - RE_HEADER_LEN || code_len > LRE_ANALYZE_MAX_CODE ||
+        code_len < entry + 2)
+        return 0;
+    flags = lre_get_flags(bc_buf);
+    /* a sticky pattern has no scan prologue and never scans */
+    if (flags & LRE_FLAG_STICKY)
+        return 0;
+    code = bc_buf + RE_HEADER_LEN;
+    if (code[0] != REOP_split_goto_first || code[5] != REOP_any ||
+        code[6] != REOP_goto || code[entry] != REOP_save_start ||
+        code[entry + 1] != 0)
+        return 0;
+    unit = (flags & (LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)) ? 2 : 1;
+    out->entry = (uint32_t)entry;
+    if (code_len >= entry + 3 && code[entry + 2] == REOP_line_start)
+        out->anchored = 1;
+
+    /* cover[p] > 0: a jump passes over the instruction boundary p, so the
+       instruction at p is not executed by every path */
+    memset(cover, 0, sizeof(int32_t) * (code_len + 2));
+    for (pos = entry; pos < code_len; pos += len) {
+        int target;
+        if (!re_checked_op_len(code + pos, code_len - pos, &len))
+            return 0;
+        if (lre_op_target(code, pos, &target)) {
+            int lo, hi;
+            if (target < 0 || (size_t)target > code_len)
+                return 0;
+            if ((size_t)target > pos) {
+                lo = (int)pos + 1;
+                hi = target;
+            } else {
+                lo = target;
+                hi = (int)(pos + len);
+            }
+            for (i = lo; i < hi; i++)
+                cover[i] = 1;
+        }
+    }
+    /* the longest run of exact characters executed by every path */
+    for (pos = entry; pos < code_len; pos += len) {
+        uint8_t op = code[pos];
+        if (!re_checked_op_len(code + pos, code_len - pos, &len))
+            return 0;
+        if ((op == REOP_char || op == REOP_char32) && !cover[pos]) {
+            c = op == REOP_char ? get_u16(code + pos + 1) :
+                (int)get_u32(code + pos + 1);
+            if (c > 0xffff || (c >= 0xd800 && c <= 0xdfff)) {
+                goto flush;
+            }
+            if (run_len == 0)
+                run_pos = (int)pos;
+            if (run_len < LRE_REQ_MAX)
+                run[run_len++] = (uint16_t)c;
+            continue;
+        }
+        if (cover[pos] == 0 && (op == REOP_save_start || op == REOP_save_end ||
+                                op == REOP_save_reset) && run_len)
+            continue;
+    flush:
+        if (run_len > best_len) {
+            best_len = run_len;
+            best_pos = run_pos;
+            memcpy(out->lit, run, sizeof(run[0]) * run_len);
+        }
+        run_len = 0;
+    }
+    if (run_len > best_len) {
+        best_len = run_len;
+        best_pos = run_pos;
+        memcpy(out->lit, run, sizeof(run[0]) * run_len);
+    }
+    if (best_len == 0)
+        return out->anchored;
+    out->len = best_len;
+
+    /* the farthest the match start can lie before the literal, in code units */
+    for (i = 0; i <= (int)code_len; i++)
+        maxw[i] = -1;
+    maxw[entry] = 0;
+    for (pos = entry; (int)pos < best_pos; pos += len) {
+        uint8_t op = code[pos];
+        int w = maxw[pos], target, nw, ok = 1;
+        if (!re_checked_op_len(code + pos, code_len - pos, &len))
+            return 1;
+        if (w < 0)
+            continue;
+        nw = w;
+        switch (op) {
+        case REOP_char: case REOP_char_i: case REOP_char32: case REOP_char32_i:
+        case REOP_dot: case REOP_any: case REOP_space: case REOP_not_space:
+        case REOP_range: case REOP_range_i: case REOP_range32: case REOP_range32_i:
+            nw = w + unit;
+            break;
+        case REOP_line_start: case REOP_line_start_m: case REOP_line_end:
+        case REOP_line_end_m: case REOP_save_start: case REOP_save_end:
+        case REOP_save_reset: case REOP_word_boundary: case REOP_word_boundary_i:
+        case REOP_not_word_boundary: case REOP_not_word_boundary_i:
+        case REOP_set_i32: case REOP_set_char_pos: case REOP_check_advance:
+            break;
+        case REOP_goto: case REOP_split_goto_first: case REOP_split_next_first:
+        case REOP_lookahead: case REOP_negative_lookahead:
+            lre_op_target(code, pos, &target);
+            if ((size_t)target <= pos || (int)target > best_pos) {
+                if ((size_t)target <= pos)
+                    ok = 0;
+                break;
+            }
+            if (maxw[target] < w)
+                maxw[target] = w;
+            if (op == REOP_goto || op == REOP_lookahead ||
+                op == REOP_negative_lookahead)
+                continue;
+            break;
+        default:
+            ok = 0;
+            break;
+        }
+        if (!ok)
+            return 1;
+        if (pos + len <= (size_t)best_pos && maxw[pos + len] < nw)
+            maxw[pos + len] = nw;
+    }
+    if (maxw[best_pos] >= 0)
+        out->prefix_max = maxw[best_pos];
+    return 1;
+}
+
 int lre_get_capture_count(const uint8_t *bc_buf)
 {
     return bc_buf[RE_HEADER_CAPTURE_COUNT];

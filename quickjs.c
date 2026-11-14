@@ -1347,6 +1347,15 @@ typedef struct JSGVCell {
 } JSGVCell;
 
 #define JS_RE_SNAP_N 16
+#define JS_RE_REQ_SLOTS 512
+
+/* what libregexp's analysis found for a compiled pattern, by bytecode string */
+typedef struct JSReReq {
+    JSString *bc;          /* holds a reference; NULL if the slot is empty */
+    LRERequired r;
+    bool lit8_ok;          /* every unit of r.lit fits in 8 bits */
+    uint8_t lit8[LRE_REQ_MAX];
+} JSReReq;
 
 struct JSContext {
     JSGCObjectHeader header; /* must come first */
@@ -1430,6 +1439,7 @@ struct JSContext {
     JSValue re_snap[JS_RE_SNAP_N];
     uint16_t re_snap_idx[JS_RE_SNAP_N];
     uint8_t re_snap_getter[JS_RE_SNAP_N];
+    JSReReq *re_req;       /* JS_RE_REQ_SLOTS entries, allocated on first use */
     int re_snap_n;
     int re_species_idx;
     JSValue re_species;
@@ -6262,6 +6272,12 @@ void JS_FreeContext(JSContext *ctx)
         JS_FreeValue(ctx, ctx->re_snap[i]);
     if (ctx->re_snap_n)
         JS_FreeValue(ctx, ctx->re_species);
+    if (ctx->re_req) {
+        for (i = 0; i < JS_RE_REQ_SLOTS; i++)
+            if (ctx->re_req[i].bc)
+                JS_FreeValue(ctx, JS_MKPTR(JS_TAG_STRING, ctx->re_req[i].bc));
+        js_free_rt(ctx->rt, ctx->re_req);
+    }
     for (i = 0; i < (int)countof(ctx->closure_shape); i++)
         js_free_shape_null(ctx->rt, ctx->closure_shape[i]);
 
@@ -101524,7 +101540,7 @@ static JSValue js_regexp_escape(JSContext *ctx, JSValueConst this_val,
 /* Most patterns need only a handful of capture/register slots; keep those on
    the stack to avoid a malloc/free pair on every exec. Larger patterns fall
    back to the heap. */
-#define JS_REGEXP_CAPTURE_STACK_SIZE 16
+#define JS_REGEXP_CAPTURE_STACK_SIZE 64
 
 
 typedef enum {
@@ -101896,6 +101912,110 @@ js_regexp_exec_data_init(JSRegExpExecData *d, JSRegExp *re, int capture_count)
     }
 }
 
+/* The analysis of 're' (see lre_analyze), kept per context by bytecode
+   string. Never NULL once the table exists; r.len == 0 and !r.anchored mean
+   there is nothing to use. */
+static const JSReReq *js_regexp_req(JSContext *ctx, JSRegExp *re)
+{
+    JSReReq *e;
+    JSString *bc = re->bytecode;
+    uint32_t h = (uint32_t)(((uintptr_t)bc >> 4) * 2654435761u) >> 8;
+
+    if (unlikely(!ctx->re_req)) {
+        ctx->re_req = js_mallocz(ctx, sizeof(JSReReq) * JS_RE_REQ_SLOTS);
+        if (!ctx->re_req)
+            return NULL;
+    }
+    e = &ctx->re_req[h & (JS_RE_REQ_SLOTS - 1)];
+    if (likely(e->bc == bc))
+        return e;
+    if (e->bc)
+        JS_FreeValue(ctx, JS_MKPTR(JS_TAG_STRING, e->bc));
+    memset(e, 0, sizeof(*e));
+    e->bc = bc;
+    JS_DupValue(ctx, JS_MKPTR(JS_TAG_STRING, bc));
+    if (!bc->is_wide_char) {
+        int i;
+        lre_analyze(str8(bc), bc->len, &e->r);
+        e->lit8_ok = true;
+        for (i = 0; i < e->r.len; i++) {
+            if (e->r.lit[i] > 0xff)
+                e->lit8_ok = false;
+            e->lit8[i] = (uint8_t)e->r.lit[i];
+        }
+    }
+    return e;
+}
+
+/* Index of the first occurrence of the literal in str[from..], or -1 */
+static int js_regexp_find_literal(const JSReReq *e, JSString *str, int from)
+{
+    int m = e->r.len, n = str->len, i;
+
+    if (n - from < m)
+        return -1;
+    if (!str->is_wide_char) {
+        const uint8_t *s = str8(str), *p;
+        const uint8_t *end = s + n - m + 1;
+        if (!e->lit8_ok)
+            return -1;
+        p = s + from;
+        while (p < end) {
+            p = memchr(p, e->lit8[0], end - p);
+            if (!p)
+                return -1;
+            if (memcmp(p, e->lit8, m) == 0)
+                return (int)(p - s);
+            p++;
+        }
+        return -1;
+    } else {
+        const uint16_t *s = str16(str);
+        for (i = from; i + m <= n; i++) {
+            int k;
+            if (s[i] != e->r.lit[0])
+                continue;
+            for (k = 1; k < m && s[i + k] == e->r.lit[k]; k++)
+                ;
+            if (k == m)
+                return i;
+        }
+        return -1;
+    }
+}
+
+/* The scanning matcher, entered after what the analysis proves: a pattern
+   that starts with ^ can only match at index 0 and needs no scan; one with a
+   required literal cannot match a subject that lacks it, and cannot start
+   before the first occurrence minus the longest possible prefix. */
+static int js_regexp_match_generic(JSContext *ctx, uint8_t **capture,
+                                   const JSRegExpExecData *d, JSRegExp *re,
+                                   JSString *str, int start_index)
+{
+    const JSReReq *e = js_regexp_req(ctx, re);
+
+    if (e && (e->r.anchored || e->r.len)) {
+        if (e->r.anchored) {
+            if (start_index != 0)
+                return 0;
+            return lre_exec_at(capture, d->bytecode, e->r.entry, str8(str), 0,
+                               str->len, str->is_wide_char, ctx);
+        }
+        {
+            int at = js_regexp_find_literal(e, str, start_index);
+            if (at < 0)
+                return 0;
+            if (e->r.prefix_max >= 0) {
+                int lo = at - e->r.prefix_max - 1;
+                if (lo > start_index)
+                    start_index = lo;
+            }
+        }
+    }
+    return lre_exec(capture, d->bytecode, str8(str), start_index,
+                    str->len, str->is_wide_char, ctx);
+}
+
 /* Run one match attempt starting at 'start_index', choosing the fastest
    applicable strategy. Same return convention as lre_exec. */
 static inline int
@@ -101914,8 +102034,7 @@ js_regexp_match_raw(JSContext *ctx, uint8_t **capture, const JSRegExpExecData *d
                                          d->metadata, str, start_index);
     case JS_REGEXP_MATCH_GENERIC:
     default:
-        return lre_exec(capture, d->bytecode, str8(str), start_index,
-                        str->len, str->is_wide_char, ctx);
+        return js_regexp_match_generic(ctx, capture, d, re, str, start_index);
     }
 }
 

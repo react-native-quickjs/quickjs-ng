@@ -114,6 +114,17 @@ int lre_exec_at(uint8_t **capture,
                 const uint8_t *cbuf, int cindex, int clen,
                 int cbuf_type, void *opaque);
 
+#define LRE_REQ_MAX 32
+typedef struct LRERequired {
+    uint16_t lit[LRE_REQ_MAX]; /* code units every match contains, in order */
+    int len;                   /* 0 if none */
+    int prefix_max;            /* most code units a match can start before lit, -1 if unbounded */
+    uint32_t entry;            /* bytecode offset of the anchored entry (save_start 0) */
+    int anchored;              /* a match can only start at index 0 */
+} LRERequired;
+/* Analyse compiled bytecode. Returns 1 if anything was found, else 0. */
+int lre_analyze(const uint8_t *bc_buf, size_t bc_buf_len, LRERequired *out);
+
 int lre_parse_escape(const uint8_t **pp, int allow_utf16);
 /* lre_is_space() is provided as an inline in libunicode.h */
 
