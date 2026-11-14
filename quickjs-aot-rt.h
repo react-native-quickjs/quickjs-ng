@@ -115,6 +115,8 @@ typedef struct JSAotGenLayout {
        deopt pc is AOT-only), and the engine owns every allocation. */
     uint32_t off_regrun_b, off_regrun_pic, off_regrun_var_buf;
     uint32_t off_regrun_arg_buf, off_regrun_func, off_regrun_this_obj;
+    /* The call's argument count (a uint16_t) and the argument vector the activation was called with (record frames only). */
+    uint32_t off_regrun_argc, off_regrun_argv;
     uint32_t off_regrun_flags, off_regrun_sf, off_regrun_caller;
     uint32_t off_fnbc_regvm_code, off_fnbc_regvm_pic_holder;
     uint32_t off_fnbc_var_count, off_fnbc_arg_count;
@@ -687,6 +689,9 @@ uint32_t qjs_aot_gv_gen(JSContext *ctx);
 
 QJS_AOT_STUB int qjs_aot_get_global_site(JSContext *ctx, JSRegRun *f, int site,
                                          int atom, int throwing, JSValue *out);
+
+/* Fill the cache cell of a global-read site for a plain data property, running no user code: 1 when the site now holds, else 0. */
+QJS_AOT_STUB int qjs_aot_global_warm(JSContext *ctx, JSRegRun *f, int site, int atom);
 
 /* The get_global handler's site-cache hit alone: 1 with a borrowed *out (store
    with AOT_SET_B), 0 when the caller must take qjs_aot_get_global_site. Runs no
