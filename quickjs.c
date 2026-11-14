@@ -64479,6 +64479,12 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
         list_del(&fd->link);
     }
 
+#if QJS_REGVM
+    /* fd->regvm_code was already freed once copied into b; the nip_catch pop
+       table has no other owner. */
+    js_free(ctx, fd->regvm_nip_pop);
+    fd->regvm_nip_pop = NULL;
+#endif
     free_objlit_sites(ctx, fd);
     js_free(ctx, fd);
     return JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, b);
