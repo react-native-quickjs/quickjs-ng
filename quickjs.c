@@ -12958,11 +12958,10 @@ static inline void regvm_put_arg(JSContext *ctx, JSValue *buf, int owned,
 static void js_regvm_drc_suspend(JSRuntime *rt, JSValue *regs, uint32_t nregs)
 {
     uint32_t i;
-    for (i = 0; i < nregs; i++) {
-        JSValue v = regs[i];
-        if (JS_VALUE_HAS_REF_COUNT(v))
-            JS_REF_COUNT(JS_VALUE_GET_PTR(v))++;
-    }
+    /* js_dup, not a bare increment: a nursery cell must be noted as referenced from the heap, or a young collection while the
+       coroutine is suspended frees it under the register that still names it. */
+    for (i = 0; i < nregs; i++)
+        js_dup(regs[i]);
 }
 
 static void js_regvm_drc_resume(JSRuntime *rt, JSValue *regs, uint32_t nregs)
