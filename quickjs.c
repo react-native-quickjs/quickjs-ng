@@ -258,6 +258,16 @@ typedef enum JSErrorEnum {
 /* rope depth at which we rebalance */
 #define JS_STRING_ROPE_MAX_DEPTH 60
 
+/* Yield-aware collection pacing. A collection is unproductive when it
+   reclaimed less than 1/JS_GC_BARREN_FRACTION of the heap or less than
+   JS_GC_MIN_WORTH bytes. Consecutive unproductive collections double the
+   growth step, up to JS_GC_PACE_MAX_PCT of the live heap; a productive one
+   resets the streak. A cap of 0 keeps the unmodified rule. */
+#define JS_GC_BARREN_FRACTION     64
+#define JS_GC_MIN_WORTH           (256 * 1024)
+#define JS_GC_PACE_MAX_PCT        400
+#define JS_GC_PACE_STREAK_DEFAULT 8
+
 #define __exception __attribute__((warn_unused_result))
 
 typedef struct JSShape JSShape;
@@ -445,6 +455,11 @@ struct JSRuntime {
     bool gc_deferred; /* see JS_SetGCDeferred */
     bool gc_pending;
     size_t gc_deferred_limit;
+    /* Yield-aware pacing. gc_cyc_empty_streak counts consecutive collections
+       that reclaimed almost nothing, saturating at gc_pace_streak_cap; see
+       js_gc_rearm_pace(). */
+    uint8_t gc_pace_streak_cap;
+    uint8_t gc_cyc_empty_streak;
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
     struct list_head string_list; /* list of JSString.link */
 #endif
@@ -1996,6 +2011,37 @@ JSValue JS_DupValueRT(JSRuntime *rt, JSValueConst v)
     return js_dup(v);
 }
 
+/* The rearm policy, shared by both collection sites. A collection costs live
+   objects but only frees cyclic garbage, so one that reclaimed nothing can be
+   delayed without retaining anything it would have freed; garbage produced
+   meanwhile is bounded by JS_GC_PACE_MAX_PCT. */
+static void js_gc_rearm_pace(JSRuntime *rt, size_t before, size_t after)
+{
+    size_t step = after >> 1, maxstep;
+    size_t freed = before > after ? before - after : 0;
+    int unproductive;
+
+    if (rt->gc_pace_streak_cap == 0) {
+        rt->malloc_gc_threshold = after + step;   /* the unmodified rule */
+        return;
+    }
+    unproductive = (freed * JS_GC_BARREN_FRACTION < before) ||
+                   (freed < (size_t)JS_GC_MIN_WORTH);
+    if (unproductive) {
+        if (rt->gc_cyc_empty_streak < rt->gc_pace_streak_cap)
+            rt->gc_cyc_empty_streak++;
+    } else {
+        rt->gc_cyc_empty_streak = 0;
+    }
+    step <<= rt->gc_cyc_empty_streak;
+    maxstep = (size_t)((uint64_t)after * JS_GC_PACE_MAX_PCT / 100);
+    if (maxstep < (after >> 1))
+        maxstep = after >> 1;                     /* never tighter than the rule */
+    if (step > maxstep)
+        step = maxstep;
+    rt->malloc_gc_threshold = after + step;
+}
+
 static void js_trigger_gc(JSRuntime *rt, size_t size)
 {
     bool force_gc;
@@ -2019,10 +2065,13 @@ static void js_trigger_gc(JSRuntime *rt, size_t size)
             printf("GC: size=%zd\n", rt->malloc_state.malloc_size);
         }
 #endif
-        JS_RunGC(rt);
-        rt->gc_pending = false;
-        rt->malloc_gc_threshold = rt->malloc_state.malloc_size +
-            (rt->malloc_state.malloc_size >> 1);
+        {
+            size_t before = rt->malloc_state.malloc_size;
+
+            JS_RunGC(rt);
+            rt->gc_pending = false;
+            js_gc_rearm_pace(rt, before, rt->malloc_state.malloc_size);
+        }
     }
 }
 
@@ -2665,6 +2714,8 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     rt->json_lazy_enabled = QJS_JSON_LAZY_DEFAULT;
     js_arena_init(rt);
     rt->malloc_gc_threshold = 256 * 1024;
+    rt->gc_pace_streak_cap = JS_GC_PACE_STREAK_DEFAULT;
+    rt->gc_cyc_empty_streak = 0;
 
     init_list_head(&rt->context_list);
     init_list_head(&rt->gc_obj_list);
@@ -2800,6 +2851,22 @@ size_t JS_GetGCThreshold(JSRuntime *rt) {
 void JS_SetGCThreshold(JSRuntime *rt, size_t gc_threshold)
 {
     rt->malloc_gc_threshold = gc_threshold;
+}
+
+int JS_GetGCPacingCap(JSRuntime *rt)
+{
+    return rt->gc_pace_streak_cap;
+}
+
+void JS_SetGCPacingCap(JSRuntime *rt, int cap)
+{
+    if (cap < 0)
+        cap = 0;
+    if (cap > 8)
+        cap = 8;
+    rt->gc_pace_streak_cap = (uint8_t)cap;
+    if (rt->gc_cyc_empty_streak > rt->gc_pace_streak_cap)
+        rt->gc_cyc_empty_streak = rt->gc_pace_streak_cap;
 }
 
 #define malloc(s) malloc_is_forbidden(s)
@@ -9056,10 +9123,13 @@ void JS_SetGCDeferred(JSRuntime *rt, bool deferred, size_t limit)
     /* 0: derive a ceiling from the current threshold */
     rt->gc_deferred_limit = limit != 0 ? limit : rt->malloc_gc_threshold * 4;
     if (!deferred && rt->gc_pending) {
-        rt->gc_pending = false;
-        JS_RunGC(rt);
-        rt->malloc_gc_threshold = rt->malloc_state.malloc_size +
-            (rt->malloc_state.malloc_size >> 1);
+        {
+            size_t before = rt->malloc_state.malloc_size;
+
+            rt->gc_pending = false;
+            JS_RunGC(rt);
+            js_gc_rearm_pace(rt, before, rt->malloc_state.malloc_size);
+        }
     }
 }
 
