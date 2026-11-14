@@ -2839,6 +2839,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_inc(uint8_t *ip, JSValue *fr, JSRegRun *rf,
 
 static uint8_t *REGVM_CC regvm_s_ROP_inc_branch_lt(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
 {
+    JSFunctionBytecode *b = rf->b;
     JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
     JSRegPIC *pic = rf->pic;
     uint8_t *rpc = ip;
@@ -2847,13 +2848,13 @@ static uint8_t *REGVM_CC regvm_s_ROP_inc_branch_lt(uint8_t *ip, JSValue *fr, JSR
     JSValue *regs = fr;
     JSValue *arg_buf = rf->arg_buf;
     int argc = rf->argc;
-    (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
  {
                 const uint8_t *i_start = rpc - 1;
                 int d = RD_REG();
-                int b = RD_REG();
+                int br = RD_REG();
                 int32_t off = RD_I32();
-                JSValue v = regs[d], bv = regs[b];
+                JSValue v = regs[d], bv = regs[br];
                 int take;
 
                 if (JS_VALUE_GET_TAG(v) == JS_TAG_INT &&
@@ -2870,7 +2871,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_inc_branch_lt(uint8_t *ip, JSValue *fr, JSR
                     if (js_regvm_unary(ctx, REG_UN_INC, v, &out))
                         goto exception;
                     SET_REG_P(d, out);
-                    take = regvm_cmp_take(ctx, REG_BIN_LT, regs[d], regs[b]);
+                    take = regvm_cmp_take(ctx, REG_BIN_LT, regs[d], regs[br]);
                     if (unlikely(take < 0))
                         goto exception;
                 }
@@ -2884,6 +2885,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_inc_branch_lt(uint8_t *ip, JSValue *fr, JSR
 
 static uint8_t *REGVM_CC regvm_s_ROP_inc_branch_lt_s(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
 {
+    JSFunctionBytecode *b = rf->b;
     JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
     JSRegPIC *pic = rf->pic;
     uint8_t *rpc = ip;
@@ -2892,13 +2894,13 @@ static uint8_t *REGVM_CC regvm_s_ROP_inc_branch_lt_s(uint8_t *ip, JSValue *fr, J
     JSValue *regs = fr;
     JSValue *arg_buf = rf->arg_buf;
     int argc = rf->argc;
-    (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
  {
                 const uint8_t *i_start = rpc - 1;
                 int d = RD_REG8();
-                int b = RD_REG8();
+                int br = RD_REG8();
                 int32_t off = RD_OFF8();
-                JSValue v = regs[d], bv = regs[b];
+                JSValue v = regs[d], bv = regs[br];
                 int take;
 
                 if (JS_VALUE_GET_TAG(v) == JS_TAG_INT &&
@@ -2915,7 +2917,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_inc_branch_lt_s(uint8_t *ip, JSValue *fr, J
                     if (js_regvm_unary(ctx, REG_UN_INC, v, &out))
                         goto exception;
                     SET_REG_P(d, out);
-                    take = regvm_cmp_take(ctx, REG_BIN_LT, regs[d], regs[b]);
+                    take = regvm_cmp_take(ctx, REG_BIN_LT, regs[d], regs[br]);
                     if (unlikely(take < 0))
                         goto exception;
                 }

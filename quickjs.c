@@ -34686,9 +34686,9 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
             L_ROP_inc_branch_lt: {
                 const uint8_t *i_start = rpc - 1;
                 int d = RD_REG();
-                int b = RD_REG();
+                int br = RD_REG();
                 int32_t off = RD_I32();
-                JSValue v = regs[d], bv = regs[b];
+                JSValue v = regs[d], bv = regs[br];
                 int take;
 
                 if (JS_VALUE_GET_TAG(v) == JS_TAG_INT &&
@@ -34705,7 +34705,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                     if (js_regvm_unary(ctx, REG_UN_INC, v, &out))
                         goto exception;
                     SET_REG_P(d, out);
-                    take = regvm_cmp_take(ctx, REG_BIN_LT, regs[d], regs[b]);
+                    take = regvm_cmp_take(ctx, REG_BIN_LT, regs[d], regs[br]);
                     if (unlikely(take < 0))
                         goto exception;
                 }
@@ -34715,9 +34715,9 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
             L_ROP_inc_branch_lt_s: {
                 const uint8_t *i_start = rpc - 1;
                 int d = RD_REG8();
-                int b = RD_REG8();
+                int br = RD_REG8();
                 int32_t off = RD_OFF8();
-                JSValue v = regs[d], bv = regs[b];
+                JSValue v = regs[d], bv = regs[br];
                 int take;
 
                 if (JS_VALUE_GET_TAG(v) == JS_TAG_INT &&
@@ -34734,7 +34734,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                     if (js_regvm_unary(ctx, REG_UN_INC, v, &out))
                         goto exception;
                     SET_REG_P(d, out);
-                    take = regvm_cmp_take(ctx, REG_BIN_LT, regs[d], regs[b]);
+                    take = regvm_cmp_take(ctx, REG_BIN_LT, regs[d], regs[br]);
                     if (unlikely(take < 0))
                         goto exception;
                 }
