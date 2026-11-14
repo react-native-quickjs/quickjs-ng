@@ -24748,8 +24748,13 @@ static void regvm_record_release(JSRuntime *rt, JSRegRun *rec)
         JSValue *buf = rec->local_buf;
         int n = rec->local_count;
 
-        for (i = 0, pval = buf; i < n; i++, pval++)
-            JS_FreeValueRT(rt, *pval);
+        for (i = 0, pval = buf; i < n; i++, pval++) {
+            JSValue v = *pval;
+            /* Skip the call for an uncounted value: most of the area holds
+               immediates, and `JS_FreeValueRT` starts with the same test. */
+            if (REGVM_HAS_COUNT(v))
+                JS_FreeValueRT(rt, v);
+        }
     }
     if (unlikely(sf->var_ref_count != 0))
         js_closcyc_frame(rt, sf, true);
