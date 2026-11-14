@@ -579,6 +579,12 @@ typedef enum JSRegOpcode {
        light-safe function. */
     ROP_debug,
 
+    /* The counted loop's increment and latch test in one instruction: `r` is
+       incremented in place, then `r < bound` selects the back edge, with the
+       back-edge interrupt poll. Anything the int fast path cannot do goes to a
+       slow half that runs the two operations in order. */
+    ROP_inc_branch_lt, ROP_inc_branch_lt_s,
+
     ROP_COUNT
 } JSRegOpcode;
 
@@ -622,7 +628,7 @@ enum { REG_CONST_CPOOL = 0, REG_CONST_ATOM };
 /* The register bytecode's format version, checked per function record before
    any instruction is parsed. Bump it whenever an opcode is added, removed or
    renumbered, or an operand's width or meaning changes. */
-#define REGVM_FORMAT_VERSION 17
+#define REGVM_FORMAT_VERSION 18
 
 /* ROP_get_field and ROP_put_field use this site index when the source
    instruction has no inline cache. */

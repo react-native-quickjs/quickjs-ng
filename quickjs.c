@@ -855,9 +855,6 @@ static JSValueConst regvm_cur_func(JSRuntime *rt);
 /* `regvm_cur`/`rv_light` may hold a record frame as the caller; readers
    filter through this. */
 static struct JSRegRun *regvm_light_head(struct JSRegRun *p);
-/* Raise the arena top over a light frame that is about to stop being the
-   innermost thing in the arena. */
-static void regvm_light_seal(JSRuntime *rt, struct JSRegRun *lf);
 #else
 /* `regvm_cur` is present in the stack-only build and always NULL there, but the
    sites that read it compile in both builds. */
@@ -866,6 +863,12 @@ static inline struct JSRegRun *regvm_light_head(struct JSRegRun *p)
     (void)p;
     return NULL;
 }
+#endif
+#if QJS_REGVM_RECORD
+/* Raise the arena top over a light frame that is about to stop being the
+   innermost thing in the arena. A no-op without the record call path. */
+static void regvm_light_seal(JSRuntime *rt, struct JSRegRun *lf);
+#else
 static inline void regvm_light_seal(JSRuntime *rt, struct JSRegRun *lf)
 {
     (void)rt;
@@ -25122,6 +25125,7 @@ typedef uint8_t *(*regvm_handler)(uint8_t *ip, JSValue *fr, JSRegRun *f,
 #define T_SZ_BRRT  10    /* "brrt"  */
 #define T_SZ_BRRT_S 5    /* "brrt"  narrow */
 #define T_SZ_RRT_S  4    /* "rrt"   narrow */
+#define T_SZ_RRT    9    /* "rrt"   counter, bound, target */
 #define T_SZ_RIT    8    /* "rit"   */
 #define T_SZ_RIT_S  4    /* "rit"   narrow */
 #define T_SZ_RI32   7    /* "rI"    */
@@ -25610,6 +25614,10 @@ static uint8_t *REGVM_CC regvm_t_branch_neq_s(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_branch_neq_s_slow(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_add_imm_self_branch(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_add_imm_self_branch_slow(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_inc_branch_lt(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_inc_branch_lt_slow(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_inc_branch_lt_s(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_inc_branch_lt_s_slow(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_add_imm_self_branch_s(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_add_imm_self_branch_s_slow(REGVM_ARGS);
 
@@ -25946,6 +25954,8 @@ static uint8_t *REGVM_CC regvm_t_cold(REGVM_ARGS)
     X(branch_neq_s, regvm_t_branch_neq_s) \
     X(add_imm_self_branch, regvm_t_add_imm_self_branch) \
     X(add_imm_self_branch_s, regvm_t_add_imm_self_branch_s) \
+    X(inc_branch_lt, regvm_t_inc_branch_lt) \
+    X(inc_branch_lt_s, regvm_t_inc_branch_lt_s) \
     X(return, regvm_t_return) \
     X(return_undefined, regvm_t_return_undefined)
 
@@ -28583,6 +28593,86 @@ static uint8_t *REGVM_CC regvm_t_add_imm_self_branch_s(REGVM_ARGS)
         return regvm_t_add_imm_self_branch_s_slow(REGVM_PASS);
 }
 
+/* The fused counter increment and latch test, wide and narrow. The int fast
+   path (two ints, counter below INT32_MAX) is the whole loop; anything else
+   goes to the slow half, which does the two operations in order and continues
+   at the same target. */
+static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_inc_branch_lt_slow(REGVM_ARGS)
+{
+    int d = T_REG(1), b = T_REG(3);
+    int32_t off = T_I32(5);
+    JSValue out;
+    int take;
+
+    /* the engine calls can coerce with valueOf/toString */
+    REGVM_CAPTURE_IP();
+    if (js_regvm_unary(ctx, REG_UN_INC, FR(d), &out))
+        T_FAIL();
+    take = regvm_cmp_take(ctx, REG_BIN_LT, out, FR(b));
+    if (unlikely(take < 0)) {
+        JS_FreeValue(ctx, out);
+        T_FAIL();
+    }
+    T_SET_NEXT_P(d, out, T_SZ_RRT + (take ? off : 0));
+}
+
+static uint8_t *REGVM_CC regvm_t_inc_branch_lt(REGVM_ARGS)
+{
+    int d = T_REG(1), b = T_REG(3);
+    int32_t off = T_I32(5);
+    JSValue v = FR(d), bv = FR(b);
+
+    if (likely(JS_VALUE_GET_TAG(v) == JS_TAG_INT &&
+               JS_VALUE_GET_TAG(bv) == JS_TAG_INT &&
+               JS_VALUE_GET_INT(v) != INT32_MAX)) {
+        int32_t n = JS_VALUE_GET_INT(v) + 1;
+
+        FR(d) = js_int32(n);
+        if (n < JS_VALUE_GET_INT(bv))
+            T_BR_NEXT(T_SZ_RRT + off);
+        T_NEXT(T_SZ_RRT);
+    }
+    __attribute__((musttail)) return regvm_t_inc_branch_lt_slow(REGVM_PASS);
+}
+
+static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_inc_branch_lt_s_slow(REGVM_ARGS)
+{
+    int d = T_REG8(1), b = T_REG8(2);
+    int32_t off = T_OFF8(3);
+    JSValue out;
+    int take;
+
+    /* the engine calls can coerce with valueOf/toString */
+    REGVM_CAPTURE_IP();
+    if (js_regvm_unary(ctx, REG_UN_INC, FR(d), &out))
+        T_FAIL();
+    take = regvm_cmp_take(ctx, REG_BIN_LT, out, FR(b));
+    if (unlikely(take < 0)) {
+        JS_FreeValue(ctx, out);
+        T_FAIL();
+    }
+    T_SET_NEXT_P(d, out, T_SZ_RRT_S + (take ? off : 0));
+}
+
+static uint8_t *REGVM_CC regvm_t_inc_branch_lt_s(REGVM_ARGS)
+{
+    int d = T_REG8(1), b = T_REG8(2);
+    int32_t off = T_OFF8(3);
+    JSValue v = FR(d), bv = FR(b);
+
+    if (likely(JS_VALUE_GET_TAG(v) == JS_TAG_INT &&
+               JS_VALUE_GET_TAG(bv) == JS_TAG_INT &&
+               JS_VALUE_GET_INT(v) != INT32_MAX)) {
+        int32_t n = JS_VALUE_GET_INT(v) + 1;
+
+        FR(d) = js_int32(n);
+        if (n < JS_VALUE_GET_INT(bv))
+            T_BR_NEXT(T_SZ_RRT_S + off);
+        T_NEXT(T_SZ_RRT_S);
+    }
+    __attribute__((musttail)) return regvm_t_inc_branch_lt_s_slow(REGVM_PASS);
+}
+
 /*
  * --- dedicated handlers for frequent cold opcodes --------------------------
  *
@@ -30539,6 +30629,8 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
             [ROP_sub_imm_self_s] = &&L_ROP_sub_imm_self_s,
             [ROP_add_imm_self_branch] = &&L_ROP_add_imm_self_branch,
             [ROP_add_imm_self_branch_s] = &&L_ROP_add_imm_self_branch_s,
+            [ROP_inc_branch_lt] = &&L_ROP_inc_branch_lt,
+            [ROP_inc_branch_lt_s] = &&L_ROP_inc_branch_lt_s,
             [ROP_to_number] = &&L_default,
             [ROP_compare] = &&L_default,
             [ROP_get_field] = &&L_ROP_get_field,
@@ -30678,18 +30770,18 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
 #else
 #define REGVM_COUNT_INC(o) ((void)0)
 #endif
-/*
- * The per-operation binary handlers. The kind is a literal here, so both the
- * numeric fast path and the out-of-line fallback fold to the one case that can
- * run: no jump table, and no code for operations this opcode cannot be. That is
- * the point of moving the kind out of the operand stream, and it is why these
- * are macros rather than one handler that reads a kind.
- */
-/* Publish the current instruction's address on the activation's record. The
-   step twins recompile the same macro bodies and define this for `rf`, so the
-   macro is spelled context-neutrally. `start` is the instruction's first byte,
-   read before the operand macros advance `rpc`. */
-#define REGVM_CAPTURE_MONO(start_) (run.cap_ip = (start_))
+/* The per-operation binary handlers. The kind is a literal, so the fast path
+   and the fallback fold to the one case that can run. */
+/* Publish the current instruction's address for a backtrace. The threaded
+   build keeps it on the activation's record; the plain monolith uses the
+   frame's `regvm_ip`. The step twins and the cold arms redefine this. `start`
+   is the instruction's first byte, read before the operand macros advance
+   `rpc`. */
+#if QJS_REGVM_THREAD || QJS_REGVM_STEPCHECK || QJS_AOT
+#define REGVM_CAPTURE_IP_MONO(start_) (run.cap_ip = (start_))
+#else
+#define REGVM_CAPTURE_IP_MONO(start_) (sf->regvm_ip = (start_))
+#endif
 #define REGVM_BIN_OP(SUB_) do { \
             const uint8_t *i_start = rpc - 1; \
             int d_ = RD_REG(); \
@@ -30697,7 +30789,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
             int c_ = RD_REG(); \
             JSValue out_; \
             if (!regvm_num_fast(SUB_, regs[a_], regs[c_], &out_)) { \
-                REGVM_CAPTURE_MONO(i_start); \
+                REGVM_CAPTURE_IP_MONO(i_start); \
                 if ((SUB_) == REG_BIN_ADD) { \
                     int _ar = regvm_accum_append(ctx, b, regs, arg_buf, argc, \
                                                  d_, a_, regs[c_]); \
@@ -30718,7 +30810,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
             int s_ = RD_REG(); \
             JSValue out_; \
             if (!regvm_unary_num_fast(SUB_, regs[s_], &out_)) { \
-                REGVM_CAPTURE_MONO(i_start); \
+                REGVM_CAPTURE_IP_MONO(i_start); \
                 if (js_regvm_unary(ctx, SUB_, regs[s_], &out_)) \
                     goto exception; \
             } \
@@ -31087,7 +31179,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                of consuming the source. */
             L_ROP_to_propkey:
             L_ROP_to_propkey2: {
-                                   run.cap_ip = rpc - 1;
+                                   REGVM_CAPTURE_IP_MONO(rpc - 1);
                 int d = RD_REG();
                 int src = RD_REG();
                 if (op == ROP_to_propkey2) {
@@ -31115,7 +31207,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 REGVM_NEXT();
             }
             L_ROP_delete: {
-                              run.cap_ip = rpc - 1;
+                              REGVM_CAPTURE_IP_MONO(rpc - 1);
                 int d = RD_REG();
                 int robj = RD_REG();
                 int rkey = RD_REG();
@@ -31274,7 +31366,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                                                            JS_VALUE_GET_FLOAT64(_b))) >= 0)) { \
                       take = _r ^ ((sub & REG_CMP_INVERT) != 0); \
                   } else { \
-                      REGVM_CAPTURE_MONO(i_start); \
+                      REGVM_CAPTURE_IP_MONO(i_start); \
                       take = regvm_cmp_take(ctx, sub, _a, _b); \
                       if (unlikely(take < 0)) \
                           goto exception; \
@@ -31474,7 +31566,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 REGVM_NEXT();
             }
             L_ROP_debug: {
-                run.cap_ip = rpc - 1;   /* before the operand read moves rpc */
+                REGVM_CAPTURE_IP_MONO(rpc - 1);   /* before the operand read moves rpc */
                 int dbg_flags = RD_U8();
 #if JS_ENABLE_DEBUGGER
                 if (unlikely(dbg_flags > JS_DEBUG_TRACE_DEBUGGER_STMT)) {
@@ -31494,7 +31586,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
 
                     /* The hook can inspect the stack and throw, so publish the
                        frame's position first. */
-                    run.cap_ip = rpc - 1;
+                    REGVM_CAPTURE_IP_MONO(rpc - 1);
                     dbg_line = find_line_num(ctx, b,
                                              (uint32_t)(rpc - 1 - b->regvm_code),
                                              &dbg_col);
@@ -31677,7 +31769,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                     SET_REG_B(d, val);
                     REGVM_NEXT();
                 }
-                REGVM_CAPTURE_MONO(i_start);
+                REGVM_CAPTURE_IP_MONO(i_start);
                 if (site == REG_IC_NONE) {
                     /* no site: the generic route */
                     val = JS_GetProperty(ctx, regs[r], atom);
@@ -31700,7 +31792,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                     SET_REG_B(d, val);
                     REGVM_NEXT();
                 }
-                REGVM_CAPTURE_MONO(i_start);
+                REGVM_CAPTURE_IP_MONO(i_start);
                 if (site == REG_IC_NONE) {
                     val = JS_GetProperty(ctx, regs[r], atom);
                 } else {
@@ -31729,10 +31821,10 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                     regvm_own_read_hit(pic, b->regvm_pic_holder, regs[r1], site1, &v1)) {
                     own1 = 0;
                 } else if (site1 == REG_IC_NONE) {
-                    run.cap_ip = rpc - 1;
+                    REGVM_CAPTURE_IP_MONO(rpc - 1);
                     v1 = JS_GetProperty(ctx, regs[r1], atom1);
                 } else {
-                    run.cap_ip = rpc - 1;
+                    REGVM_CAPTURE_IP_MONO(rpc - 1);
                     v1 = regvm_get_field_ic(ctx, b, &pic, regs[r1], atom1, site1);
                 }
                 if (JS_IsException(v1))
@@ -31856,7 +31948,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                         }
                         {
                             int ah;
-                            run.cap_ip = rpc - 1;
+                            REGVM_CAPTURE_IP_MONO(rpc - 1);
                             ah = regvm_put_field_add_hit(ctx, b, pic, p,
                                                          regs[v], site);
                             if (ah > 0)
@@ -31865,7 +31957,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                                 goto exception;
                         }
                     }
-                    run.cap_ip = rpc - 1;
+                    REGVM_CAPTURE_IP_MONO(rpc - 1);
                     if (regvm_put_field_ic(ctx, b, &pic, regs[r], atom, regs[v], site) < 0)
                         goto exception;
                     REGVM_NEXT();
@@ -31885,7 +31977,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 JSAtom atom = RD_U32();
                 int v = RD_REG();
                 /* the write can call a setter */
-                run.cap_ip = rpc - 1;
+                REGVM_CAPTURE_IP_MONO(rpc - 1);
 #if QJS_DRC
                 /* The register only borrows the value, so the property has to
                    take its own reference; there is nothing to empty. */
@@ -31945,14 +32037,14 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
 #ifdef QJS_REGVM_COUNT
                         js_regvm_elem[2]++;
 #endif
-                        run.cap_ip = rpc - 1;
+                        REGVM_CAPTURE_IP_MONO(rpc - 1);
                         val = JS_GetPropertyValueConst(ctx, recv, k);
                     }
                 } else {
 #ifdef QJS_REGVM_COUNT
                     js_regvm_elem[2]++;
 #endif
-                    run.cap_ip = rpc - 1;
+                    REGVM_CAPTURE_IP_MONO(rpc - 1);
                     val = JS_GetPropertyValueConst(ctx, recv, k);
                 }
                 if (JS_IsException(val))
@@ -31965,7 +32057,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 int key = RD_REG();
                 int v = RD_REG();
                 /* the write can call a setter */
-                run.cap_ip = rpc - 1;
+                REGVM_CAPTURE_IP_MONO(rpc - 1);
                 if (JS_SetPropertyValue(ctx, regs[o], js_dup(regs[key]),
                                         js_dup(regs[v]), JS_PROP_THROW_STRICT) < 0)
                     goto exception;
@@ -31980,7 +32072,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 int key = RD_REG();
                 int v = RD_REG();
                 /* the write can call a setter */
-                run.cap_ip = rpc - 1;
+                REGVM_CAPTURE_IP_MONO(rpc - 1);
 #if QJS_DRC
                 /* The register only borrows; the container takes its own
                    reference and the source is not emptied. */
@@ -32347,7 +32439,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 REGVM_NEXT();
             }
             L_ROP_for_await_of_start: {
-                                          run.cap_ip = rpc - 1;
+                                          REGVM_CAPTURE_IP_MONO(rpc - 1);
                 int w = RD_REG();
                 /* the same start as the synchronous loop, with the async
                    flag: the helper wraps the iterator it is given */
@@ -32369,7 +32461,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                replaces val, so the shape is 4 -> 4. The catch offset is a
                control-stack entry here. */
             L_ROP_iterator_next: {
-                                     run.cap_ip = rpc - 1;
+                                     REGVM_CAPTURE_IP_MONO(rpc - 1);
                 int d0 = RD_REG();
                 int d1 = RD_REG();
                 int d2 = RD_REG();
@@ -32420,7 +32512,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
             }
             L_ROP_iter_next:
                 {
-                    run.cap_ip = rpc - 1; int w = RD_REG();
+                    REGVM_CAPTURE_IP_MONO(rpc - 1); int w = RD_REG();
                   if (regvm_for_of_next(ctx, &regs[w + 2], -2)) {
                       regvm_ctl_iter_forget(ctx, regvm_ctl, regvm_nctl);
                       goto exception;
@@ -32434,7 +32526,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                       regvm_ctl_iter_forget(ctx, regvm_ctl, regvm_nctl);
                   REGVM_NEXT(); }
             L_ROP_iter_close: {
-                                  run.cap_ip = rpc - 1;
+                                  REGVM_CAPTURE_IP_MONO(rpc - 1);
                 int it = RD_REG();
                 int nx = RD_REG();
                 int k;
@@ -32500,7 +32592,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                ROP_iter_next leaves. */
             L_ROP_iter_value_done:
                 {
-                    run.cap_ip = rpc - 1; int w = RD_REG();
+                    REGVM_CAPTURE_IP_MONO(rpc - 1); int w = RD_REG();
                   JSValue tmp[5] = { JS_UNDEFINED, JS_UNDEFINED,
                                      JS_UNDEFINED, JS_UNDEFINED, JS_UNDEFINED };
                   tmp[0] = js_dup(regs[w]);
@@ -32530,7 +32622,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
             /* stack: iter_obj next catch_offset val. The helper reads sp[-4]
                and sp[-1] and writes its flag at sp[0]. */
             L_ROP_iterator_call: {
-                                     run.cap_ip = rpc - 1;
+                                     REGVM_CAPTURE_IP_MONO(rpc - 1);
                 int w = RD_REG();
                 int flags = RD_U8();
                 JSValue *sp = &regs[w + 4];
@@ -32574,16 +32666,16 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                   REGVM_NEXT(); }
             L_ROP_for_in_start:
                 {
-                    run.cap_ip = rpc - 1; int w = RD_REG();
+                    REGVM_CAPTURE_IP_MONO(rpc - 1); int w = RD_REG();
                   if (regvm_for_in_start(ctx, &regs[w + 1])) goto exception;
                   REGVM_NEXT(); }
             L_ROP_for_in_next:
                 {
-                    run.cap_ip = rpc - 1; int w = RD_REG();
+                    REGVM_CAPTURE_IP_MONO(rpc - 1); int w = RD_REG();
                   if (regvm_for_in_next(ctx, &regs[w + 1])) goto exception;
                   REGVM_NEXT(); }
             L_ROP_append: {
-                              run.cap_ip = rpc - 1;
+                              REGVM_CAPTURE_IP_MONO(rpc - 1);
                 int w = RD_REG();
                 JSValue *sp = &regs[w + 3];
                 if (js_append_enumerate(ctx, sp))
@@ -32922,7 +33014,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 REGVM_NEXT();
             }
             L_ROP_put_private: {
-                                   run.cap_ip = rpc - 1;
+                                   REGVM_CAPTURE_IP_MONO(rpc - 1);
                 int o = RD_REG();
                 int v = RD_REG();
                 int k = RD_REG();
@@ -32933,7 +33025,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 REGVM_NEXT();
             }
             L_ROP_delete_var: {
-                                  run.cap_ip = rpc - 1;
+                                  REGVM_CAPTURE_IP_MONO(rpc - 1);
                 int d = RD_REG();
                 JSAtom atom = RD_U32();
                 int ret = JS_DeleteGlobalVar(ctx, atom);
@@ -32943,7 +33035,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 REGVM_NEXT();
             }
             L_ROP_get_private: {
-                                   run.cap_ip = rpc - 1;
+                                   REGVM_CAPTURE_IP_MONO(rpc - 1);
                 int d = RD_REG();
                 int o = RD_REG();
                 int k = RD_REG();
@@ -32999,7 +33091,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 REGVM_NEXT();
             }
             L_ROP_copy_props: {
-                                  run.cap_ip = rpc - 1;
+                                  REGVM_CAPTURE_IP_MONO(rpc - 1);
                 int t2 = RD_REG();
                 int s2 = RD_REG();
                 int e2 = RD_REG();
@@ -33021,7 +33113,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                inherited getter sees the derived `this`. Mirrors
                js_cold_get_super_value. */
             L_ROP_super_get: {
-                                 run.cap_ip = rpc - 1;
+                                 REGVM_CAPTURE_IP_MONO(rpc - 1);
                 int d = RD_REG();
                 int t = RD_REG();
                 int o = RD_REG();
@@ -33216,7 +33308,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 js_regvm_unsub[sub]++;
 #endif
                 if (!regvm_unary_num_fast(sub, regs[s], &out)) {
-                    REGVM_CAPTURE_MONO(i_start);
+                    REGVM_CAPTURE_IP_MONO(i_start);
                     if (js_regvm_unary(ctx, sub, regs[s], &out))
                         goto exception;
                 }
@@ -33261,7 +33353,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 js_regvm_binsub[sub]++;
 #endif
                 if (!regvm_num_fast(sub, regs[a], regs[c], &out)) {
-                    REGVM_CAPTURE_MONO(i_start);
+                    REGVM_CAPTURE_IP_MONO(i_start);
                     if (js_regvm_binary(ctx, sub, regs[a], regs[c], &out))
                         goto exception;
                 }
@@ -33278,7 +33370,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 int rc = RD_REG();
                 JSValue out;
                 if (!regvm_num_fast(sub, var_buf[ls], regs[rc], &out)) {
-                    REGVM_CAPTURE_MONO(i_start);
+                    REGVM_CAPTURE_IP_MONO(i_start);
                     if (js_regvm_binary(ctx, sub, var_buf[ls], regs[rc], &out))
                         goto exception;
                 }
@@ -33293,7 +33385,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 int rs = RD_U16();
                 JSValue out;
                 if (!regvm_num_fast(sub, regs[rc], var_buf[rs], &out)) {
-                    REGVM_CAPTURE_MONO(i_start);
+                    REGVM_CAPTURE_IP_MONO(i_start);
                     if (js_regvm_binary(ctx, sub, regs[rc], var_buf[rs], &out))
                         goto exception;
                 }
@@ -33308,7 +33400,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 int rs = RD_U16();
                 JSValue out;
                 if (!regvm_num_fast(sub, var_buf[ls], var_buf[rs], &out)) {
-                    REGVM_CAPTURE_MONO(i_start);
+                    REGVM_CAPTURE_IP_MONO(i_start);
                     if (js_regvm_binary(ctx, sub, var_buf[ls], var_buf[rs], &out))
                         goto exception;
                 }
@@ -33323,7 +33415,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 int32_t imm = RD_I32();
                 JSValue out;
                 if (!regvm_num_fast(sub, regs[a], js_int32(imm), &out)) {
-                    REGVM_CAPTURE_MONO(i_start);
+                    REGVM_CAPTURE_IP_MONO(i_start);
                     if (js_regvm_binary(ctx, sub, regs[a], js_int32(imm), &out))
                         goto exception;
                 }
@@ -33338,7 +33430,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 int32_t imm = RD_OFF8();
                 JSValue out;
                 if (!regvm_num_fast(sub, regs[a], js_int32(imm), &out)) {
-                    REGVM_CAPTURE_MONO(i_start);
+                    REGVM_CAPTURE_IP_MONO(i_start);
                     if (js_regvm_binary(ctx, sub, regs[a], js_int32(imm), &out))
                         goto exception;
                 }
@@ -33366,7 +33458,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                     SET_REG_P(d, js_float64((double)((int64_t)JS_VALUE_GET_INT(v) + imm)));
                     REGVM_NEXT();
                 }
-                run.cap_ip = i_start;
+                REGVM_CAPTURE_IP_MONO(i_start);
                 if (!regvm_num_fast(REG_BIN_ADD, v, js_int32(imm), &out) &&
                     js_regvm_binary(ctx, REG_BIN_ADD, v, js_int32(imm), &out))
                     goto exception;
@@ -33391,7 +33483,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                     SET_REG_P(d, js_float64((double)((int64_t)JS_VALUE_GET_INT(v) - imm)));
                     REGVM_NEXT();
                 }
-                run.cap_ip = i_start;
+                REGVM_CAPTURE_IP_MONO(i_start);
                 if (!regvm_num_fast(REG_BIN_SUB, v, js_int32(imm), &out) &&
                     js_regvm_binary(ctx, REG_BIN_SUB, v, js_int32(imm), &out))
                     goto exception;
@@ -33418,7 +33510,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                     regs[d] = js_float64((double)((int64_t)JS_VALUE_GET_INT(v) + imm));
                     REGVM_NEXT();
                 }
-                run.cap_ip = i_start;
+                REGVM_CAPTURE_IP_MONO(i_start);
                 if (!regvm_num_fast(REG_BIN_ADD, v, js_int32(imm), &out) &&
                     js_regvm_binary(ctx, REG_BIN_ADD, v, js_int32(imm), &out))
                     goto exception;
@@ -33442,7 +33534,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                     regs[d] = js_float64((double)((int64_t)JS_VALUE_GET_INT(v) - imm));
                     REGVM_NEXT();
                 }
-                run.cap_ip = i_start;
+                REGVM_CAPTURE_IP_MONO(i_start);
                 if (!regvm_num_fast(REG_BIN_SUB, v, js_int32(imm), &out) &&
                     js_regvm_binary(ctx, REG_BIN_SUB, v, js_int32(imm), &out))
                     goto exception;
@@ -33474,7 +33566,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                     rpc += off;
                     REGVM_NEXT();
                 }
-                run.cap_ip = i_start;
+                REGVM_CAPTURE_IP_MONO(i_start);
                 if (!regvm_num_fast(REG_BIN_ADD, v, js_int32(imm), &out) &&
                     js_regvm_binary(ctx, REG_BIN_ADD, v, js_int32(imm), &out))
                     goto exception;
@@ -33505,13 +33597,75 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                     rpc += off;
                     REGVM_NEXT();
                 }
-                run.cap_ip = i_start;
+                REGVM_CAPTURE_IP_MONO(i_start);
                 if (!regvm_num_fast(REG_BIN_ADD, v, js_int32(imm), &out) &&
                     js_regvm_binary(ctx, REG_BIN_ADD, v, js_int32(imm), &out))
                     goto exception;
                 SET_REG_P(d, out);
                 REGVM_MONO_BACKEDGE(off);
                 rpc += off;
+                REGVM_NEXT();
+            }
+            /* The fused counter increment and latch test. The int fast path is
+               the whole loop; otherwise the two operations run in order with
+               the standard store. The taken arm carries the back-edge interrupt
+               poll. */
+            L_ROP_inc_branch_lt: {
+                const uint8_t *i_start = rpc - 1;
+                int d = RD_REG();
+                int b = RD_REG();
+                int32_t off = RD_I32();
+                JSValue v = regs[d], bv = regs[b];
+                int take;
+
+                if (JS_VALUE_GET_TAG(v) == JS_TAG_INT &&
+                    JS_VALUE_GET_TAG(bv) == JS_TAG_INT &&
+                    JS_VALUE_GET_INT(v) != INT32_MAX) {
+                    int32_t n = JS_VALUE_GET_INT(v) + 1;
+
+                    regs[d] = js_int32(n);
+                    take = n < JS_VALUE_GET_INT(bv);
+                } else {
+                    JSValue out;
+
+                    REGVM_CAPTURE_IP_MONO(i_start);
+                    if (js_regvm_unary(ctx, REG_UN_INC, v, &out))
+                        goto exception;
+                    SET_REG_P(d, out);
+                    take = regvm_cmp_take(ctx, REG_BIN_LT, regs[d], regs[b]);
+                    if (unlikely(take < 0))
+                        goto exception;
+                }
+                if (take) { REGVM_MONO_BACKEDGE(off); rpc += off; REGVM_NEXT(); }
+                REGVM_NEXT();
+            }
+            L_ROP_inc_branch_lt_s: {
+                const uint8_t *i_start = rpc - 1;
+                int d = RD_REG8();
+                int b = RD_REG8();
+                int32_t off = RD_OFF8();
+                JSValue v = regs[d], bv = regs[b];
+                int take;
+
+                if (JS_VALUE_GET_TAG(v) == JS_TAG_INT &&
+                    JS_VALUE_GET_TAG(bv) == JS_TAG_INT &&
+                    JS_VALUE_GET_INT(v) != INT32_MAX) {
+                    int32_t n = JS_VALUE_GET_INT(v) + 1;
+
+                    regs[d] = js_int32(n);
+                    take = n < JS_VALUE_GET_INT(bv);
+                } else {
+                    JSValue out;
+
+                    REGVM_CAPTURE_IP_MONO(i_start);
+                    if (js_regvm_unary(ctx, REG_UN_INC, v, &out))
+                        goto exception;
+                    SET_REG_P(d, out);
+                    take = regvm_cmp_take(ctx, REG_BIN_LT, regs[d], regs[b]);
+                    if (unlikely(take < 0))
+                        goto exception;
+                }
+                if (take) { REGVM_MONO_BACKEDGE(off); rpc += off; REGVM_NEXT(); }
                 REGVM_NEXT();
             }
             /* The right operand is a constant never materialised in a register.
@@ -33528,7 +33682,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 JSValue out;
                 if (kind == REG_CONST_CPOOL) {
                     if (!regvm_num_fast(sub, regs[a], b->cpool[idx], &out)) {
-                        REGVM_CAPTURE_MONO(i_start);
+                        REGVM_CAPTURE_IP_MONO(i_start);
                         if (sub == REG_BIN_ADD) {
                             int _ar = regvm_accum_append(ctx, b, regs, arg_buf,
                                                          argc, d, a,
@@ -33544,7 +33698,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                     JSValue cst = JS_AtomToValue(ctx, idx);
                     if (JS_IsException(cst))
                         goto exception;
-                    REGVM_CAPTURE_MONO(i_start);
+                    REGVM_CAPTURE_IP_MONO(i_start);
                     if (sub == REG_BIN_ADD) {
                         int _ar = regvm_accum_append(ctx, b, regs, arg_buf,
                                                      argc, d, a, cst);
@@ -34009,6 +34163,11 @@ static JSContext *regvm_caller_realm(JSRegRun *f, JSContext *ctx)
     }
     return ctx;
 }
+
+/* The cold arms come from the same monolith bodies; here the frame is the
+   record `f`. */
+#undef REGVM_CAPTURE_IP_MONO
+#define REGVM_CAPTURE_IP_MONO(start_) (f->cap_ip = (start_))
 
 static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                                JSContext *ctx)
@@ -58064,6 +58223,9 @@ static const char *const regvm_rop_fmt[ROP_COUNT] = {
     [ROP_sub_mul] = "rrrrr",
     /* the debugger trap: the JS_DEBUG_TRACE_* flags byte */
     [ROP_debug] = "b",
+    /* the fused counter increment and latch test: counter, bound, target */
+    [ROP_inc_branch_lt] = "rrt",
+    [ROP_inc_branch_lt_s] = "rrt",
     [ROP_put_field] = "rasr",
     [ROP_define_field] = "rar",
     /* object, window base, count, template index: fills an object literal's
@@ -58253,7 +58415,7 @@ static int regvm_rop_narrow(uint16_t rop)
 {
     return rop == ROP_load_i8_s || rop == ROP_move_s ||
            rop == ROP_branch_cmp_reg_reg_s || rop == ROP_binary_imm_s ||
-           rop == ROP_branch_s ||
+           rop == ROP_branch_s || rop == ROP_inc_branch_lt_s ||
            (rop >= ROP_branch_lt_s && rop <= ROP_branch_neq_s) ||
            rop == ROP_add_imm_s || rop == ROP_sub_imm_s ||
            rop == ROP_add_imm_self_s || rop == ROP_sub_imm_self_s ||
@@ -58368,6 +58530,9 @@ static int regvm_widen(JSRegInsn *in)
         return 0;
     case ROP_add_imm_self_branch_s:
         in->rop = ROP_add_imm_self_branch;
+        return 0;
+    case ROP_inc_branch_lt_s:
+        in->rop = ROP_inc_branch_lt;
         return 0;
     case ROP_add_imm_s: case ROP_sub_imm_s:
         sub = in->rop == ROP_add_imm_s ? REG_BIN_ADD : REG_BIN_SUB;
@@ -61692,6 +61857,91 @@ static void regvm_rotate_loop_test(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
     js_free(ctx, is_target);
 }
 
+/* The counted loop's increment and latch test in one dispatch: the rotation
+   leaves `inc r ; branch_lt r, bound, L_body`, and when the increment is in
+   place (same physical register) the pair becomes `inc_branch_lt r, bound,
+   L_body`. Adjacency is the soundness argument, as in
+   `regvm_fuse_self_branch`. The branch must not be a jump target. */
+static void regvm_fuse_inc_branch(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
+                                  int n_pcs, int n_values, const int *ireg)
+{
+    int n = ir->insns ? ir->n_insns : 0, i, out = 0;
+    unsigned char *drop = NULL;
+    int *remap = NULL, *first = NULL, *is_target = NULL;
+
+    if (n < 2 || n_values <= 0 || !ireg)
+        return;
+    drop = js_mallocz(ctx, (size_t)n);
+    remap = js_malloc(ctx, (size_t)n * sizeof(int));
+    first = js_malloc(ctx, (size_t)(n + 1) * sizeof(int));
+    is_target = js_mallocz(ctx, (size_t)n * sizeof(int));
+    if (!drop || !remap || !first || !is_target)
+        goto done;
+    for (i = 0; i < n; i++) {
+        JSRegInsn *in = &ir->insns[i];
+        const char *fmt = regvm_rop_fmt[in->rop];
+        int k;
+
+        for (k = 0; fmt && fmt[k]; k++) {
+            if (fmt[k] == 't') {
+                int ti = (in->ops[k] >= 0 && in->ops[k] < n_pcs)
+                             ? pc_to_insn[in->ops[k]] : -1;
+                if (ti >= 0 && ti < n && ti != i)
+                    is_target[ti]++;
+            }
+        }
+    }
+    for (i = 0; i + 1 < n; i++) {
+        JSRegInsn *inc = &ir->insns[i], *br = &ir->insns[i + 1];
+
+        if (inc->rop != ROP_unary || inc->n_ops != 3 ||
+            inc->ops[1] != REG_UN_INC ||
+            br->rop != ROP_branch_cmp_reg_reg || br->n_ops != 4 ||
+            br->ops[0] != REG_BIN_LT)
+            continue;
+        if (inc->ops[0] < 0 || inc->ops[0] >= n_values ||
+            inc->ops[2] < 0 || inc->ops[2] >= n_values ||
+            br->ops[1] < 0 || br->ops[1] >= n_values)
+            continue;
+        if (ireg[inc->ops[0]] < 0 || ireg[inc->ops[0]] != ireg[inc->ops[2]] ||
+            ireg[inc->ops[0]] != ireg[br->ops[1]])
+            continue;                       /* the increment must be in place */
+        if (is_target[i + 1])
+            continue;                       /* the branch is a jump target */
+        inc->rop = ROP_inc_branch_lt;
+        inc->n_ops = 3;
+        inc->ops[0] = br->ops[1];           /* the counter's value */
+        inc->ops[1] = br->ops[2];           /* the bound */
+        inc->ops[2] = br->ops[3];           /* the body */
+        drop[i + 1] = 1;
+    }
+    for (i = 0; i < n; i++) {
+        if (!drop[i]) {
+            if (out != i)
+                ir->insns[out] = ir->insns[i];
+            remap[i] = out;
+            out++;
+        }
+    }
+    if (out == n)
+        goto done;
+    ir->n_insns = out;
+    first[n] = out;
+    for (i = n - 1; i >= 0; i--)
+        first[i] = drop[i] ? first[i + 1] : remap[i];
+    for (i = 0; i < n_pcs; i++) {
+        int old = pc_to_insn[i];
+        if (old < 0 || old > n)
+            old = 0;
+        pc_to_insn[i] = first[old];
+    }
+ done:
+    js_free(ctx, drop);
+    js_free(ctx, remap);
+    js_free(ctx, first);
+    js_free(ctx, is_target);
+}
+
 /* Register operands are byte offsets: one byte reaches register 15, two bytes
    reach register 4095. */
 #define REGVM_NARROW_REG_MAX 16
@@ -61821,6 +62071,12 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
             a = regvm_reg_of(in, 0, ireg, n_values, scratch_reg, win_base, cycle_reg);
             if (a >= 0 && a < REGVM_NARROW_REG_MAX)
                 in->rop = ROP_add_imm_self_branch_s;
+        } else if (in->rop == ROP_inc_branch_lt) {
+            a = regvm_reg_of(in, 0, ireg, n_values, scratch_reg, win_base, cycle_reg);
+            b = regvm_reg_of(in, 1, ireg, n_values, scratch_reg, win_base, cycle_reg);
+            if (a >= 0 && a < REGVM_NARROW_REG_MAX && b >= 0 &&
+                b < REGVM_NARROW_REG_MAX)
+                in->rop = ROP_inc_branch_lt_s;
         }
     }
     for (;;) {
@@ -63991,6 +64247,7 @@ static int regvm_own_has_dest(uint16_t rop)
     case ROP_add_imm_s: case ROP_sub_imm_s:
     case ROP_add_imm_self_s: case ROP_sub_imm_self_s:
     case ROP_add_imm_self_branch: case ROP_add_imm_self_branch_s:
+    case ROP_inc_branch_lt: case ROP_inc_branch_lt_s:
     case ROP_get_field: case ROP_get_local_field:
     case ROP_get_local_field_0: case ROP_get_local_field_1:
     case ROP_get_local_field_2: case ROP_get_local_field_3:
@@ -65566,6 +65823,8 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                            n_values, ireg);
     regvm_rotate_loop_test(ctx, &ir, pc_to_insn, bc_len + n_stubs_used,
                            n_values);
+    regvm_fuse_inc_branch(ctx, &ir, pc_to_insn, bc_len + n_stubs_used,
+                          n_values, ireg);
     /*
      * Forward a frame read to a value still in its register: a local stored
      * earlier in the same block can be read from the stored value's register.
