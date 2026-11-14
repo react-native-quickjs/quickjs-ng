@@ -11117,20 +11117,28 @@ static JSValue js_new_young_array(JSContext *ctx, const JSValue *src, int count)
 /* Build an array from `count` registers, writing the values straight into the
    array's storage rather than a temporary on the C stack. */
 #if QJS_REGVM
+static JSValue regvm_array_from_regs_old(JSContext *ctx, const JSValue *src, int count);
+
 static JSValue regvm_array_from_regs(JSContext *ctx, const JSValue *src,
                                      int count)
+{
+#if !QJS_PACKED_ARRAYS
+    if (y_interp_on && y_mine(ctx) && count > 0 && count <= JS_YARR_MAX) {
+        JSValue obj = js_new_young_array(ctx, src, count);
+        if (JS_VALUE_GET_TAG(obj) != JS_TAG_UNINITIALIZED)
+            return obj;
+    }
+#endif
+    return regvm_array_from_regs_old(ctx, src, count);
+}
+
+/* The array as an ordinary counted object, never a nursery cell. */
+static JSValue regvm_array_from_regs_old(JSContext *ctx, const JSValue *src, int count)
 {
     JSValue obj;
     JSObject *p;
     int i;
 
-#if !QJS_PACKED_ARRAYS
-    if (y_interp_on && y_mine(ctx) && count > 0 && count <= JS_YARR_MAX) {
-        obj = js_new_young_array(ctx, src, count);
-        if (JS_VALUE_GET_TAG(obj) != JS_TAG_UNINITIALIZED)
-            return obj;
-    }
-#endif
     if (count > 0 && count <= JS_ARRAY_INLINE_MAX)
         obj = JS_NewObjectFromShapeCapExtra(ctx, js_dup_shape(ctx->array_shape),
                                             JS_CLASS_ARRAY, NULL, 0, count);
@@ -72766,14 +72774,15 @@ int qjs_aot_typed_put(JSValue recv, uint32_t idx, JSValue v)
     return 0;
 }
 
+/* Compiled code keeps the array where no nursery collection can see it, so it is built as an ordinary object. A nursery cell
+   promoted on the spot cost the promotion, and its death went unnoticed: the young allocation runs no collection trigger, so a
+   compiled loop without a safepoint parked every dead array until the end of the run. */
 int qjs_aot_array_from(JSContext *ctx, JSValue *argv, int na, JSValue *out)
 {
-    JSValue val = regvm_array_from_regs(ctx, argv, na);
+    JSValue val = regvm_array_from_regs_old(ctx, argv, na);
 
     if (JS_IsException(val))
         return -1;
-    if (Y_YOUNG(JS_VALUE_GET_PTR(val)))
-        y_promote_now(JS_VALUE_GET_OBJ(val));
     *out = val;
     return 0;
 }
