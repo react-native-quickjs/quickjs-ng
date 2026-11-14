@@ -34595,13 +34595,15 @@ static uint8_t *REGVM_CC regvm_t_unwind_loop(REGVM_ARGS)
 {
     JSRegRun *c;
 
+    /* A C-entered activation is released by the C frame that entered it, on
+       both the return and the throw path. The frame compiled code builds for its
+       callee has a caller, so the flag is tested first: such a frame is on the C
+       stack, not in the arena. */
+    if (unlikely(f->flags & REGVM_FLAG_C_ENTRY)) {
+        f->ret = JS_EXCEPTION;
+        return REGVM_C_RET;
+    }
     if (f->caller == NULL) {
-        /* A C-entered activation is released by the C frame that entered it, on
-           both the return and the throw path. */
-        if (unlikely(f->flags & REGVM_FLAG_C_ENTRY)) {
-            f->ret = JS_EXCEPTION;
-            return REGVM_C_RET;
-        }
         f->ret = JS_EXCEPTION;
         return NULL;
     }
