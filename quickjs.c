@@ -62130,6 +62130,16 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
         }
     }
 
+    /* A literal in code the pass dropped (what follows a return) was never reached:
+       it keeps no template, so the template table counts only the live ones. */
+    for (; objlit_k < s->objlit_count; objlit_k++) {
+        JSObjLitSite *site = &s->objlit_sites[objlit_k];
+
+        site->template_index = UINT16_MAX;
+        site->tab_idx = -1;
+        site->pos = -1;
+    }
+
     /* check that there were no missing labels */
     for(i = 0; i < s->label_count; i++) {
         assert(label_slots[i].first_reloc == NULL);
