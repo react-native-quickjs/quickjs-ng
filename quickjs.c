@@ -69804,9 +69804,49 @@ static void aot_site_store(JSRuntime *rt, JSAotSite *e, int kind, JSValue v,
 static JSValue regvm_aot_run_to_end(JSContext *ctx, JSRegRun *f, JSValue *fr,
                                     uint32_t pc)
 {
+    JSFunctionBytecode *b = f->b;
+    JSRegRun tmp;
+    uint8_t *ip;
+
     ctx->rt->regvm_cur = f;
-    regvm_t_dispatch(f->b->regvm_code + pc, fr, f, f->b->realm);
-    return f->ret;
+    if (likely(b->aot_light || b->regvm_light)) {
+        regvm_t_dispatch(b->regvm_code + pc, fr, f, b->realm);
+        return f->ret;
+    }
+    /* The code is not light-safe (closure variables, arguments, control records, an instruction only the monolith runs): the
+       monolith's handlers read the frame's JSStackFrame, which a light frame does not have. Step it, as the generated
+       generic body does for the instructions it does not lower: each step runs on the frame and needs no JSStackFrame. */
+    /* The steps read the record-only tail of the frame for the arguments (`rf->argv`) and `new.target`: a light frame ends after the
+       header prefix. Step on a copy of the prefix that has a tail (the registers, the variable area and the arguments stay where
+       they are). */
+    memset(&tmp, 0, sizeof(tmp));
+    memcpy(&tmp, f, REGVM_LIGHT_PREFIX_BYTES);
+    tmp.ctx = b->realm;
+    tmp.caller_ctx = ctx;
+    tmp.new_target = JS_UNDEFINED;
+    tmp.argv = f->arg_buf;
+    tmp.deopt_pc = QJS_AOT_NO_DEOPT;
+    ctx->rt->regvm_cur = &tmp;
+    ip = b->regvm_code + pc;
+    for (;;) {
+        uint8_t *nip;
+
+        tmp.cap_ip = ip;
+        nip = regvm_step(ip, fr, &tmp, b->realm);
+        if (nip == NULL) {
+            if (needs_backtrace(ctx->rt->current_exception))
+                build_backtrace(ctx, ctx->rt->current_exception, JS_UNDEFINED, NULL, 0, 0, 0);
+            ctx->rt->regvm_cur = f;
+            return JS_EXCEPTION;
+        }
+        if (nip == REGVM_COLD_RET) {
+            ctx->rt->regvm_cur = f;
+            if (unlikely(JS_IsException(tmp.ret)) && needs_backtrace(ctx->rt->current_exception))
+                build_backtrace(ctx, ctx->rt->current_exception, JS_UNDEFINED, NULL, 0, 0, 0);
+            return tmp.ret;
+        }
+        ip = nip;
+    }
 }
 
 static __attribute__((always_inline)) inline void regvm_light_free(
