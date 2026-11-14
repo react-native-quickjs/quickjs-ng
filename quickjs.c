@@ -19662,11 +19662,11 @@ static __exception int JS_CopyDataProperties(JSContext *ctx,
         return ret;
     }
 
-    /* No exclusion list means plain `{...src}` / Object.assign, which is the
-       shape worth specialising. `setprop` (Object.assign) would additionally
-       have to honour setters on the target; the fast path only accepts targets
-       that cannot have any, so both callers can share it. */
-    if (JS_VALUE_GET_TAG(excluded) != JS_TAG_OBJECT) {
+    /* Plain `{...src}` only, never Object.assign. The fast path defines
+       properties (CreateDataPropertyOrThrow, what spread requires);
+       Object.assign uses Set, which calls setters on the target and its
+       prototype chain and keeps existing attributes. */
+    if (!setprop && JS_VALUE_GET_TAG(excluded) != JS_TAG_OBJECT) {
         ret = JS_CopyDataPropertiesFast(ctx, target, source);
         if (ret != 0)
             return ret < 0 ? -1 : 0;
