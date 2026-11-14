@@ -64279,6 +64279,37 @@ static void add_pc2line_info(JSFunctionDef *s, uint32_t pc,
     s->col_number_last = col_num;
 }
 
+/* The bytes resolve_labels may add to an input instruction: a field access gains its inline-cache index (and a get_loc/get_arg fused with
+   it no more than that), an object literal its template index, an arguments element or a received array element its operand. A fused
+   group grows by at most the sum of its members. */
+static int resolve_growth(int op)
+{
+    switch (op) {
+    case OP_get_field:
+    case OP_get_field2:
+    case OP_put_field:
+    case OP_object:
+    case OP_args_el:
+        return 2;
+    case OP_get_array_el:
+    case OP_put_array_el:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* An upper bound of the output bytes of the input instructions in [pos, end). */
+static int resolve_gap_bound(const uint8_t *bc_buf, int pos, int end)
+{
+    int n = end - pos;
+    while (pos < end) {
+        n += resolve_growth(bc_buf[pos]);
+        pos += opcode_info[bc_buf[pos]].size;
+    }
+    return n;
+}
+
 /* Emit the IC variant for every cacheable field access when enabled. */
 static void resolve_emit_field(JSFunctionDef *s, DynBuf *bc_out,
                                int plain_op, int ic_op, JSAtom atom,
@@ -64992,6 +65023,9 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
     int args_alias_idx = -1;
     D3Ev *d3_ev = NULL;
     int d3_n = 0, d3_k = 0;
+#ifndef NDEBUG
+    int grow_pos = -1, grow_out = 0;
+#endif
 
     label_slots = s->label_slots;
 
@@ -65142,6 +65176,12 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
 
     for (pos = prologue_skip_to; pos < bc_len; pos = pos_next) {
         int val;
+#ifndef NDEBUG
+        /* the previous step grew within resolve_growth, which the forward 8-bit jumps rely on */
+        assert(grow_pos < 0 || (int)bc_out.size - grow_out <= resolve_gap_bound(bc_buf, grow_pos, pos));
+        grow_pos = pos;
+        grow_out = bc_out.size;
+#endif
         objlit_template_index = -1;
         op = bc_buf[pos];
         len = opcode_info[op].size;
@@ -65358,8 +65398,12 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
             jp->label = label;
 
             if (ls->addr == -1) {
+                /* The label's output position is not known yet, and this pass can make code longer than its input (resolve_growth):
+                   the 8-bit form is taken only when the gap still fits with the growth it may get. Anything else is shortened by the
+                   jump pass at the end, which sees the final positions. */
                 int diff = ls->pos2 - pos - 1;
-                if (diff < 128 && (op == OP_if_false || op == OP_if_true || op == OP_goto)) {
+                if (diff < 128 && (op == OP_if_false || op == OP_if_true || op == OP_goto) &&
+                    diff - (ls->pos2 - pos_next) + resolve_gap_bound(bc_buf, pos_next, ls->pos2) < 128) {
                     jp->size = 1;
                     jp->op = OP_if_false8 + (op - OP_if_false);
                     dbuf_putc(&bc_out, OP_if_false8 + (op - OP_if_false));
