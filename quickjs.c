@@ -58641,7 +58641,13 @@ static int regvm_fmt_size(const char *fmt, int wide, uint16_t rop)
 #if QJS_REGVM_THREAD
 static int regvm_code_all_threaded(const uint8_t *code, int len)
 {
-    const uint8_t *p = code, *end = p + len;
+    const uint8_t *p = code, *end;
+
+    /* The callers run this even when the encode produced no program
+       (`regvm_code` NULL, `len` 0), and `NULL + 0` is undefined behaviour. */
+    if (code == NULL || len <= 0)
+        return 0;
+    end = p + len;
 
     while (p < end) {
         int op = *p, sz;
