@@ -21329,7 +21329,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_set_var_ref0): set_value(ctx, var_refs[0]->pvalue, js_dup(sp[-1])); BREAK;
         CASE(OP_set_var_ref1): set_value(ctx, var_refs[1]->pvalue, js_dup(sp[-1])); BREAK;
         CASE(OP_set_var_ref2): set_value(ctx, var_refs[2]->pvalue, js_dup(sp[-1])); BREAK;
-        CASE(OP_set_var_ref3): set_value(ctx, var_refs[3]->pvalue, js_dup(sp[-1])); BREAK;
 
         CASE(OP_get_var_ref):
             {
@@ -22719,6 +22718,47 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 } else {
                     sf->cur_pc = pc;
                     val = JS_GetPropertyValueConst(ctx, sp[-1], var_buf[idx]);
+                    if (unlikely(JS_IsException(val)))
+                        goto exception;
+                }
+                JS_FreeValue(ctx, sp[-1]);
+                sp[-1] = val;
+            }
+            BREAK;
+
+        CASE(OP_get_arg8_array_el):
+            /* the argument-register form of OP_get_loc8_array_el: the receiver
+               is on the stack and the KEY is arg_buf[a], borrowed -- no dup, no
+               free, no 16-byte stack push and pop for it. Borrowing the key is
+               legal because JS_GetPropertyValueConst() never frees it, and the
+               only user code it can reach with the key still live takes its own
+               reference. The body is duplicated rather than shared with the loc
+               form so that form's register allocation is unchanged, and it adds
+               no function-wide local. */
+            {
+                JSValue val;
+                int idx = *pc++;
+
+                if (likely(JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT &&
+                           JS_VALUE_GET_TAG(arg_buf[idx]) == JS_TAG_INT &&
+                           JS_VALUE_GET_OBJ(sp[-1])->class_id == JS_CLASS_ARRAY &&
+                           (uint32_t)JS_VALUE_GET_INT(arg_buf[idx]) <
+                               JS_VALUE_GET_OBJ(sp[-1])->u.array.count &&
+                           !js_array_slot_is_hole(
+                               JS_VALUE_GET_OBJ(sp[-1])->u.array.u.values[
+                                   JS_VALUE_GET_INT(arg_buf[idx])]))) {
+                    if (js_lazy_marker_is(JS_VALUE_GET_OBJ(sp[-1])->u.array.u.values[
+                                              JS_VALUE_GET_INT(arg_buf[idx])]))
+                        val = js_lazy_materialize_slot(ctx,
+                                  &JS_VALUE_GET_OBJ(sp[-1])->u.array.u.values[
+                                       JS_VALUE_GET_INT(arg_buf[idx])],
+                                  JS_VALUE_GET_OBJ(sp[-1]));
+                    else
+                        val = js_dup(JS_VALUE_GET_OBJ(sp[-1])->u.array.u.values[
+                                         JS_VALUE_GET_INT(arg_buf[idx])]);
+                } else {
+                    sf->cur_pc = pc;
+                    val = JS_GetPropertyValueConst(ctx, sp[-1], arg_buf[idx]);
                     if (unlikely(JS_IsException(val)))
                         goto exception;
                 }
@@ -39105,8 +39145,14 @@ static void put_short_code(DynBuf *bc_out, int op, int idx)
             }
             break;
         case OP_set_var_ref:
-            dbuf_putc(bc_out, OP_set_var_ref0 + idx);
-            return;
+            /* OP_set_var_ref3's slot now holds OP_get_arg8_array_el, so only
+               index 0 keeps the short form; 1-3 take the general 3-byte form,
+               like put_arg, set_arg and put_var_ref already do. */
+            if (idx == 0) {
+                dbuf_putc(bc_out, OP_set_var_ref0);
+                return;
+            }
+            break;
         case OP_call:
             dbuf_putc(bc_out, OP_call0 + idx);
             return;
@@ -40391,6 +40437,20 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                    round trip and the push/pop both disappear. Plain
                    get_field only, and not `.length`, which becomes
                    OP_get_length further down. */
+                /* get_arg(a) get_array_el -> get_arg8_array_el(a): the key is
+                   the argument and is borrowed, the receiver stays on the
+                   operand stack. After the triple above, which matches a
+                   different successor, and before the field fusion below. */
+                if (op == OP_get_arg && idx < 256 &&
+                    code_match(&cc, pos_next, OP_get_array_el, -1)) {
+                    if (cc.line_num >= 0) line_num = cc.line_num;
+                    if (cc.col_num >= 0) col_num = cc.col_num;
+                    add_pc2line_info(s, bc_out.size, line_num, col_num);
+                    dbuf_putc(&bc_out, OP_get_arg8_array_el);
+                    dbuf_putc(&bc_out, idx);
+                    pos_next = cc.pos;
+                    break;
+                }
                 if (op == OP_get_arg && s->ic_count < 0xffff &&
                     code_match(&cc, pos_next, OP_get_field, -1) &&
                     cc.atom != JS_ATOM_length) {
