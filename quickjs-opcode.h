@@ -298,6 +298,10 @@ def( dispose_scope, 3, 0, 0, u16) /* emitted in phase 1, removed in phase 2 */
 
 def(     source_loc, 9, 0, 0, u32x2) /* emitted in phase 1, removed in phase 3 */
 
+/* Parse-time debugger trap. Must be a temporary opcode: resolve_labels
+   rewrites it into OP_debug in phase 3. */
+def(     debug_stmt, 2, 0, 0, u8) /* emitted in phase 1, removed in phase 3 */
+
 DEF(    push_minus1, 1, 0, 1, none_int)
 DEF(         push_0, 1, 0, 1, none_int)
 DEF(         push_1, 1, 0, 1, none_int)
@@ -371,6 +375,10 @@ DEF(   is_undefined, 1, 1, 1, none)
 DEF(        is_null, 1, 1, 1, none)
 DEF(typeof_is_undefined, 1, 1, 1, none)
 DEF( typeof_is_function, 1, 1, 1, none)
+
+/* Debugger trap. The u8 operand carries JS_DEBUG_TRACE_* flags. Defined
+   unconditionally so opcode numbering never depends on JS_ENABLE_DEBUGGER. */
+DEF(          debug, 2, 0, 0, u8)
 
 #undef DEF
 #undef def
