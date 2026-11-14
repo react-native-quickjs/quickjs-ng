@@ -49213,6 +49213,8 @@ typedef struct JSToken {
 /* Expected-transition cache for JSON.parse: the shape chain built for the
    previous object at the same nesting depth is reused instead of hashing every
    add-transition. */
+#define JSON_KCACHE_N 256
+
 typedef struct JSONShapeCache {
     int n;              /* number of valid transitions (keys) */
     int cap;
@@ -49238,6 +49240,8 @@ typedef struct JSParseState {
     const uint8_t *mark; // first token character, invariant: eol < mark
     bool json_key_mode;
     bool json_latin1;   /* JSON.parse of an 8-bit string's own bytes: a byte >= 0x80 is that code point, not UTF-8 */
+    JSAtom json_key_hint; /* JSON.parse: the key the shape being built expects next (only during json_next_key_token) */
+    JSAtom *json_kcache;  /* JSON.parse: JSON_KCACHE_N recent keys by a hash of their bytes (each holds a count), allocated at the first key */
 
     /* JSON.parse shape-reuse cache, indexed by object nesting depth */
     JSONShapeCache *json_shapes;
@@ -50738,17 +50742,85 @@ static int json_parse_string(JSParseState *s, const uint8_t **pp)
 }
 
 /* Parse an ordinary JSON object key without first allocating a JSString. */
+/* Whether the atom's string is exactly the bytes [p, p + len) (8-bit, not a tagged integer). */
+static inline bool json_atom_is_bytes(JSContext *ctx, JSAtom a, const uint8_t *p, uint32_t len)
+{
+    JSString *ap;
+    const uint8_t *q;
+    uint32_t i;
+
+    if (__JS_AtomIsTaggedInt(a))
+        return false;
+    ap = ctx->rt->atom_array[a];
+    if (ap->is_wide_char || ap->len != len)
+        return false;
+    q = str8(ap);
+    for (i = 0; i < len; i++)
+        if (q[i] != p[i])
+            return false;
+    return true;
+}
+
 static int json_parse_key_string(JSParseState *s, const uint8_t **pp)
 {
     const uint8_t *start = *pp;
     const uint8_t *p = start;
 
+    /* the key the shape being built expects, matched in one pass: the input holds the atom's bytes, each one a byte the scan below
+       accepts (printable ASCII, no quote, no backslash), then the closing quote */
+    if (s->json_key_hint != JS_ATOM_NULL && !__JS_AtomIsTaggedInt(s->json_key_hint)) {
+        JSString *ap = s->ctx->rt->atom_array[s->json_key_hint];
+        if (!ap->is_wide_char && (size_t)(s->buf_end - start) > ap->len) {
+            const uint8_t *q = str8(ap);
+            uint32_t i, n = ap->len;
+            for (i = 0; i < n; i++) {
+                uint8_t c = q[i];
+                if (c != start[i] || c < 0x20 || c >= 0x80 || c == '"' || c == '\\')
+                    break;
+            }
+            if (i == n && start[n] == '"') {
+                s->token.val = TOK_IDENT;
+                s->token.u.ident.atom = JS_DupAtom(s->ctx, s->json_key_hint);
+                s->token.u.ident.has_escape = false;
+                s->token.u.ident.is_reserved = false;
+                *pp = start + n + 1;
+                return 0;
+            }
+        }
+    }
     while (p < s->buf_end && *p != '"' && *p != '\\' &&
            *p >= 0x20 && *p < 0x80)
         p++;
     if (p < s->buf_end && *p == '"') {
-        JSAtom atom = JS_NewAtomLen(s->ctx, (const char *)start,
-                                    p - start);
+        JSAtom atom = JS_ATOM_NULL, hint = s->json_key_hint;
+        uint32_t len = (uint32_t)(p - start), h, i;
+        /* the key the shape being built expects: its bytes compared with the atom's own, no hashing or table lookup */
+        if (hint != JS_ATOM_NULL && json_atom_is_bytes(s->ctx, hint, start, len))
+            atom = JS_DupAtom(s->ctx, hint);
+        if (atom == JS_ATOM_NULL) {
+            /* else a key seen recently in this parse: a small table by a cheap hash of the bytes, checked byte for byte */
+            h = len;
+            for (i = 0; i < len; i++)
+                h = h * 31 + start[i];
+            h = (h ^ (h >> 11)) & (JSON_KCACHE_N - 1);
+            if (!s->json_kcache) {
+                s->json_kcache = js_mallocz(s->ctx, sizeof(JSAtom) * JSON_KCACHE_N);
+                if (!s->json_kcache)
+                    return -1;
+            }
+            if (s->json_kcache[h] != JS_ATOM_NULL && json_atom_is_bytes(s->ctx, s->json_kcache[h], start, len)) {
+                atom = JS_DupAtom(s->ctx, s->json_kcache[h]);
+            } else {
+                atom = JS_NewAtomLen(s->ctx, (const char *)start, len);
+                if (atom == JS_ATOM_NULL)
+                    return -1;
+                if (!__JS_AtomIsTaggedInt(atom)) {
+                    if (s->json_kcache[h] != JS_ATOM_NULL)
+                        JS_FreeAtom(s->ctx, s->json_kcache[h]);
+                    s->json_kcache[h] = JS_DupAtom(s->ctx, atom);
+                }
+            }
+        }
         if (atom == JS_ATOM_NULL)
             return -1;
         s->token.val = TOK_IDENT;
@@ -51099,6 +51171,25 @@ static __exception int json_next_token(JSParseState *s)
     case '$':
         if (s->json_key_mode)
             goto def_token;
+        /* the three JSON literals by their bytes: the predefined atoms, no identifier scan or atom table lookup */
+        atom = JS_ATOM_NULL;
+        if (c == 't' && p[1] == 'r' && p[2] == 'u' && p[3] == 'e' &&
+            !(p[4] < 128 && ((lre_id_continue_table_ascii[p[4] >> 5] >> (p[4] & 31)) & 1)) && p[4] < 128) {
+            atom = JS_ATOM_true; p += 4;
+        } else if (c == 'n' && p[1] == 'u' && p[2] == 'l' && p[3] == 'l' &&
+                   !(p[4] < 128 && ((lre_id_continue_table_ascii[p[4] >> 5] >> (p[4] & 31)) & 1)) && p[4] < 128) {
+            atom = JS_ATOM_null; p += 4;
+        } else if (c == 'f' && p[1] == 'a' && p[2] == 'l' && p[3] == 's' && p[4] == 'e' &&
+                   !(p[5] < 128 && ((lre_id_continue_table_ascii[p[5] >> 5] >> (p[5] & 31)) & 1)) && p[5] < 128) {
+            atom = JS_ATOM_false; p += 5;
+        }
+        if (atom != JS_ATOM_NULL) {
+            s->token.u.ident.atom = atom;
+            s->token.u.ident.has_escape = false;
+            s->token.u.ident.is_reserved = false;
+            s->token.val = TOK_IDENT;
+            break;
+        }
         /* identifier : only pure ascii characters are accepted */
         p++;
         atom = json_parse_ident(s, &p, c);
@@ -51165,7 +51256,16 @@ static int json_next_key_token(JSParseState *s)
     s->json_key_mode = true;
     ret = json_next_token(s);
     s->json_key_mode = saved;
+    s->json_key_hint = JS_ATOM_NULL;
     return ret;
+}
+
+/* The key read next with the one the depth's shape cache expects at position k as a hint (json_parse_key_string checks it byte for byte) */
+static int json_next_key_token_hint(JSParseState *s, const JSONShapeCache *c, int k)
+{
+    if (c && c->atoms && k < c->n)
+        s->json_key_hint = c->atoms[k];
+    return json_next_key_token(s);
 }
 
 #ifndef QJS_DISABLE_PARSER
@@ -105687,6 +105787,14 @@ static void json_free_parse_record(JSContext *ctx, JSONParseRecord *pr)
 
 static void json_shape_cache_free(JSContext *ctx, JSParseState *s)
 {
+    if (s->json_kcache) {
+        int q;
+        for (q = 0; q < JSON_KCACHE_N; q++)
+            if (s->json_kcache[q] != JS_ATOM_NULL)
+                JS_FreeAtom(ctx, s->json_kcache[q]);
+        js_free(ctx, s->json_kcache);
+        s->json_kcache = NULL;
+    }
     int i, k;
     if (!s->json_shapes)
         return;
@@ -105798,7 +105906,7 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr, int depth)
             JSObject *jsobj;
             int pr_size, k, matched;
 
-            if (json_next_key_token(s))
+            if (json_next_key_token_hint(s, depth < s->json_shapes_len ? &s->json_shapes[depth] : NULL, 0))
                 goto fail;
             val = JS_NewObject(ctx);
             if (JS_IsException(val))
@@ -105907,7 +106015,7 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr, int depth)
                         json_parse_error(s, s->token.ptr, "Expected ',' or '}' after property value");
                         goto fail;
                     }
-                    if (json_next_key_token(s))
+                    if (json_next_key_token_hint(s, jsc && matched ? jsc : NULL, k))
                         goto fail;
                 }
             }
