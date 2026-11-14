@@ -24514,7 +24514,7 @@ static __exception int regvm_for_of_next(JSContext *ctx, JSValue *regs_sp,
                         value = JS_GetProperty(ctx, obj, JS_ATOM_value);
                     JS_FreeValue(ctx, obj);
                 }
-            } else if (done) {
+            } else if (done && !JS_IsException(value)) {
                 JS_FreeValue(ctx, value);
                 value = JS_UNDEFINED;
             }
