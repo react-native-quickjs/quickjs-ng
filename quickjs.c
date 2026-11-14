@@ -108,6 +108,15 @@ typedef struct JSRegRCC JSRegRCC;
 #endif
 
 /*
+ * QJS_SETNAME_FAST: `set_name` swaps the closure's empty inferred name for its
+ * real one in place instead of going through the generic property definer.
+ * Off restores the definer call for every case.
+ */
+#ifndef QJS_SETNAME_FAST
+#define QJS_SETNAME_FAST 1
+#endif
+
+/*
  * The handler-table entry for the seven opcodes above. With the switch on each
  * names its own `regvm_t_<name>`; off, all seven fall back to `regvm_t_cold`,
  * which is exactly the old behaviour. Used in `regvm_threaded` (which reads the
@@ -27595,7 +27604,46 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_set_name_slow(REGVM_A
 {
     int r = T_REG(1);
     JSAtom atom = T_U32(3);
-    if (JS_DefineObjectName(ctx, FR(r), atom, JS_PROP_CONFIGURABLE) < 0)
+    JSValue v = FR(r);
+
+    /*
+     * QJS_SETNAME_FAST: `js_closure` already gave every closure its own
+     * compile-time name, and `set_name` only ever replaces the *empty* one
+     * (inference writes the name after the object exists). A closure's `name`
+     * is an own, non-writable, non-enumerable, configurable data property
+     * (`js_function_set_properties`, JS_PROP_CONFIGURABLE), so when it is
+     * already present and normal the generic definer's whole job is to swap
+     * the string -- it frees the old value, stores the new one, and re-applies
+     * a mask that changes no bit (JS_DefineProperty's `else` branch below the
+     * find_own_property, quickjs.c:15336). Going through the generic definer
+     * costs ~256 instructions for that swap; this is it directly.
+     */
+#if QJS_SETNAME_FAST
+    if (atom != JS_ATOM_NULL && JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
+        JSObject *p = JS_VALUE_GET_OBJ(v);
+
+        if (p->class_id == JS_CLASS_BYTECODE_FUNCTION) {
+            JSProperty *pr;
+            JSShapeProperty *prs = find_own_property(&pr, p, JS_ATOM_name);
+
+            if (prs != NULL && prs->flags == JS_PROP_CONFIGURABLE &&
+                JS_VALUE_GET_TAG(pr->u.value) == JS_TAG_STRING) {
+                if (JS_VALUE_GET_STRING(pr->u.value)->len != 0) {
+                    /* already named: JS_DefineObjectName is a no-op */
+                    T_NEXT(T_SZ_RA);
+                } else {
+                    JSValue s = JS_AtomToString(ctx, atom);
+
+                    if (JS_IsException(s))
+                        T_FAIL();
+                    set_value(ctx, &pr->u.value, s);
+                    T_NEXT(T_SZ_RA);
+                }
+            }
+        }
+    }
+#endif
+    if (JS_DefineObjectName(ctx, v, atom, JS_PROP_CONFIGURABLE) < 0)
         T_FAIL();
     T_NEXT(T_SZ_RA);
 }
