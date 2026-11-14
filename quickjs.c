@@ -29500,13 +29500,16 @@ static void regvm_pic_install(JSRuntime *rt, JSRegPIC *e, JSShape **pholder,
  * counted reference does not stop an unhashed shape from being mutated in
  * place; a hashed one with refcount >= 2 is copy-on-write, which the hit path
  * needs. The hash is recomputed from the property list because `sh->hash` is
- * only maintained while `is_hashed`.
+ * only maintained while `is_hashed`. A shape with a deleted property is left
+ * as it is: every delete makes its own copy, which no transition reaches, so
+ * hashing them puts one more equal shape in the same bucket per object and
+ * each free walks the chain. Its sites take the uncached path.
  */
 static void regvm_shape_hashify(JSRuntime *rt, JSShape *sh)
 {
     uint32_t h, i;
 
-    if (sh->is_hashed)
+    if (sh->is_hashed || sh->deleted_prop_count != 0)
         return;
     if (2 * (rt->shape_hash_count + 1) > rt->shape_hash_size)
         resize_shape_hash(rt, rt->shape_hash_bits + 1);
