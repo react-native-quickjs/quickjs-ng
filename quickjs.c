@@ -30143,8 +30143,10 @@ static int regvm_put_field_ic(JSContext *ctx, JSFunctionBytecode *b,
             JSPutAddEntry *pe = js_putadd_probe(rt, po->shape, atom);
             if (pe != NULL) {
                 int ah = regvm_put_add_apply(ctx, b, po, val, site, 0, pe->to_shape, pe->off);
-                if (ah != 0)
-                    return ah < 0 ? -1 : 0;
+                if (ah != 0) {
+                    ret = ah < 0 ? -1 : 0;
+                    goto stored;
+                }
             }
         }
         /* Snapshot for the shared table always, and for the site's own entry only when it has no transition yet or holds this
@@ -30165,6 +30167,7 @@ static int regvm_put_field_ic(JSContext *ctx, JSFunctionBytecode *b,
                            prof_was_own, site_ok);
     if (pre_sh)
         js_free_shape(rt, pre_sh);
+ stored:
 #if QJS_AOT_PROFILE
     if (AOT_PROF_ON(b)) {
         int cls = AOT_STORE_OTHER, slot = -1;
