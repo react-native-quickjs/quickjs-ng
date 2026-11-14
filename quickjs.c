@@ -69899,6 +69899,13 @@ QJS_AOT_STUB JSValue qjs_aot_deopt(JSContext *ctx, JSRegRun *f, JSValue *fr,
 /* the bound callee (and its C prototype) per runtime.                       */
 /* ------------------------------------------------------------------------ */
 
+/* A function the unit has switched off (its exits crossed the profitability gate) is bound for ever otherwise: each call enters the compiled stub only to
+   deopt, which costs more than the interpreter's own call. Dropping the binding makes its later calls take the interpreter's path. */
+QJS_AOT_STUB void qjs_aot_unbind_fn(JSRegRun *f)
+{
+    js_aot_unbind(f->b);
+}
+
 /* A compiled loop's back edge polls the embedder's interrupt handler here, the
    way every interpreter back edge does, so a compiled `while (true) {}` can
    still be stopped. The counter is the context's own, so a compiled loop and

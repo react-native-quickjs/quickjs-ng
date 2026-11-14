@@ -309,6 +309,8 @@ int qjs_aot_func_disabled(JSContext *ctx, uint32_t fn);
    function once the count reaches the limit. Returns 1 when this call disabled
    the function. `QJS_AOT_NO_SITE` is never counted. */
 int qjs_aot_note_deopt(JSContext *ctx, uint32_t site);
+/* Drop the compiled binding of f's function (a function the unit has switched off): its later calls run the interpreter's own call path. */
+QJS_AOT_STUB void qjs_aot_unbind_fn(JSRegRun *f);
 QJS_AOT_STUB JSValue qjs_aot_deopt(JSContext *ctx, JSRegRun *f, JSValue *fr,
                                    uint32_t pc, uint32_t site);
 /* An entry that runs nothing hands the call to the interpreter (no frame of the unit is built); the gated form also stops
