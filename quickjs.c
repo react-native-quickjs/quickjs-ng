@@ -25220,24 +25220,7 @@ typedef struct JSRegArenaChunk {
     size_t saved_top;           /* this chunk's top while a later chunk is current */
 } JSRegArenaChunk;
 
-#ifdef QJS_REGVM_KNOBS
-/* Shift the frame arena by REGVM_SKEW bytes (rounded down to 16)
-   so a measurement can pick an alias-free layout. `getenv` is read once; without
-   QJS_REGVM_KNOBS the offset folds to zero and the macro is unchanged. */
-static size_t regvm_skew(void)
-{
-    static long v = -1;
-    if (v < 0) {
-        const char *e = getenv("REGVM_SKEW");
-        v = e ? atol(e) & ~15L : 0;
-    }
-    return (size_t)v;
-}
-#define REGVM_CHUNK_HDR \
-    (((sizeof(JSRegArenaChunk) + 15) & ~(size_t)15) + regvm_skew())
-#else
 #define REGVM_CHUNK_HDR ((sizeof(JSRegArenaChunk) + 15) & ~(size_t)15)
-#endif
 
 static inline uint8_t *regvm_chunk_data(JSRegArenaChunk *c)
 {
@@ -57539,13 +57522,10 @@ static __exception int compute_stack_size(JSContext *ctx,
 #define REGVM_KNOB(name) ((const char *)0)
 #endif
 
-/* Variable-home modes: 0 counts only, 1 materializes split/copy SSA values
-   with the ordinary allocator, 2 enables fixed homes, 3 also allows
-   transfer-at-last-use from a home, and 5 compacts used homes. */
+/* Variable-home modes; only mode 5 (compact used homes) ships. */
 static int regvm_homes_mode(void)
 {
-    const char *mode = REGVM_KNOB("REGVM_HOMES");
-    return mode ? atoi(mode) : 5;
+    return 5;
 }
 
 /* The encoder's read-back pass re-decodes every emitted instruction against
@@ -62832,8 +62812,6 @@ static void regvm_transfer_dead_sources(JSContext *ctx, JSRegIR *ir,
 
     if (n <= 0 || n_values <= 0)
         return;
-    if (REGVM_KNOB("REGVM_NOTRANSFER"))
-        return;
     nref = js_malloc(ctx, (size_t)n_values);
     lastu = js_malloc(ctx, (size_t)n_values * sizeof(int));
     if (!nref || !lastu) {
@@ -62870,12 +62848,8 @@ static void regvm_transfer_dead_sources(JSContext *ctx, JSRegIR *ir,
         } else if (rop == ROP_put_arg) {
             vi = 1; to = ROP_put_arg_xfer;
         } else if (rop == ROP_put_element) {
-            if (REGVM_KNOB("REGVM_NOELEMXFER"))
-                continue;
             vi = 2; to = ROP_put_element_xfer;
         } else if (rop == ROP_put_field && in->ops[2] == REG_IC_NONE) {
-            if (REGVM_KNOB("REGVM_NOELEMXFER"))
-                continue;
             vi = 3; to = ROP_put_field_xfer;
         } else {
             continue;
@@ -63460,8 +63434,6 @@ static void regvm_fuse_const_operand(JSContext *ctx, JSRegIR *ir,
 
     if (n < 2 || n_values <= 0)
         return;
-    if (REGVM_KNOB("REGVM_NOFOLD"))
-        return;
     nref = js_malloc(ctx, (size_t)n_values);
     drop = js_mallocz(ctx, (size_t)n);
     remap = js_malloc(ctx, (size_t)n * sizeof(int));
@@ -63475,7 +63447,7 @@ static void regvm_fuse_const_operand(JSContext *ctx, JSRegIR *ir,
         JSRegInsn *ld = &ir->insns[i], *bn = &ir->insns[i + 1];
         int dc, K, sub;
 
-        if (ld->rop == ROP_load_const && !REGVM_KNOB("REGVM_NOBCPOOL")) {
+        if (ld->rop == ROP_load_const) {
             /* A constant-pool or atom operand needs no register: the pool value
                is owned by the bytecode and an atom value is made for the
                operation. */
@@ -63567,8 +63539,6 @@ static void regvm_fuse_field_chain(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
     int *remap = NULL, *first = NULL;
 
     if (n < 2)
-        return;
-    if (REGVM_KNOB("REGVM_NOCHAIN"))
         return;
     drop = js_mallocz(ctx, (size_t)n);
     is_target = js_mallocz(ctx, (size_t)n);
@@ -63667,8 +63637,6 @@ static void regvm_fuse_arith_pair(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
     int *remap = NULL, *first = NULL;
 
     if (n < 2)
-        return;
-    if (REGVM_KNOB("REGVM_NOARITH2"))
         return;
     drop = js_mallocz(ctx, (size_t)n);
     is_target = js_mallocz(ctx, (size_t)n);
@@ -63833,10 +63801,6 @@ static int regvm_slot_operand(const JSFunctionDef *fd, const uint8_t *bc, int po
     }
     if (u >= 0 && u < fd->var_count + fd->arg_count &&
         slot_ok && slot_ok[u] && ok_index && ok_index[u] >= 0) {
-        if (role == REGVM_SLOT_INTERNAL && REGVM_KNOB("REGVM_NOINTERNAL"))
-            return -1;
-        if (role == REGVM_SLOT_RMW && REGVM_KNOB("REGVM_NORMW"))
-            return -1;
         *p_role = role;
         return ok_index[u];
     }
@@ -64033,9 +63997,6 @@ static void regvm_home_overlap_report(int pos, int k, int cur, int stale)
     js_regvm_home_overlap++;
 #endif
 #ifdef QJS_REGVM_KNOBS
-    if (REGVM_KNOB("REGVM_HOMES"))
-        fprintf(stderr, "##HOVL## pos=%d k=%d cur=%d stale=%d\n",
-                pos, k, cur, stale);
 #else
     (void)pos; (void)k; (void)cur; (void)stale;
 #endif
@@ -64666,8 +64627,7 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
     int init_cnt = 0, undef_cnt = 0, ret_sum = 0, uni_cnt = 0, uninit_ret = 0;
     int init_all = 0;
     int i, b, k, e, ne = 0, sp = 0, ok = 0;
-    const char *ownknob = REGVM_KNOB("REGVM_OWN");
-    int dump = ownknob != NULL;
+    int dump = 0;
     /* Owned by the IR once the analysis completes; js_regvm_encode frees it. */
     ir->own_init = NULL;
     ir->own_undef = NULL;
@@ -65118,27 +65078,9 @@ done:
 }
 
 
-/*
- * Item 1.3 of the no-refusals plan: make a refused function visible at compile
- * time. Behind QJS_REGVM_KNOBS and the REGVM_REPORT_DEFERRED environment
- * variable, so a normal run stays silent; the switch exists to keep the
- * refusal inventory measurable over test262 and the corpus.
- */
-#ifdef QJS_REGVM_KNOBS
-static int regvm_report_deferred_on(void)
-{
-    static int on = -1;
-    if (on < 0) {
-        const char *e = getenv("REGVM_REPORT_DEFERRED");
-        on = e && e[0] && e[0] != '0';
-    }
-    return on;
-}
-#else
-#define regvm_report_deferred_on() 0
-#endif
 
 /* Print "regvm: refused <name> (<file>:<line>): <why>" once per refusal. */
+static inline int regvm_report_deferred_on(void) { return 0; }
 static void regvm_report_refusal(JSContext *ctx, JSFunctionDef *fd,
                                  const char *why)
 {
@@ -65712,7 +65654,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
             }
         }
         js_free(ctx, cdone);
-        if (need_cycle && !REGVM_KNOB("REGVM_NOCYCLE"))
+        if (need_cycle)
             cycle_reg = reg_count++;    /* above the window, so it aliases nothing */
     }
 
@@ -65798,8 +65740,6 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
             continue;
         two = (succ[b * 2] >= 0 && succ[b * 2 + 1] >= 0 &&
                succ[b * 2] != succ[b * 2 + 1]);
-        if (REGVM_KNOB("REGVM_NOSTUB"))
-            two = 0;
         /* a one-successor predecessor places its moves inline below */
         pre_e = two ? -1 : (succ[b * 2] >= 0 ? b * 2
                             : (succ[b * 2 + 1] >= 0 ? b * 2 + 1 : -1));
@@ -66087,7 +66027,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
 #endif
     if (!fd->regvm_baseline)
         regvm_transfer_dead_sources(ctx, &ir, n_values,
-                                REGVM_KNOB("REGVM_NOPHIIN") ? NULL : phi_in,
+                                phi_in,
                                 phi_in,
                                 home_of, home_mode, live_out, live_words,
                                 bstart, n_blocks);
@@ -66207,8 +66147,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
        of a never-defined value is a compiler modelling gap, so the function is
        refused. Runs after the removing passes, on the program actually emitted.
        */
-    if (!REGVM_KNOB("REGVM_NOVERIFY") && defined && n_values > 0 &&
-        !fd->regvm_baseline) {
+    if (defined && n_values > 0 && !fd->regvm_baseline) {
         for (i = 0; i < ir.n_insns; i++) {
             const char *fmt = regvm_rop_fmt[ir.insns[i].rop];
             for (k = 0; fmt && fmt[k]; k++) {
@@ -66359,13 +66298,6 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                         fd->regvm_fill_count = (uint16_t)m;
                     }
                 }
-                if (REGVM_KNOB("REGVM_OWN")) {
-                    fprintf(stderr, "##FILL## n=%d of %d:", fd->regvm_fill_count,
-                            ntot);
-                    for (k = 0; k < fd->regvm_fill_count; k++)
-                        fprintf(stderr, " %d", fd->regvm_fill[k]);
-                    fprintf(stderr, "\n");
-                }
             }
         }
     }
@@ -66514,8 +66446,6 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
         *pdeferred = 1;
         return 0;
     }
-    if (REGVM_KNOB("REGVM_FORCE_DEFER"))
-        REGVM_DEFER("forced by REGVM_FORCE_DEFER");
     const char *enc_why = NULL;
 
     if (bc_len <= 0)
@@ -66766,22 +66696,6 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                 slot_ok[fd->arguments_var_idx] = 0;
             if (fd->arguments_arg_idx >= 0 && fd->arguments_arg_idx < nslots)
                 slot_ok[fd->arguments_arg_idx] = 0;
-            if (REGVM_KNOB("REGVM_PROMO_NOLOC"))
-                for (i = 0; i < fd->var_count; i++)
-                    slot_ok[i] = 0;
-            if (REGVM_KNOB("REGVM_PROMO_NOARG"))
-                for (i = 0; i < fd->arg_count; i++)
-                    slot_ok[fd->var_count + i] = 0;
-            if (REGVM_KNOB("REGVM_ONLY0")) {
-                for (i = 1; i < nslots; i++)
-                    slot_ok[i] = 0;
-            }
-            if (REGVM_KNOB("REGVM_ONLYSLOT")) {
-                int keep = atoi(REGVM_KNOB("REGVM_ONLYSLOT"));
-                for (i = 0; i < nslots; i++)
-                    if (i != keep)
-                        slot_ok[i] = 0;
-            }
 
             for (pos = 0; pos < bc_len; pos += short_opcode_info(bc[pos]).size) {
                 int op = bc[pos], u = -1;
@@ -66862,13 +66776,6 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
             /* Fall back to the frame and clear the eligibility bits with the
                count, so every later user of `slot_ok`/`ok_index` agrees that
                nothing is promoted. */
-            for (i = 0; i < nslots; i++) {
-                slot_ok[i] = 0;
-                ok_index[i] = -1;
-            }
-            ns_ok = 0;
-        }
-        if (REGVM_KNOB("REGVM_NOPROMO")) {
             for (i = 0; i < nslots; i++) {
                 slot_ok[i] = 0;
                 ok_index[i] = -1;
@@ -67808,12 +67715,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                     }
                 }
                 /* a phi input is used at the end of this block, not before it */
-                if (REGVM_KNOB("REGVM_OLDPHIUSE")) {
-                    uint64_t *U = use_bits + (size_t)b * words;
-                    uint64_t *PU = phi_use_bits + (size_t)b * words;
-                    for (w = 0; w < words; w++)
-                        U[w] |= PU[w];
-                } else {
+                {
                     uint64_t *PU = phi_use_bits + (size_t)b * words;
                     for (w = 0; w < words; w++)
                         OUT[w] |= PU[w];
@@ -68543,8 +68445,6 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                register and drop the copy. */
             {
                 int hv = phi_hint[vv] >= 0 ? phi_hint[vv] : first_op[vv];
-                if (REGVM_KNOB("REGVM_NOCOALESCE"))
-                    hv = -1;
             if (hv >= 0) {
                 int hr = ireg[hv];
                 if (hr >= (home_mode >= 5 ? home_count :
@@ -68600,7 +68500,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
          */
         /* Fixed homes already put every slot phi and its incoming versions in
            one register, so this is only needed without homes. */
-        if (ns_ok > 0 && home_mode < 2 && !REGVM_KNOB("REGVM_NOCOAL")) {
+        if (ns_ok > 0 && home_mode < 2) {
             for (b = 0; b < n_blocks; b++) {
                 if (in_depth[b] < 0)
                     continue;
@@ -68855,16 +68755,11 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
         rc = 0;
         goto done;
     }
-    /*
-     * The optimising lowering has now refused this shape twice (once
-     * optimising, once conservative). That is the point of the third tier:
-     * refuse nothing. `*pdeferred = 1` hands the function to the baseline
-     * builder, which shares only the stack-effect model, the lowering, the
-     * ownership replay and the encoder -- no SSA, liveness, promotion, reuse or
-     * fusion -- so it cannot refuse a shape those passes could not express.
-     * Record why the optimising path gave up, so the baseline population can be
-     * measured (REGVM_REPORT_DEFERRED) and a baseline failure can name it.
-     */
+    /* The optimising lowering refused this shape twice, so hand the function to
+       the baseline builder (`*pdeferred = 1`), which shares only the
+       stack-effect model, the lowering, the ownership replay and the encoder.
+       Record why the optimising path gave up, so a baseline failure can name
+       it. */
     regvm_report_refusal(ctx, fd, defer_why);
     *pdeferred = 1;
     deferred = 1;
