@@ -378,6 +378,9 @@ QJS_AOT_STUB uint8_t *qjs_aot_iter_next(uint8_t *ip, JSValue *fr, JSRegRun *f,
 QJS_AOT_STUB int qjs_aot_put_add(JSContext *ctx, JSRegRun *f, JSValue recv,
                                  JSValue v, int site);
 
+/* A compiled `new` finished with `inst`: the constructor learns its instance capacity. */
+void qjs_aot_construct_done(JSObject *ctor, JSValue inst);
+
 /* The `this` object of `new C(...)` for a plain constructor: allocated the way the
    interpreter's light construct does (the prototype from `C.prototype`, the profiled
    inline slot capacity), so the caller can run the constructor's compiled body with it
