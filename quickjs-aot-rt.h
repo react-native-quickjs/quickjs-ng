@@ -121,6 +121,16 @@ typedef struct JSAotGenLayout {
     uint32_t class_uint8c_array, class_int8_array, class_uint8_array, class_int16_array;
     uint32_t class_uint16_array, class_int32_array, class_uint32_array;
     uint32_t class_float32_array, class_float64_array;
+    /* A string value's length word, the context's per-class prototype table and the class
+       of String.prototype's holder. */
+    uint32_t string_len_mask, off_ctx_class_proto, class_string;
+    /* In a flat string's header: the wide-character bit (first word) and the kind bits
+       (second word). */
+    uint32_t string_wide_mask, string_kind_mask;
+    /* The flag bits of a shape property entry (first word; the atom is the second). */
+    uint32_t shape_prop_tmask;
+    /* The runtime's table of one-character strings (code units below 256). */
+    uint32_t off_rt_onechar;
     /* The per-site polymorphic property cache: where the bytecode's allocation
        is, the stride between sites, and the ways per site. */
     uint32_t off_fnbc_aot_poly, off_fnbc_aot_poly_sites, aot_poly_ways;
@@ -302,7 +312,8 @@ void qjs_aot_set_reg_p(JSContext *ctx, JSValue *fr, int off, JSValue v);
 enum {
     QJS_AOT_INTR_SQRT, QJS_AOT_INTR_ABS, QJS_AOT_INTR_FLOOR, QJS_AOT_INTR_CEIL,
     QJS_AOT_INTR_ROUND, QJS_AOT_INTR_SIN, QJS_AOT_INTR_COS, QJS_AOT_INTR_MIN,
-    QJS_AOT_INTR_MAX, QJS_AOT_INTR_PARSEINT, QJS_AOT_INTR_COUNT
+    QJS_AOT_INTR_MAX, QJS_AOT_INTR_PARSEINT, QJS_AOT_INTR_STR_CHARCODEAT,
+    QJS_AOT_INTR_STR_CODEPOINTAT, QJS_AOT_INTR_STR_CHARAT, QJS_AOT_INTR_COUNT
 };
 void *qjs_aot_intrinsic_fn(int id);
 
@@ -387,6 +398,13 @@ int qjs_aot_load_const(JSContext *ctx, JSRegRun *f, int kind, uint32_t idx, JSVa
 int qjs_aot_object_fill(JSContext *ctx, JSRegRun *f, JSValue obj, JSValue *vals, int n, int ti);
 int qjs_aot_object_fill_b(JSContext *ctx, struct JSFunctionBytecode *b, JSValue obj, JSValue *vals,
                           int n, int ti);
+/* The slot of `atom` in this realm's String.prototype when it is a plain data property:
+   1 with the prototype's shape, the property's entry in that shape and its byte offset
+   in the property array, 0 otherwise. A compiled method load on a string receiver keeps
+   them and reads the current value while the shape, the entry's atom and its flags are
+   unchanged. */
+int qjs_aot_strproto_slot(JSContext *ctx, uint32_t atom, const void **shape,
+                          const void **prs, uint32_t *off);
 /* Stores a number into an in-range element of a typed array; 0 when the case is not that. */
 int qjs_aot_typed_put(JSValue recv, uint32_t idx, JSValue v);
 /* `f.apply(this, arguments)`: with the builtin `apply` and this frame's arguments not
