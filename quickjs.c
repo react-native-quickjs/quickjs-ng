@@ -16821,6 +16821,7 @@ typedef struct JSAotFacts {
     int n, cap;
     uint32_t breaks;
     uint32_t fresh_pending; /* FRESH groups still PENDING: only they care about a construct */
+    uint32_t sweep_pending; /* a group broke since the last sweep: it may still hold values (the sweep is a walk of every group) */
     struct JSAotLayoutDep *ld;      /* the facts_valid bits that depend on a layout */
     int nld, ldcap;
 } JSAotFacts;
@@ -16932,6 +16933,7 @@ static void js_aot_fact_break_now(JSAotFacts *F, JSAotFact *g)
         F->fresh_pending--;
     g->state = QJS_AOT_FACT_BROKEN;
     F->breaks++;
+    F->sweep_pending = 1;
     js_aot_fact_set_deps(g, 0);
     /* a constructor-layout watch: the layout was built on this `prototype` value */
     if (g->layout != 0)
@@ -16986,8 +16988,9 @@ static void js_aot_facts_sweep(JSRuntime *rt)
 {
     JSAotFacts *F = rt->aot_facts;
     int i, j;
-    if (F == NULL)
+    if (F == NULL || !F->sweep_pending)
         return;
+    F->sweep_pending = 0;
     for (i = 0; i < F->n; i++) {
         JSAotFact *g = F->g[i];
         if (g->state != QJS_AOT_FACT_BROKEN || JS_IsUndefined(g->objv))
@@ -17023,6 +17026,7 @@ static void js_aot_facts_free(JSRuntime *rt)
                 *(uint32_t *)F->g[i]->dep[j].word &= ~(uint32_t)F->g[i]->dep[j].mask;
         F->g[i]->state = QJS_AOT_FACT_BROKEN;
     }
+    F->sweep_pending = 1;
     js_free_rt(rt, F->ld);
     js_aot_facts_sweep(rt);
     for (i = 0; i < F->n; i++) {
@@ -66497,6 +66501,74 @@ QJS_AOT_STUB int qjs_aot_global_get(JSContext *ctx, uint32_t atom, JSValue *out)
     if (JS_VALUE_GET_TAG(pr->u.value) == JS_TAG_UNINITIALIZED)
         return 0;
     *out = pr->u.value;
+    return 1;
+}
+
+/* A store to the global binding `atom`, as `put_var` (`init` = `put_var_init`), for a binding that is a writable data property: no code
+   runs. The engine's own store does it (the facts that watch the binding break there); the binding's previous value is handed back in
+   *old as a counted reference, so whatever the caller borrowed from it stays alive. `val` is borrowed. 1 when stored, 0 when the binding
+   is not such a property (nothing done), -1 with an exception pending. */
+QJS_AOT_STUB int qjs_aot_global_put(JSContext *ctx, uint32_t atom, JSValue val, int init, JSValue *old)
+{
+    JSShapeProperty *prs;
+    JSProperty *pr;
+    JSObject *p;
+
+    p = JS_VALUE_GET_OBJ(ctx->global_var_obj);
+    prs = find_own_property(&pr, p, (JSAtom)atom);
+    if (prs == NULL) {
+        p = JS_VALUE_GET_OBJ(ctx->global_obj);
+        prs = find_own_property(&pr, p, (JSAtom)atom);
+        if (prs == NULL)
+            return 0;
+    }
+    if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL || !(prs->flags & JS_PROP_WRITABLE))
+        return 0;
+    if (!init && JS_VALUE_GET_TAG(pr->u.value) == JS_TAG_UNINITIALIZED)
+        return 0;
+    *old = js_dup(pr->u.value);
+    if (JS_SetGlobalVar(ctx, (JSAtom)atom, js_dup(val), init) < 0) {
+        JS_FreeValue(ctx, *old);
+        *old = JS_UNDEFINED;
+        return -1;
+    }
+    return 1;
+}
+
+/* `new Array()` for code that knows the array will hold a few elements: an empty array of the realm's array shape whose first `n` elements
+   live in the object's own allocation (the first pushes allocate nothing; a growth past them moves the elements out as for any array). */
+QJS_AOT_STUB JSValue qjs_aot_new_array_inline(JSContext *ctx, uint32_t n)
+{
+    return JS_NewObjectFromShapeCapExtra(ctx, js_dup_shape(ctx->array_shape), JS_CLASS_ARRAY, NULL, 0, n);
+}
+
+/* `a + b` where one side is a string and the other a string or a primitive whose string form runs no code (a number, a boolean,
+   null, undefined). 1 with an owned *out, 0 for any other operands (nothing done), -1 with an exception pending. */
+QJS_AOT_STUB int qjs_aot_add_str(JSContext *ctx, JSValue a, JSValue b, JSValue *out)
+{
+    int ta = JS_VALUE_GET_NORM_TAG(a), tb = JS_VALUE_GET_NORM_TAG(b);
+#define AOT_STR_PRIM(t) ((t) == JS_TAG_STRING || (t) == JS_TAG_INT || (t) == JS_TAG_FLOAT64 || (t) == JS_TAG_BOOL || (t) == JS_TAG_NULL || (t) == JS_TAG_UNDEFINED)
+    JSValue sa, sb, r;
+    if (!((ta == JS_TAG_STRING || tb == JS_TAG_STRING) && AOT_STR_PRIM(ta) && AOT_STR_PRIM(tb)))
+        return 0;
+#undef AOT_STR_PRIM
+    {
+        int cr = js_concat_short(ctx, a, b, out);
+        if (cr != 0)
+            return cr;
+    }
+    sa = JS_ToString(ctx, a);
+    if (JS_IsException(sa))
+        return -1;
+    sb = JS_ToString(ctx, b);
+    if (JS_IsException(sb)) {
+        JS_FreeValue(ctx, sa);
+        return -1;
+    }
+    r = JS_ConcatString(ctx, sa, sb);
+    if (JS_IsException(r))
+        return -1;
+    *out = r;
     return 1;
 }
 
