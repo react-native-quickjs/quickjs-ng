@@ -23645,6 +23645,8 @@ static inline __attribute__((always_inline)) int regvm_num_fast(int sub, JSValue
         case REG_BIN_ADD: *out = js_float64(d1 + d2); return 1;
         case REG_BIN_SUB: *out = js_float64(d1 - d2); return 1;
         case REG_BIN_MUL: *out = js_float64(d1 * d2); return 1;
+        case REG_BIN_DIV: *out = js_float64(d1 / d2); return 1;
+        case REG_BIN_MOD: *out = js_float64(fmod(d1, d2)); return 1;
         case REG_BIN_LT: *out = js_bool(d1 < d2); return 1;
         case REG_BIN_LTE: *out = js_bool(d1 <= d2); return 1;
         case REG_BIN_GT: *out = js_bool(d1 > d2); return 1;
@@ -23673,6 +23675,16 @@ static inline __attribute__((always_inline)) int regvm_num_fast(int sub, JSValue
             }
             *out = js_int32((int32_t)r);
             return 1;
+        case REG_BIN_DIV:
+            *out = js_number((double)v1 / (double)v2);
+            return 1;
+        case REG_BIN_MOD:
+            if (likely(v1 >= 0 && v2 > 0)) {
+                *out = js_int32(v1 % v2);
+                return 1;
+            }
+            *out = js_number(fmod(v1, v2));
+            return 1;
         case REG_BIN_LT: *out = js_bool(v1 < v2); return 1;
         case REG_BIN_LTE: *out = js_bool(v1 <= v2); return 1;
         case REG_BIN_GT: *out = js_bool(v1 > v2); return 1;
@@ -23698,6 +23710,8 @@ static inline __attribute__((always_inline)) int regvm_num_fast(int sub, JSValue
         case REG_BIN_ADD: *out = js_float64(d1 + d2); return 1;
         case REG_BIN_SUB: *out = js_float64(d1 - d2); return 1;
         case REG_BIN_MUL: *out = js_float64(d1 * d2); return 1;
+        case REG_BIN_DIV: *out = js_float64(d1 / d2); return 1;
+        case REG_BIN_MOD: *out = js_float64(fmod(d1, d2)); return 1;
         case REG_BIN_LT: *out = js_bool(d1 < d2); return 1;
         case REG_BIN_LTE: *out = js_bool(d1 <= d2); return 1;
         case REG_BIN_GT: *out = js_bool(d1 > d2); return 1;
