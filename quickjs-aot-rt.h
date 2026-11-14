@@ -200,6 +200,12 @@ JSValue *qjs_aot_arg_buf(JSRegRun *f);
 /* Mirror put_local: set_value(ctx, &vb[slot], js_dup(v)). */
 QJS_AOT_STUB void qjs_aot_put_local(JSContext *ctx, JSValue *vb, int slot, JSValue v);
 
+/* Mirror the get_global handler: its per-instruction site cache, then the cell
+   probe, then JS_GetGlobalVar. 0 = borrowed *out (the site hit; store with
+   AOT_SET_B), 1 = owned *out (store with AOT_SET_P), -1 = exception. */
+QJS_AOT_STUB int qjs_aot_get_global_site(JSContext *ctx, JSRegRun *f, int site,
+                                         int atom, int throwing, JSValue *out);
+
 /* Mirror the get_global cell-cache fast path then JS_GetGlobalVar: 0 on
    success with an owned *out, -1 on exception. */
 QJS_AOT_STUB int qjs_aot_get_global(JSContext *ctx, int atom, int throwing, JSValue *out);
@@ -219,7 +225,8 @@ JSValue qjs_aot_get_var_ref(JSRegRun *f, int slot);
    (store with AOT_SET_P), -1 = exception. */
 int qjs_aot_load_this(JSContext *ctx, JSRegRun *f, JSValue *out);
 
-/* Mirror move_xfer: move d<-s and clear s, honouring the DRC ownership model. */
+/* Mirror move_xfer: move d<-s, honouring the DRC ownership model (the source
+   is cleared only where registers own their values). */
 void qjs_aot_move_xfer(JSContext *ctx, JSValue *fr, int d, int s);
 
 /* Mirror js_regvm_unary (exception-capable): 0 with an owned *out, -1 on
@@ -228,6 +235,15 @@ int qjs_aot_unary(JSContext *ctx, int sub, JSValue a, JSValue *out);
 
 /* Mirror regvm_to_bool: 0/1, or -1 on exception. */
 int qjs_aot_to_bool(JSContext *ctx, JSValue v);
+
+/* Mirror regvm_is_nullish_loose: 1 for null, undefined and the IsHTMLDDA
+   object. */
+int qjs_aot_nullish(JSValue v);
+
+/* Mirror array_const: 0 with an owned *out (a fresh array built from the
+   function's constant-pool template), -1 on exception. */
+QJS_AOT_STUB int qjs_aot_array_const(JSContext *ctx, JSRegRun *f, uint32_t idx,
+                                     JSValue *out);
 
 /* --- AOT typed-region helpers ----------------------------------------------
  *
