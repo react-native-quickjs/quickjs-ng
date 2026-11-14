@@ -1891,6 +1891,7 @@ typedef struct JSFunctionBytecode {
     uint8_t ctor_final_tries;
     uint16_t ctor_proto_slot;
     uint8_t ctor_inst_next;
+    uint32_t ctor_fused_ep; /* aot_pic_epoch when the field names were last checked against the prototype chain (see qjs_aot_new_fused) */
     int byte_code_len;
     /* Runtime-only unified IC storage. It is allocated on first successful fill. */
     JSICEntry *ic_table;
@@ -71433,6 +71434,19 @@ JSValue qjs_aot_new_fused(JSContext *ctx, JSObject *ctor, JSValue *argv, int na,
         !cb->is_derived_class_constructor && !JS_AOT_LAYOUT_CTOR(cb)) {
         pv = ctor->prop[cb->ctor_proto_slot].u.value;
         if (JS_VALUE_GET_TAG(pv) == JS_TAG_OBJECT && sh->proto == JS_VALUE_GET_OBJ(pv)) {
+            /* Each field is stored by the constructor as a property add; building the object from the finished shape is the same
+               only while no object on the prototype chain has a setter, a read-only property or an exotic behaviour for that name.
+               Every such definition moves aot_pic_epoch (also once the watchpoint epoch is saturated), so the check is repeated
+               only after it moved. */
+            if (unlikely(cb->ctor_fused_ep != ctx->rt->aot_pic_epoch)) {
+                for (i = 0; i < nf; i++) {
+                    JSAtom atom;
+                    memcpy(&atom, cb->regvm_code + fm[1 + 2 * i], sizeof(atom));
+                    if (!ic_store_is_plain_add(sh, atom))
+                        return JS_UNINITIALIZED;
+                }
+                cb->ctor_fused_ep = ctx->rt->aot_pic_epoch;
+            }
             { qjs_y_oldcap[cb->inst_inline_cap & 15]++; }
             obj = js_new_plain_object(ctx, js_dup_shape(sh), cb->inst_inline_cap);
             if (unlikely(JS_IsException(obj)))
@@ -71531,6 +71545,7 @@ void qjs_aot_fused_learn(JSContext *ctx, JSObject *ctor, JSValue inst, const uin
     js_fnbc_gc_force_trace(rt, cb);
     cb->ctor_final_shape = js_dup_shape(sh);
     cb->ctor_fused_ok = !cb->is_derived_class_constructor && !JS_AOT_LAYOUT_CTOR(cb);
+    cb->ctor_fused_ep = rt->aot_pic_epoch - 1;
 }
 
 int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out)
