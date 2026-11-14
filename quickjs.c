@@ -4565,7 +4565,7 @@ static int js_blk_cache_on = 1;
 static unsigned long js_dbg_tpl_calls, js_dbg_note[8];
 void qjs_aot_dbg_note(int k) { js_dbg_note[k & 7]++; }
 __attribute__((destructor)) static void js_dbg_tpl_dump(void) { if (getenv("QJS_DEBUG_TPL")) fprintf(stderr, "engine template allocations: %lu; inline declines bsi=%lu empty=%lu limit=%lu shape/cap/proto=%lu hit=%lu; engine new_fused calls=%lu ok=%lu\n", js_dbg_tpl_calls, js_dbg_note[0], js_dbg_note[1], js_dbg_note[2], js_dbg_note[3], js_dbg_note[4], js_dbg_note[5], js_dbg_note[6]); }
-static uint32_t js_drc_minlim = 4096;
+static uint32_t js_drc_minlim = 256;
 static size_t js_drc_slack_min = (size_t)4 << 20;
 static int js_neverfree; /* throw-away measurement knob: a reconcile frees no parked plain object */
 static int js_free_stack_on = 1;
