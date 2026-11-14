@@ -5242,8 +5242,9 @@ static void drc_st_site_dump(void)
 #define DRC_ST(x) ((void)0)
 #endif
 
-/* Set while the runtime is torn down: the final collection scans no native stack (every word on it is stale). */
-static int ss_final;
+/* The runtime being torn down: its final collection scans no native stack (every word on it is stale). Only that runtime: a runtime made
+   after it, or running on another thread meanwhile, still scans its stack. */
+static JSRuntime *ss_final_rt;
 void JS_FreeRuntime(JSRuntime *rt)
 {
 #ifdef QJS_DRC_STATS
@@ -5359,7 +5360,7 @@ void JS_FreeRuntime(JSRuntime *rt)
     js_gc_promote_all_code(rt);
 
     /* Nothing is live on the machine stack any more: a stale word in a frame slot must not pin an object (and its cycle) through the collection below. */
-    ss_final = 1;
+    ss_final_rt = rt;
     JS_RunGC(rt);
 
 #if QJS_DRC
@@ -5651,6 +5652,7 @@ void JS_FreeRuntime(JSRuntime *rt)
 
     js_arena_free_all(rt);
 
+    ss_final_rt = NULL;
     {
         JSMallocState *ms = &rt->malloc_state;
         rt->mf.js_free(ms->opaque, rt);
@@ -12652,7 +12654,7 @@ static void js_drc_pin(JSRuntime *rt)
     js_drc_pend_flush(rt);
     regvm_for_each_root_range(rt, js_drc_pin_range, NULL);
     { static int envss = -1; if (envss < 0) envss = getenv("QJS_STACKSCAN") != NULL; ss_on = ((qjs_aot_form_v & 1) || envss) ? 1 : (y_interp_on && __atomic_load_n(&y_rt, __ATOMIC_ACQUIRE) == rt) ? 2 : 0; }
-    if (ss_on && !ss_final) ss_scan(rt); else if (__atomic_load_n(&y_rt, __ATOMIC_ACQUIRE) == rt) ss_n = 0;
+    if (ss_on && ss_final_rt != rt) ss_scan(rt); else if (__atomic_load_n(&y_rt, __ATOMIC_ACQUIRE) == rt) ss_n = 0;
 }
 
 static void js_drc_unpin_range(void *opaque, JSValue *regs, uint32_t nregs)
