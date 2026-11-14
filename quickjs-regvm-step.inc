@@ -4081,7 +4081,6 @@ static uint8_t *REGVM_CC regvm_s_ROP_move_xfer(uint8_t *ip, JSValue *fr, JSRegRu
                   if (d != s) {
 #if QJS_DRC
                       regs[d] = regs[s];
-                      regs[s] = JS_UNDEFINED;
 #else
                       set_value(ctx, &regs[d], regs[s]);
                       regs[s] = JS_UNDEFINED;
