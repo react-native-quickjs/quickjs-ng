@@ -4121,6 +4121,32 @@ static uint8_t *REGVM_CC regvm_s_ROP_post_dec(uint8_t *ip, JSValue *fr, JSRegRun
     return NULL;
 }
 
+static uint8_t *REGVM_CC regvm_s_ROP_array_const(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+{
+    JSFunctionBytecode *b = rf->b;
+    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
+    JSRegPIC *pic = rf->pic;
+    uint8_t *rpc = ip;
+    int op = *rpc++;
+    JSValue ret_val = JS_UNDEFINED;
+    JSValue *regs = fr;
+    JSValue *arg_buf = rf->arg_buf;
+    int argc = rf->argc;
+    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ {
+                int d = RD_REG();
+                uint32_t idx = RD_U32();
+                ret_val = regvm_array_from_const(ctx, b->cpool[idx]);
+                if (JS_IsException(ret_val))
+                    goto exception;
+                SET_REG_P(d, ret_val);
+                REGVM_NEXT();
+            }
+ exception:
+    rf->ret = JS_EXCEPTION;
+    return NULL;
+}
+
 static uint8_t *REGVM_CC regvm_s_ROP_mul_add(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
 {
     JSFunctionBytecode *b = rf->b;
@@ -6585,6 +6611,7 @@ static const regvm_handler regvm_step_table[ROP_COUNT] = {
     [ROP_mul_add] = regvm_s_ROP_mul_add,
     [ROP_post_inc] = regvm_s_ROP_post_inc,
     [ROP_post_dec] = regvm_s_ROP_post_dec,
+    [ROP_array_const] = regvm_s_ROP_array_const,
     [ROP_mul_sub] = regvm_s_ROP_mul_sub,
     [ROP_add_mul] = regvm_s_ROP_add_mul,
     [ROP_sub_mul] = regvm_s_ROP_sub_mul,
@@ -6829,6 +6856,7 @@ static const uint8_t regvm_step_covered[ROP_COUNT] = {
     [ROP_mul_add] = 1,
     [ROP_post_inc] = 1,
     [ROP_post_dec] = 1,
+    [ROP_array_const] = 1,
     [ROP_mul_sub] = 1,
     [ROP_add_mul] = 1,
     [ROP_sub_mul] = 1,
