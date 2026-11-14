@@ -50833,6 +50833,70 @@ static int json_parse_key_string(JSParseState *s, const uint8_t **pp)
     return json_parse_string(s, pp);
 }
 
+/* A JSON number in [p, end) (already validated) as the correctly rounded double, when that takes one exact operation: at most 19
+   significant digits making an integer w <= 2^53, and a decimal exponent e with |e| <= 22, so w and 10^|e| are exact doubles and
+   w * 10^e or w / 10^-e is rounded once (Clinger's fast path). Returns false for anything else, which strtod handles. */
+static bool json_fast_double(const uint8_t *p, const uint8_t *end, double *out)
+{
+    static const double pow10[23] = {
+        1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11,
+        1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+    };
+    bool neg = false, eneg = false;
+    uint64_t w = 0;
+    int nd = 0, e = 0, ex = 0;
+    double d;
+
+    if (*p == '-') {
+        neg = true;
+        p++;
+    }
+    while (p < end && is_digit(*p)) {
+        if (w != 0 || *p != '0') {
+            if (++nd > 19)
+                return false;
+            w = w * 10 + (uint64_t)(*p - '0');
+        }
+        p++;
+    }
+    if (p < end && *p == '.') {
+        p++;
+        while (p < end && is_digit(*p)) {
+            if (w != 0 || *p != '0') {
+                if (++nd > 19)
+                    return false;
+                w = w * 10 + (uint64_t)(*p - '0');
+            }
+            e--;
+            p++;
+        }
+    }
+    if (p < end && (*p == 'e' || *p == 'E')) {
+        p++;
+        if (*p == '+' || *p == '-')
+            eneg = *p++ == '-';
+        while (p < end && is_digit(*p)) {
+            if (ex > 1000)
+                return false;
+            ex = ex * 10 + (*p - '0');
+            p++;
+        }
+        e += eneg ? -ex : ex;
+    }
+    if (p != end || w > ((uint64_t)1 << 53))
+        return false;
+    if (w == 0) {
+        *out = neg ? -0.0 : 0.0;
+        return true;
+    }
+    if (e < -22 || e > 22)
+        return false;
+    d = (double)w;
+    d = e < 0 ? d / pow10[-e] : d * pow10[e];
+    *out = neg ? -d : d;
+    return true;
+}
+
 static int json_parse_number(JSParseState *s, const uint8_t **pp)
 {
     const uint8_t *p = *pp;
@@ -50896,7 +50960,8 @@ static int json_parse_number(JSParseState *s, const uint8_t **pp)
         }
     } else {
         double d;
-        d = strtod((const char *)p_start, NULL);
+        if (!json_fast_double(p_start, p, &d))
+            d = strtod((const char *)p_start, NULL);
         s->token.u.num.val = js_float64(d);
     }
     *pp = p;
