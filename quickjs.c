@@ -27218,6 +27218,50 @@ static const JSValue regvm_undefined_value = { { .int32 = 0 }, JS_TAG_UNDEFINED 
  * "rrrb" (8 bytes) and `ROP_call_method` is "rrrrb" (10), so the resume
  * address is `ip + 8` or `ip + 10`.
  */
+#if QJS_AOT
+/* A call whose callee has a compiled body. Binding keeps such a callee off the
+   light paths, so without this the call took `JS_CallInternal`, then
+   `js_regvm_execute`, then the compiled entry: several times the cost of the
+   interpreter's own call. The compiled body runs on a light frame laid after
+   this one, as a compiled caller's call does, and returns its value here. A
+   callee that cannot be entered that way, or a nearly exhausted C stack, takes
+   the slow call, which raises the proper error. */
+static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_aot(REGVM_ARGS)
+{
+    int d = T_REG(1), c = T_REG(3), ab = T_REG(5), na = T_U8(7);
+    JSValue rv;
+    int r;
+
+    REGVM_CAPTURE_IP();
+    if (unlikely(js_check_stack_overflow(ctx->rt, 0)))
+        __attribute__((musttail)) return regvm_t_call_slow(REGVM_PASS);
+    r = qjs_aot_call_light(ctx, f, na, FR(c), JS_UNDEFINED, FRP(ab), &rv);
+    if (r == 0)
+        __attribute__((musttail)) return regvm_t_call_slow(REGVM_PASS);
+    if (r < 0)
+        T_FAIL();
+    T_SET_NEXT_P(d, rv, 8);
+}
+
+static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_aot(REGVM_ARGS)
+{
+    int d = T_REG(1), c = T_REG(3), t = T_REG(5), ab = T_REG(7);
+    int na = T_U8(9);
+    JSValue rv;
+    int r;
+
+    REGVM_CAPTURE_IP();
+    if (unlikely(js_check_stack_overflow(ctx->rt, 0)))
+        __attribute__((musttail)) return regvm_t_call_method_slow(REGVM_PASS);
+    r = qjs_aot_call_light(ctx, f, na, FR(c), FR(t), FRP(ab), &rv);
+    if (r == 0)
+        __attribute__((musttail)) return regvm_t_call_method_slow(REGVM_PASS);
+    if (r < 0)
+        T_FAIL();
+    T_SET_NEXT_P(d, rv, 10);
+}
+#endif
+
 static uint8_t *REGVM_CC regvm_t_call(REGVM_ARGS)
 {
     int c = T_REG(3);
@@ -27256,6 +27300,10 @@ static uint8_t *REGVM_CC regvm_t_call(REGVM_ARGS)
                                                 realm);
                 }
             }
+#if QJS_AOT
+            if (cb->aot_fn != NULL && cb->aot_light)
+                __attribute__((musttail)) return regvm_t_call_aot(REGVM_PASS);
+#endif
             /* A light callee's header carries `ret_ip`, which locates the
                caller. Record, lazy and slow calls can fail before a callee
                header exists, so they keep the explicit capture. */
@@ -27307,6 +27355,11 @@ static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS)
                                                 realm);
                 }
             }
+#if QJS_AOT
+            if (cb->aot_fn != NULL && cb->aot_light)
+                __attribute__((musttail))
+                    return regvm_t_call_method_aot(REGVM_PASS);
+#endif
             /* see `regvm_t_call`; non-light paths keep the capture */
             REGVM_CAPTURE_IP();
             if (likely(regvm_record_eligible(cb)))
@@ -60101,7 +60154,7 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->off_fnbc_aot_poly_sites =
         (uint32_t)offsetof(JSFunctionBytecode, aot_poly_sites);
     out->aot_poly_ways = AOT_POLY_WAYS;
-    out->off_object_array_count = (uint32_t)offsetof(JSObject, u.array.u1.size);
+    out->off_object_array_count = (uint32_t)offsetof(JSObject, u.array.count);
     out->off_object_array_values = (uint32_t)offsetof(JSObject, u.array.u.values);
     out->class_array = JS_CLASS_ARRAY;
     out->off_fnbc_aot_fn = (uint32_t)offsetof(JSFunctionBytecode, aot_fn);
@@ -60120,6 +60173,22 @@ void js_aot_gen_layout(JSAotGenLayout *out)
             if (q[i] != 0) {
                 out->off_object_flags_byte = (uint32_t)i;
                 out->object_is_prototype_mask = q[i];
+                break;
+            }
+        }
+    }
+    {
+        /* `holey` likewise. */
+        JSObject o;
+        const uint8_t *q = (const uint8_t *)&o;
+        size_t i;
+
+        memset(&o, 0, sizeof(o));
+        o.holey = 1;
+        for (i = 0; i < sizeof(o); i++) {
+            if (q[i] != 0) {
+                out->off_object_holey_byte = (uint32_t)i;
+                out->object_holey_mask = q[i];
                 break;
             }
         }

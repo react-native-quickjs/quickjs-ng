@@ -98,6 +98,10 @@ typedef struct JSAotGenLayout {
     /* The per-site polymorphic property cache: where the bytecode's allocation
        is, the stride between sites, and the ways per site. */
     uint32_t off_fnbc_aot_poly, off_fnbc_aot_poly_sites, aot_poly_ways;
+    /* The byte and mask of `holey`: an inline array access refuses a holey
+       array, as the engine's own fast store does, since filling a hole has
+       bookkeeping the inline path does not do. */
+    uint32_t off_object_holey_byte, object_holey_mask;
 } JSAotGenLayout;
 
 /* Fold every field after `hash` (the hash field itself is excluded). Shared by
