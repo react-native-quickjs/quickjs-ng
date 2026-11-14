@@ -50,6 +50,10 @@ typedef struct JSAotGenFunc {
     int cpool_count;
     const double *cpool_num;
     const uint8_t *cpool_numeric;
+    /* For every constant-pool entry, the text of a short plain string (8-bit characters 1..127, at most 15 bytes) and
+       "" for every other entry, so the generator can tell `typeof x === "number"` from any other comparison. Entry i
+       is `cpool_str[i]`, NUL terminated; an empty string and an entry that is not a short plain string both read "". */
+    const char (*cpool_str)[16];
     /* For every constant-pool entry that is a function, that function's digest (all zero for any
        other entry), so the generator can follow a `make_closure` to the function it creates. */
     const uint8_t (*cpool_fn)[16];

@@ -72823,6 +72823,31 @@ int js_aot_gen_collect(JSRuntime *rt, JSAotGenFunc **pout)
                         js_free_rt(rt, mark);
                     }
                 }
+                /* The short plain strings of the pool; a failed allocation leaves the table absent. */
+                if (b->cpool_count > 0 && b->cpool != NULL) {
+                    char (*strs)[16] = js_mallocz_rt(rt, 16 * (size_t)b->cpool_count);
+                    if (strs) {
+                        int ci;
+                        for (ci = 0; ci < b->cpool_count; ci++) {
+                            JSValue cv = b->cpool[ci];
+                            if (JS_VALUE_GET_TAG(cv) == JS_TAG_STRING) {
+                                JSString *sp = JS_VALUE_GET_STRING(cv);
+                                if (!sp->is_wide_char && sp->len <= 15) {
+                                    const uint8_t *sc = (const uint8_t *)strv(sp);
+                                    uint32_t k;
+                                    for (k = 0; k < sp->len; k++)
+                                        if (sc[k] == 0 || sc[k] > 127)
+                                            break;
+                                    if (k == sp->len) {
+                                        memcpy(strs[ci], sc, sp->len);
+                                        strs[ci][sp->len] = 0;
+                                    }
+                                }
+                            }
+                        }
+                        g->cpool_str = (const char (*)[16])strs;
+                    }
+                }
                 /* The digest of every function in the pool, whether or not it has numbers. */
                 if (b->cpool_count > 0 && b->cpool != NULL) {
                     uint8_t (*fns)[16] = js_mallocz_rt(rt, 16 * (size_t)b->cpool_count);
@@ -72896,6 +72921,7 @@ void js_aot_gen_free(JSRuntime *rt, JSAotGenFunc *arr, int n)
         for (i = 0; i < n; i++) {
             js_free_rt(rt, (void *)arr[i].cpool_num);
             js_free_rt(rt, (void *)arr[i].cpool_numeric);
+            js_free_rt(rt, (void *)arr[i].cpool_str);
             js_free_rt(rt, (void *)arr[i].cpool_fn);
             js_free_rt(rt, (void *)arr[i].closure_type);
             js_free_rt(rt, (void *)arr[i].closure_idx);
