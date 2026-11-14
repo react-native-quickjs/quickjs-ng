@@ -346,6 +346,10 @@ int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out);
 int qjs_aot_object_template(JSContext *ctx, JSRegRun *f, int index, JSValue *out);
 int qjs_aot_special_object(JSContext *ctx, JSRegRun *f, int kind, JSValue *out);
 int qjs_aot_array_from(JSContext *ctx, JSValue *argv, int na, JSValue *out);
+/* Fills an object literal's properties from `n` registers (`object_fill`): the
+   template's shape when the object still has it, else property definitions. The
+   registers are left undefined, as the handler leaves them. 0, or -1 on an exception. */
+int qjs_aot_object_fill(JSContext *ctx, JSRegRun *f, JSValue obj, JSValue *vals, int n, int ti);
 /* `f.apply(this, arguments)`: with the builtin `apply` and this frame's arguments not
    reified, calls the callee with the frame's own arguments. 1 with an owned *out when
    it did; 0 when the case needs the handler (not the builtin, or the arguments
