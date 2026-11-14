@@ -1432,10 +1432,13 @@ struct JSContext {
 #endif
 
     /* What RegExp.prototype and RegExp looked like when they were built: the
-       shapes and the functions of the properties the pristine fast paths
-       would otherwise look up (see js_regexp_fast). */
-    JSShape *re_proto_shape;
-    JSShape *re_ctor_shape;
+       functions of the properties the pristine fast paths would otherwise look
+       up, the slot and name of each, and the prototype's own prototype (see
+       js_regexp_fast). No shape is kept: a shape of an object that was built
+       by adding properties one at a time is not hashed, and an unhashed shape
+       must have exactly one owner. */
+    JSObject *re_proto_parent;
+    JSAtom re_snap_atom[JS_RE_SNAP_N];
     JSValue re_snap[JS_RE_SNAP_N];
     uint16_t re_snap_idx[JS_RE_SNAP_N];
     uint8_t re_snap_getter[JS_RE_SNAP_N];
@@ -6182,10 +6185,6 @@ static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
 
     if (ctx->regexp_result_shape)
         mark_func(rt, &ctx->regexp_result_shape->header);
-    if (ctx->re_proto_shape)
-        mark_func(rt, &ctx->re_proto_shape->header);
-    if (ctx->re_ctor_shape)
-        mark_func(rt, &ctx->re_ctor_shape->header);
     for (i = 0; i < ctx->re_snap_n; i++)
         JS_MarkValue(rt, ctx->re_snap[i], mark_func);
     if (ctx->re_snap_n)
@@ -6273,10 +6272,10 @@ void JS_FreeContext(JSContext *ctx)
     js_free_shape_null(ctx->rt, ctx->mapped_arguments_shape);
     js_free_shape_null(ctx->rt, ctx->regexp_shape);
     js_free_shape_null(ctx->rt, ctx->regexp_result_shape);
-    js_free_shape_null(ctx->rt, ctx->re_proto_shape);
-    js_free_shape_null(ctx->rt, ctx->re_ctor_shape);
-    for (i = 0; i < ctx->re_snap_n; i++)
+    for (i = 0; i < ctx->re_snap_n; i++) {
         JS_FreeValue(ctx, ctx->re_snap[i]);
+        JS_FreeAtomRT(ctx->rt, ctx->re_snap_atom[i]);
+    }
     if (ctx->re_snap_n)
         JS_FreeValue(ctx, ctx->re_species);
     if (ctx->re_req) {
@@ -102390,11 +102389,11 @@ static void js_regexp_snapshot(JSContext *ctx)
         ctx->re_snap_idx[i] = (uint16_t)idx[i];
         ctx->re_snap_getter[i] = (uint8_t)getter[i];
         ctx->re_snap[i] = js_dup(js_regexp_snap_value(proto, idx[i], getter[i]));
+        ctx->re_snap_atom[i] = JS_DupAtom(ctx, atoms[i]);
     }
     ctx->re_species_idx = sidx;
     ctx->re_species = js_dup(js_regexp_snap_value(ctor, sidx, 1));
-    ctx->re_proto_shape = js_dup_shape(proto->shape);
-    ctx->re_ctor_shape = js_dup_shape(ctor->shape);
+    ctx->re_proto_parent = proto->shape->proto;
     ctx->re_snap_n = n;
 fail:
     for (i = 0; i < (int)countof(js_re_snap_names); i++)
@@ -102413,10 +102412,18 @@ static bool js_regexp_proto_pristine(JSContext *ctx)
     JSObject *proto = JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_REGEXP]);
     int i;
 
-    if (proto->shape != ctx->re_proto_shape)
+    JSShapeProperty *sp = get_shape_prop(proto->shape);
+
+    if (proto->shape->proto != ctx->re_proto_parent)
         return false;
     for (i = 0; i < ctx->re_snap_n; i++) {
         JSProperty *pr = &proto->prop[ctx->re_snap_idx[i]];
+        /* the slot still holds the property it held: same name, and a
+           getter or a plain data property as before */
+        if (ctx->re_snap_idx[i] >= proto->shape->prop_count ||
+            sp[ctx->re_snap_idx[i]].atom != ctx->re_snap_atom[i] ||
+            ((sp[ctx->re_snap_idx[i]].flags & JS_PROP_TMASK) == JS_PROP_GETSET) != (ctx->re_snap_getter[i] != 0))
+            return false;
         if (ctx->re_snap_getter[i]) {
             if ((void *)pr->u.getset.getter != JS_VALUE_GET_PTR(ctx->re_snap[i]))
                 return false;
@@ -102434,7 +102441,11 @@ static bool js_regexp_ctor_pristine(JSContext *ctx)
     JSObject *ctor = JS_VALUE_GET_OBJ(ctx->regexp_ctor);
     JSProperty *pr;
 
-    if (ctor->shape != ctx->re_ctor_shape)
+    JSShapeProperty *sp = get_shape_prop(ctor->shape);
+
+    if (ctx->re_species_idx >= ctor->shape->prop_count ||
+        sp[ctx->re_species_idx].atom != JS_ATOM_Symbol_species ||
+        (sp[ctx->re_species_idx].flags & JS_PROP_TMASK) != JS_PROP_GETSET)
         return false;
     pr = &ctor->prop[ctx->re_species_idx];
     return (void *)pr->u.getset.getter == JS_VALUE_GET_PTR(ctx->re_species);
