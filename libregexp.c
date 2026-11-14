@@ -3909,7 +3909,7 @@ static bool lre_op_target(const uint8_t *code, size_t pos, int *ptarget)
     }
 }
 
-int lre_analyze(const uint8_t *bc_buf, size_t bc_buf_len, LRERequired *out)
+int lre_analyze2(const uint8_t *bc_buf, size_t bc_buf_len, LRERequired *out)
 {
     int32_t cover[LRE_ANALYZE_MAX_CODE + 2];
     int32_t maxw[LRE_ANALYZE_MAX_CODE + 2];
@@ -3917,6 +3917,7 @@ int lre_analyze(const uint8_t *bc_buf, size_t bc_buf_len, LRERequired *out)
     size_t code_len, pos, len, entry = 11;
     int best_pos = -1, best_len = 0, run_pos = -1, run_len = 0;
     uint16_t run[LRE_REQ_MAX];
+    uint32_t run_ci = 0;
     int unit, flags, c, i;
 
     memset(out, 0, sizeof(*out));
@@ -3938,8 +3939,24 @@ int lre_analyze(const uint8_t *bc_buf, size_t bc_buf_len, LRERequired *out)
         return 0;
     unit = (flags & (LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)) ? 2 : 1;
     out->entry = (uint32_t)entry;
-    if (code_len >= entry + 3 && code[entry + 2] == REOP_line_start)
+    if (code_len >= entry + 3 && code[entry + 2] == REOP_line_start) {
         out->anchored = 1;
+        /* the exact characters that must follow the ^ */
+        pos = entry + 3;
+        while (pos < code_len && out->alen < LRE_REQ_MAX) {
+            uint8_t op = code[pos];
+            if (!re_checked_op_len(code + pos, code_len - pos, &len))
+                break;
+            if (op == REOP_save_start || op == REOP_save_end) {
+                pos += len;
+                continue;
+            }
+            if (op != REOP_char || get_u16(code + pos + 1) > 0xff)
+                break;
+            out->apre[out->alen++] = (uint8_t)get_u16(code + pos + 1);
+            pos += len;
+        }
+    }
 
     /* cover[p] > 0: a jump passes over the instruction boundary p, so the
        instruction at p is not executed by every path */
@@ -3968,6 +3985,30 @@ int lre_analyze(const uint8_t *bc_buf, size_t bc_buf_len, LRERequired *out)
         uint8_t op = code[pos];
         if (!re_checked_op_len(code + pos, code_len - pos, &len))
             return 0;
+        /* an ASCII letter under /i outside Unicode mode matches exactly the
+           two cases of itself */
+        if (op == REOP_char_i && !cover[pos] && get_u16(code + pos + 1) < 128 &&
+            !(((get_u16(code + pos + 1) | 0x20) >= 'a') &&
+              ((get_u16(code + pos + 1) | 0x20) <= 'z'))) {
+            /* ASCII digits and punctuation have no other case */
+            c = get_u16(code + pos + 1);
+            if (run_len == 0)
+                run_pos = (int)pos;
+            if (run_len < LRE_REQ_MAX)
+                run[run_len++] = (uint16_t)c;
+            continue;
+        }
+        if (op == REOP_char_i && !cover[pos] && unit == 1 &&
+            (((c = get_u16(code + pos + 1)) | 0x20) >= 'a') &&
+            ((c | 0x20) <= 'z') && c < 128) {
+            if (run_len == 0)
+                run_pos = (int)pos;
+            if (run_len < LRE_REQ_MAX) {
+                run_ci |= (uint32_t)1 << run_len;
+                run[run_len++] = (uint16_t)(c | 0x20);
+            }
+            continue;
+        }
         if ((op == REOP_char || op == REOP_char32) && !cover[pos]) {
             c = op == REOP_char ? get_u16(code + pos + 1) :
                 (int)get_u32(code + pos + 1);
@@ -3987,18 +4028,52 @@ int lre_analyze(const uint8_t *bc_buf, size_t bc_buf_len, LRERequired *out)
         if (run_len > best_len) {
             best_len = run_len;
             best_pos = run_pos;
+            out->ci = run_ci;
             memcpy(out->lit, run, sizeof(run[0]) * run_len);
         }
         run_len = 0;
+        run_ci = 0;
     }
     if (run_len > best_len) {
         best_len = run_len;
         best_pos = run_pos;
+        out->ci = run_ci;
         memcpy(out->lit, run, sizeof(run[0]) * run_len);
     }
     if (best_len == 0)
         return out->anchored;
     out->len = best_len;
+    /* the unit least likely to occur in text, to search for first */
+    {
+        int best_score = 1 << 30;
+        for (i = 0; i < best_len; i++) {
+            int u = out->lit[i], score;
+            if (u >= 128)
+                score = 0;
+            else if (u >= 'A' && u <= 'Z')
+                score = 1;
+            else if (u >= '0' && u <= '9')
+                score = 2;
+            else if (u == ' ')
+                score = 12;
+            else if (u == 'e' || u == 't' || u == 'a' || u == 'o' || u == 'i' ||
+                     u == 'n' || u == 's' || u == 'r')
+                score = 10;
+            else if (u >= 'a' && u <= 'z')
+                score = 7;
+            else if (u == ',' || u == '.' || u == '"' || u == '\'' ||
+                     u == '(' || u == ')' || u == '=' || u == '/')
+                score = 6;
+            else
+                score = 3;
+            if ((out->ci >> i) & 1)
+                score += 1;
+            if (score < best_score) {
+                best_score = score;
+                out->rare = i;
+            }
+        }
+    }
 
     /* the farthest the match start can lie before the literal, in code units */
     for (i = 0; i <= (int)code_len; i++)

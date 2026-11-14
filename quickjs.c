@@ -101912,7 +101912,7 @@ js_regexp_exec_data_init(JSRegExpExecData *d, JSRegExp *re, int capture_count)
     }
 }
 
-/* The analysis of 're' (see lre_analyze), kept per context by bytecode
+/* The analysis of 're' (see lre_analyze2), kept per context by bytecode
    string. Never NULL once the table exists; r.len == 0 and !r.anchored mean
    there is nothing to use. */
 static const JSReReq *js_regexp_req(JSContext *ctx, JSRegExp *re)
@@ -101936,7 +101936,7 @@ static const JSReReq *js_regexp_req(JSContext *ctx, JSRegExp *re)
     JS_DupValue(ctx, JS_MKPTR(JS_TAG_STRING, bc));
     if (!bc->is_wide_char) {
         int i;
-        lre_analyze(str8(bc), bc->len, &e->r);
+        lre_analyze2(str8(bc), bc->len, &e->r);
         e->lit8_ok = true;
         for (i = 0; i < e->r.len; i++) {
             if (e->r.lit[i] > 0xff)
@@ -101947,41 +101947,97 @@ static const JSReReq *js_regexp_req(JSContext *ctx, JSRegExp *re)
     return e;
 }
 
-/* Index of the first occurrence of the literal in str[from..], or -1 */
+/* Whether the literal occurs at 'at' of a subject of 8-bit or 16-bit units */
+static inline bool js_regexp_lit_at(const JSReReq *e, JSString *str, int at)
+{
+    int m = e->r.len, k;
+
+    if (!str->is_wide_char) {
+        const uint8_t *s = str8(str) + at;
+        for (k = 0; k < m; k++) {
+            unsigned u = s[k];
+            if ((e->r.ci >> k) & 1)
+                u |= 0x20;
+            if (u != e->r.lit[k])
+                return false;
+        }
+    } else {
+        const uint16_t *s = str16(str) + at;
+        for (k = 0; k < m; k++) {
+            unsigned u = s[k];
+            if ((e->r.ci >> k) & 1)
+                u |= 0x20;
+            if (u != e->r.lit[k])
+                return false;
+        }
+    }
+    return true;
+}
+
+/* Index of the first occurrence of the literal in str[from..], or -1. The
+   search runs on the literal's rarest unit, then checks the whole literal
+   around it. */
 static int js_regexp_find_literal(const JSReReq *e, JSString *str, int from)
 {
-    int m = e->r.len, n = str->len, i;
+    int m = e->r.len, n = str->len, r = e->r.rare, i;
+    bool ci = (e->r.ci >> r) & 1;
+    unsigned u = e->r.lit[r];
 
     if (n - from < m)
         return -1;
     if (!str->is_wide_char) {
-        const uint8_t *s = str8(str), *p;
-        const uint8_t *end = s + n - m + 1;
+        const uint8_t *s = str8(str), *p, *end;
         if (!e->lit8_ok)
             return -1;
-        p = s + from;
+        p = s + from + r;
+        end = s + n - m + 1 + r;
         while (p < end) {
-            p = memchr(p, e->lit8[0], end - p);
-            if (!p)
-                return -1;
-            if (memcmp(p, e->lit8, m) == 0)
-                return (int)(p - s);
+            if (ci) {
+                while (p < end && (unsigned)(*p | 0x20) != u)
+                    p++;
+                if (p >= end)
+                    return -1;
+            } else {
+                p = memchr(p, (int)u, end - p);
+                if (!p)
+                    return -1;
+            }
+            if (js_regexp_lit_at(e, str, (int)(p - s) - r))
+                return (int)(p - s) - r;
             p++;
         }
         return -1;
     } else {
         const uint16_t *s = str16(str);
         for (i = from; i + m <= n; i++) {
-            int k;
-            if (s[i] != e->r.lit[0])
-                continue;
-            for (k = 1; k < m && s[i + k] == e->r.lit[k]; k++)
-                ;
-            if (k == m)
+            unsigned c = s[i + r];
+            if (ci)
+                c |= 0x20;
+            if (c == u && js_regexp_lit_at(e, str, i))
                 return i;
         }
         return -1;
     }
+}
+
+/* What the analysis proves about 're' on 'str' from 'start_index': returns
+   false if there can be no match, else moves *pstart to the earliest index a
+   match can start at. */
+static bool js_regexp_req_start(const JSReReq *e, JSString *str, int *pstart)
+{
+    int at;
+
+    if (!e || !e->r.len)
+        return true;
+    at = js_regexp_find_literal(e, str, *pstart);
+    if (at < 0)
+        return false;
+    if (e->r.prefix_max >= 0) {
+        int lo = at - e->r.prefix_max - 1;
+        if (lo > *pstart)
+            *pstart = lo;
+    }
+    return true;
 }
 
 /* The scanning matcher, entered after what the analysis proves: a pattern
@@ -101994,24 +102050,28 @@ static int js_regexp_match_generic(JSContext *ctx, uint8_t **capture,
 {
     const JSReReq *e = js_regexp_req(ctx, re);
 
-    if (e && (e->r.anchored || e->r.len)) {
-        if (e->r.anchored) {
-            if (start_index != 0)
-                return 0;
-            return lre_exec_at(capture, d->bytecode, e->r.entry, str8(str), 0,
-                               str->len, str->is_wide_char, ctx);
+    if (e && e->r.anchored) {
+        int k;
+        if (start_index != 0)
+            return 0;
+        if (str->len < e->r.alen)
+            return 0;
+        if (!str->is_wide_char) {
+            const uint8_t *s = str8(str);
+            for (k = 0; k < e->r.alen; k++)
+                if (s[k] != e->r.apre[k])
+                    return 0;
+        } else {
+            const uint16_t *s = str16(str);
+            for (k = 0; k < e->r.alen; k++)
+                if (s[k] != e->r.apre[k])
+                    return 0;
         }
-        {
-            int at = js_regexp_find_literal(e, str, start_index);
-            if (at < 0)
-                return 0;
-            if (e->r.prefix_max >= 0) {
-                int lo = at - e->r.prefix_max - 1;
-                if (lo > start_index)
-                    start_index = lo;
-            }
-        }
+        return lre_exec_at(capture, d->bytecode, e->r.entry, str8(str), 0,
+                           str->len, str->is_wide_char, ctx);
     }
+    if (!js_regexp_req_start(e, str, &start_index))
+        return 0;
     return lre_exec(capture, d->bytecode, str8(str), start_index,
                     str->len, str->is_wide_char, ctx);
 }
@@ -102030,6 +102090,8 @@ js_regexp_match_raw(JSContext *ctx, uint8_t **capture, const JSRegExpExecData *d
         return js_regexp_match_prefix(ctx, capture, d->bytecode, d->metadata,
                                       str, start_index);
     case JS_REGEXP_MATCH_FIRST_SET:
+        if (!js_regexp_req_start(js_regexp_req(ctx, re), str, &start_index))
+            return 0;
         return js_regexp_match_first_set(ctx, capture, d->bytecode,
                                          d->metadata, str, start_index);
     case JS_REGEXP_MATCH_GENERIC:
