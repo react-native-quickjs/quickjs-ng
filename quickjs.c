@@ -63097,6 +63097,7 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->off_rt_ic_epoch = (uint32_t)offsetof(JSRuntime, ic_watchpoint_epoch);
     out->off_rt_lazy_json = (uint32_t)offsetof(JSRuntime, lazy_json_seen);
     out->off_rt_shape_free_epoch = (uint32_t)offsetof(JSRuntime, shape_free_epoch);
+    out->off_fnbc_regvm_len = (uint32_t)offsetof(JSFunctionBytecode, regvm_len);
     {
         /* The object's flag bits and its inline slot capacity share one 16-bit word:
            find where it is and which bits each field takes by setting them in a
