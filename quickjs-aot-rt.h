@@ -464,7 +464,10 @@ enum {
     QJS_AOT_INTR_SQRT, QJS_AOT_INTR_ABS, QJS_AOT_INTR_FLOOR, QJS_AOT_INTR_CEIL,
     QJS_AOT_INTR_ROUND, QJS_AOT_INTR_SIN, QJS_AOT_INTR_COS, QJS_AOT_INTR_MIN,
     QJS_AOT_INTR_MAX, QJS_AOT_INTR_PARSEINT, QJS_AOT_INTR_STR_CHARCODEAT,
-    QJS_AOT_INTR_STR_CODEPOINTAT, QJS_AOT_INTR_STR_CHARAT, QJS_AOT_INTR_COUNT
+    QJS_AOT_INTR_STR_CODEPOINTAT, QJS_AOT_INTR_STR_CHARAT, QJS_AOT_INTR_COUNT,
+    /* Not an inline-lowered builtin (no row in the generator's table, outside the unit's pointer table): `Function.prototype.apply`, whose pointer a region compares with to tell the
+       builtin from a replaced `apply`. */
+    QJS_AOT_INTR_X_FUNC_APPLY = QJS_AOT_INTR_COUNT
 };
 void *qjs_aot_intrinsic_fn(int id);
 

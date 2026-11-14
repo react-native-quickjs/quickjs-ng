@@ -95270,6 +95270,7 @@ void *qjs_aot_intrinsic_fn(int id)
     case QJS_AOT_INTR_STR_CHARCODEAT: return (void *)js_string_charCodeAt;
     case QJS_AOT_INTR_STR_CODEPOINTAT: return (void *)js_string_codePointAt;
     case QJS_AOT_INTR_STR_CHARAT: return (void *)js_string_charAt;
+    case QJS_AOT_INTR_X_FUNC_APPLY: return (void *)js_function_apply;
     }
     return NULL;
 }
