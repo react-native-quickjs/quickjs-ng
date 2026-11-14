@@ -99,7 +99,7 @@ uint8_t *lre_compile(int *plen, char *error_msg, int error_msg_size,
                      const char *buf, size_t buf_len, int re_flags,
                      void *opaque);
 int lre_get_alloc_count(const uint8_t *bc_buf);
-int lre_check_bytecode(const uint8_t *bc_buf, int bc_buf_len);
+int lre_check_bytecode(const uint8_t *bc_buf, int bc_buf_len, void *opaque);
 int lre_get_capture_count(const uint8_t *bc_buf);
 int lre_get_flags(const uint8_t *bc_buf);
 int lre_is_raw_atom(const char *buf, size_t len, int re_flags);

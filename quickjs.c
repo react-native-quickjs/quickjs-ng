@@ -42917,7 +42917,7 @@ static JSValue JS_ReadRegExp(BCReaderState *s)
     }
 
     if (bc->is_wide_char ||
-        lre_check_bytecode(str8(bc), bc->len) != 0) {
+        lre_check_bytecode(str8(bc), bc->len, ctx) != 0) {
         js_free_string(ctx->rt, pattern);
         js_free_string(ctx->rt, bc);
         return JS_ThrowInternalError(ctx, "bad regexp bytecode");
@@ -52751,8 +52751,8 @@ static int js_regexp_match_prefix(JSContext *ctx, uint8_t **capture,
     return 0;
 }
 
-static int js_regexp_first_set_scan8(const uint8_t *bitmap, const uint8_t *s,
-                                     int from, int len);
+static int js_regexp_first_set_scan8(JSContext *ctx, const uint8_t *bitmap,
+                                     const uint8_t *s, int from, int len);
 
 #if defined(__aarch64__) && defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -52766,38 +52766,44 @@ static int js_regexp_first_set_scan8(const uint8_t *bitmap, const uint8_t *s,
    bytes per iteration with a table-gather (vqtbl2q): idx = byte>>3 selects one
    of the 32 bitmap bytes, then (gathered >> (byte&7)) & 1 is the membership.
    Behaves identically to the scalar bitmap test. */
-static int js_regexp_first_set_scan8(const uint8_t *bitmap, const uint8_t *s,
-                                     int from, int len)
+static int js_regexp_first_set_scan8(JSContext *ctx, const uint8_t *bitmap,
+                                     const uint8_t *s, int from, int len)
 {
-    int i = from;
-#if JS_REGEXP_FIRST_SET_SIMD
-    uint8x16x2_t tbl;
-    uint8x16_t ones = vdupq_n_u8(1);
-    uint8x16_t seven = vdupq_n_u8(7);
+    int i = from, chunk_end;
 
-    tbl.val[0] = vld1q_u8(bitmap);
-    tbl.val[1] = vld1q_u8(bitmap + 16);
-    for (; i + 16 <= len; i += 16) {
-        uint8x16_t v = vld1q_u8(s + i);
-        uint8x16_t gathered = vqtbl2q_u8(tbl, vshrq_n_u8(v, 3));
-        uint8x16_t mask = vshlq_u8(ones,
-                              vreinterpretq_s8_u8(vandq_u8(v, seven)));
-        uint8x16_t hit = vtstq_u8(gathered, mask);
-        if (vmaxvq_u8(hit)) {
-            uint8_t lanes[16];
-            int j;
-            vst1q_u8(lanes, hit);
-            for (j = 0; j < 16; j++) {
-                if (lanes[j])
-                    return i + j;
+    while (i < len) {
+        chunk_end = i + min_int(len - i, JS_REGEXP_SCAN_CHUNK_SIZE);
+#if JS_REGEXP_FIRST_SET_SIMD
+        uint8x16x2_t tbl;
+        uint8x16_t ones = vdupq_n_u8(1);
+        uint8x16_t seven = vdupq_n_u8(7);
+
+        tbl.val[0] = vld1q_u8(bitmap);
+        tbl.val[1] = vld1q_u8(bitmap + 16);
+        for (; i + 16 <= chunk_end; i += 16) {
+            uint8x16_t v = vld1q_u8(s + i);
+            uint8x16_t gathered = vqtbl2q_u8(tbl, vshrq_n_u8(v, 3));
+            uint8x16_t mask = vshlq_u8(ones,
+                                  vreinterpretq_s8_u8(vandq_u8(v, seven)));
+            uint8x16_t hit = vtstq_u8(gathered, mask);
+            if (vmaxvq_u8(hit)) {
+                uint8_t lanes[16];
+                int j;
+                vst1q_u8(lanes, hit);
+                for (j = 0; j < 16; j++) {
+                    if (lanes[j])
+                        return i + j;
+                }
             }
         }
-    }
 #endif
-    for (; i < len; i++) {
-        uint8_t c = s[i];
-        if ((bitmap[c >> 3] >> (c & 7)) & 1)
-            return i;
+        for (; i < chunk_end; i++) {
+            uint8_t c = s[i];
+            if ((bitmap[c >> 3] >> (c & 7)) & 1)
+                return i;
+        }
+        if (i < len && lre_check_timeout(ctx))
+            return LRE_RET_TIMEOUT;
     }
     return len;
 }
@@ -52821,7 +52827,9 @@ static int js_regexp_match_first_set(JSContext *ctx, uint8_t **capture,
         const uint8_t *s = str8(str);
         candidate = start_index;
         while (candidate < len) {
-            candidate = js_regexp_first_set_scan8(bitmap, s, candidate, len);
+            candidate = js_regexp_first_set_scan8(ctx, bitmap, s, candidate, len);
+            if (candidate == LRE_RET_TIMEOUT)
+                return LRE_RET_TIMEOUT;
             if (candidate >= len)
                 break;
             ret = lre_exec_at(capture, re_bytecode, entry, s, candidate,
