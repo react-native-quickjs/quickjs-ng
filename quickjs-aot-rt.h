@@ -43,13 +43,20 @@ typedef struct JSRegRun JSRegRun;
    missing from the backtrace of an error a callee creates. `pc` is the bytecode offset
    of the call in progress. `roots` and `nroots` publish the argument window of the call in
    progress as a root range, because the function has no register file the collector
-   scans. Records live on the C stack and are linked innermost-first. */
+   scans. Records live on the C stack and are linked innermost-first.
+
+   Bodies inlined into such a function share its record. One of them at a time is in the middle
+   of a call to a compiled function that has its own record: `ifunc`, when set, is that body's
+   function (borrowed: the caller's window keeps it alive for the call) and `ipc` the bytecode
+   offset of the call. It is reported as a frame between the callee's and the record's own. */
 typedef struct JSAotFlRec {
     struct JSAotFlRec *prev;
     JSObject *func;
     uint32_t pc;
     uint32_t nroots;
     JSValue *roots;
+    JSObject *ifunc;
+    uint32_t ipc;
 } JSAotFlRec;
 
 typedef struct JSAotGenLayout {
