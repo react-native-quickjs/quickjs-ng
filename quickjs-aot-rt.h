@@ -102,6 +102,21 @@ typedef struct JSAotGenLayout {
        array, as the engine's own fast store does, since filling a hole has
        bookkeeping the inline path does not do. */
     uint32_t off_object_holey_byte, object_holey_mask;
+    /* The rest of the light-frame header a generated native entry writes, so
+       it can build the frame the engine's own light call builds. The header is
+       the frame's first `light_prefix_slots` words; `off_regrun_fr` is where
+       the register file starts, and `off_regrun_hdr_pack` is the one 64-bit
+       store that sets the destination, the argument count and the flag word
+       together. */
+    uint32_t off_regrun_ret_ip, off_regrun_fr, off_regrun_var_refs;
+    uint32_t off_regrun_hdr_pack, off_regrun_cap_ip;
+    uint32_t off_fnbc_realm;
+    uint32_t off_rt_regvm_cur, off_rt_stack_limit;
+    uint32_t off_object_func_var_refs;
+    uint32_t light_prefix_slots;
+    /* The frame flags a generated native entry composes, from REGVM_FLAG_*. */
+    uint32_t regvm_flag_light, regvm_flag_c_entry, regvm_flag_stack;
+    uint32_t regvm_flag_trivial_ret, regvm_flag_same_realm;
 } JSAotGenLayout;
 
 /* Fold every field after `hash` (the hash field itself is excluded). Shared by
@@ -194,6 +209,17 @@ JSValue qjs_aot_ret(JSRegRun *f);
 QJS_AOT_STUB JSValue qjs_aot_return(JSValue *fr, int off);
 QJS_AOT_STUB JSValue qjs_aot_unwind(JSContext *ctx, JSRegRun *f, JSValue *fr,
                        uint32_t pc, uint32_t *resume_pc);
+/* Raise the arena top over this activation's frame, so frames its callees
+   allocate land above it. Idempotent and monotonic. */
+QJS_AOT_STUB void qjs_aot_seal(JSContext *ctx, JSRegRun *f);
+/* Throw the interpreter's stack-overflow RangeError, so a native entry that
+   finds the C stack nearly exhausted fails the way a deep interpreter call
+   does. Always returns JS_EXCEPTION. */
+QJS_AOT_STUB JSValue qjs_aot_throw_stack_overflow(JSContext *ctx);
+/* Release the counted values of a native frame's variable area, for a callee
+   that has one. The frame itself is the caller's stack buffer, so this is the
+   whole teardown. */
+QJS_AOT_STUB void qjs_aot_light_release(JSContext *ctx, JSRegRun *f);
 
 /* --- AOT fast-path helpers ------------------------------------------------
  *
@@ -405,6 +431,14 @@ QJS_AOT_STUB int qjs_aot_call_b(JSContext *ctx, int na, JSValue callee, JSValue 
 int qjs_aot_call_light(JSContext *ctx, JSRegRun *caller_f, int na,
                         JSValue callee, JSValue this_obj, JSValue *argv,
                         JSValue *out);
+
+/* Make sure the callee's property-cache table exists before a native entry
+   publishes its frame. The engine's own light call does this; a native entry
+   that builds the frame itself must too, because the callee's inline handlers
+   read `pic` with no NULL test. Allocating here is a safepoint, which is why it
+   happens before the frame is published rather than inside the callee.
+   Returns 0, or -1 with an out-of-memory exception thrown. */
+QJS_AOT_STUB int qjs_aot_pic_ensure(JSContext *ctx, JSObject *co);
 
 /* A compiled call to a compiled leaf: same contract, but the callee's frame is
    the caller's stack buffer, so no arena traffic. `frame_bytes` must be at

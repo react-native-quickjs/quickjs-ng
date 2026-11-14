@@ -55,6 +55,14 @@ typedef struct JSAotGenFunc {
        eligible. */
     int light_ok;
     int light_need;
+    /* How many variable slots a light frame fills and releases: the highest
+       slot the promotion map leaves in the variable area, plus one, which the
+       engine holds as `regvm_var_count`. It is not `var_count` when promotion
+       moved slots into registers, and `light_need` bakes it in without saying
+       which of the two it used, so the generator cannot recover it. A native
+       entry needs it to size the variable area and to release exactly what the
+       engine would. */
+    int light_var_count;
     char name[128];
     char file[256];
     int line, col;             /* the definition's source position, or 0 */
