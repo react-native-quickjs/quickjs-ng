@@ -22,14 +22,18 @@ typedef struct JSRegRun JSRegRun;
 #define QJS_AOT_STUB
 #endif
 
-/* QJS_DRC changes the ownership rule for a register store, so it is part of
-   the ABI: a unit built with a different -DQJS_DRC is refused at bind. */
+/* QJS_DRC changes the ownership rule for a register store, and the NaN-boxing
+   choice changes the width and encoding of a JSValue, so both are part of the
+   ABI: a unit built with a different one is refused at bind. */
 #ifndef QJS_DRC
 #define QJS_DRC 1
 #endif
+#ifndef QJS_NAN_BOXING64
+#define QJS_NAN_BOXING64 0
+#endif
 
 #ifndef QJS_AOT_ABI
-#define QJS_AOT_ABI (4u | ((uint32_t)QJS_DRC << 8))
+#define QJS_AOT_ABI (5u | ((uint32_t)QJS_DRC << 8) | ((uint32_t)QJS_NAN_BOXING64 << 9))
 #endif
 
 /* The engine's object layouts the generated code reads at constant offsets.
@@ -302,6 +306,16 @@ typedef struct JSAotEntry {
     JSAotNFn nfn;        /* the native entry, or NULL: a caller enters here without a frame */
     uint32_t flags;
     uint32_t code_crc;   /* IRVERIFY: hash of the register program */
+    /* The register file the unit compiled this body for: at least the program's
+       `regvm_reg_count`, and WIDER when the generator allocated registers above
+       the program's own (a virtual object's argument window, a hoisted global
+       read). Those registers hold counted values too, so a collector scanning
+       only `regvm_reg_count` would miss them. The count is published here rather
+       than by raising `regvm_reg_count`, because that field also POSITIONS
+       `var_refs` and the handshake slots in the interpreter's flat frame layout.
+       0 for a function emitted before this field existed: the engine then falls
+       back to the program's own count. */
+    uint32_t reg_count;
 } JSAotEntry;
 
 /* The unit's table and size, referenced weakly by the engine; qjs_aot_count
