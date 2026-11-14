@@ -164,11 +164,24 @@ typedef struct JSRegRCC JSRegRCC;
 #define QJS_DRC_VALIDATE 0
 #endif
 
+/* QJS_GC_STRESS (a debug build option; nothing of it is compiled otherwise) forces collections where a missed root shows at once: a reconcile
+   (with its young collection) every QJS_DRC_STRESS_EVERY-th allocation (default 61), before every pending job, and at every interrupt poll
+   (each back edge and call when QJS_GC_STRESS_POLL is set; every JS_INTERRUPT_COUNTER_INIT-th otherwise). Allocation sites are never
+   pretenured, and QJS_Y_CHECK is on with an unrecorded young root fatal. The two poll settings catch different misses: run both. */
+#if defined(QJS_GC_STRESS) && !defined(QJS_DRC_STRESS_ALLOC)
+#define QJS_DRC_STRESS_ALLOC 1
+#endif
 #if QJS_DRC
 static void js_drc_reconcile(JSRuntime *rt);
 #ifdef QJS_DRC_STRESS_ALLOC
 /* A reconcile at every QJS_DRC_STRESS_EVERY-th allocation (default every one): the validation mode of the conservative stack roots. */
+#ifdef QJS_GC_STRESS
+/* Not every allocation: a cell collected at the next allocation is still in a live register and is promoted at once, so it never reaches a
+   suspended frame or a store young, where a missed root is. */
+static uint32_t js_drc_stress_every = 61;
+#else
 static uint32_t js_drc_stress_every = 1;
+#endif
 static uint32_t js_drc_stress_ctr;
 __attribute__((constructor)) static void js_drc_stress_init(void)
 {
@@ -176,6 +189,14 @@ __attribute__((constructor)) static void js_drc_stress_init(void)
     if (js_drc_stress_every == 0) js_drc_stress_every = 1;
 }
 #define JS_DRC_STRESS_POINT(rt_) do { if (!(rt_)->drc_in_reconcile && (rt_)->gc_phase == JS_GC_PHASE_NONE && ++js_drc_stress_ctr >= js_drc_stress_every) { js_drc_stress_ctr = 0; js_drc_reconcile(rt_); } } while (0)
+#endif
+#ifdef QJS_GC_STRESS
+#define JS_GC_STRESS_FORCE(rt_) do { if (!(rt_)->drc_in_reconcile && (rt_)->gc_phase == JS_GC_PHASE_NONE) js_drc_reconcile(rt_); } while (0)
+static int js_gc_stress_poll;
+__attribute__((constructor)) static void js_gc_stress_init(void)
+{
+    js_gc_stress_poll = getenv("QJS_GC_STRESS_POLL") != NULL;
+}
 #endif
 #if QJS_DRC
 static void js_closcyc_resolve(JSRuntime *rt);
@@ -4417,6 +4438,10 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
         return NULL;
 #endif
 
+#ifdef QJS_GC_STRESS
+    /* Each runtime starts at the same phase of the allocation count, so a failure reproduces from its own script alone. */
+    js_drc_stress_ctr = 0;
+#endif
     memset(&ms, 0, sizeof(ms));
     ms.opaque = opaque;
     ms.malloc_limit = 0;
@@ -4697,6 +4722,11 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
         return 0;
     }
 
+#ifdef QJS_GC_STRESS
+    /* Between jobs every coroutine is parked, and the native stack is shallow: no stale copy of a parked frame's registers is
+       scanned, so a cell the frame holds only through a register stays young unless the suspend path noted it. */
+    JS_GC_STRESS_FORCE(rt);
+#endif
     /* get the first pending job and execute it */
     e = list_entry(rt->job_list.next, JSJobEntry, link);
     list_del(&e->link);
@@ -5099,6 +5129,11 @@ static void y_site_eval(void) {
         YSite *s = &qjs_ysite[q];
         uint8_t was;
         if (!s->made && !s->surv) continue;
+#ifdef QJS_GC_STRESS
+        /* Forced collections make every site look long-lived; a pretenured site would keep its cells out of the nursery the stress is for. */
+        s->made = s->surv = 0;
+        continue;
+#endif
         s->am += s->made; s->as += s->surv; s->made = s->surv = 0;
         if (s->am < 256) continue;
         was = s->pre;
@@ -12724,6 +12759,9 @@ static void y_collect(JSRuntime *rt)
     y_rt = rt;
     y_cnt[0]++;
     for (kb = 0; kb < 16; kb++) { YCls *k = &qjs_ycls[kb]; if (k->cur) { k->cur->bump = k->bump; y_abytes += (uint64_t)(k->bump - k->run0) / k->stride; } }
+#ifdef QJS_GC_STRESS
+    if (y_check_on < 0) y_check_on = 1;
+#endif
     if (y_check_on < 0) y_check_on = getenv("QJS_Y_CHECK") != NULL;
     if (y_stk_cap < y_roots_n + 64) { y_stk_cap = y_roots_n + 4096; y_stk = __builtin_realloc(y_stk, (size_t)y_stk_cap * sizeof(void *)); }
     for (i = 0; i < y_roots_n; i++) {
@@ -12755,6 +12793,10 @@ static void y_collect(JSRuntime *rt)
                         }
                         fprintf(stderr, "  holders found: %d\n", nh);
                     }
+#ifdef QJS_GC_STRESS
+                    fprintf(stderr, "QJS_GC_STRESS: a young cell with references is not a root of the young collection\n");
+                    abort();
+#endif
                 }
             }
         }
@@ -15586,6 +15628,11 @@ static no_inline __exception int __js_poll_interrupts(JSContext *ctx)
 {
     JSRuntime *rt = ctx->rt;
     ctx->interrupt_counter = JS_INTERRUPT_COUNTER_INIT;
+#ifdef QJS_GC_STRESS
+    if (js_gc_stress_poll)
+        ctx->interrupt_counter = 1;
+    JS_GC_STRESS_FORCE(rt);
+#endif
     js_drc_safepoint(rt);
     if (rt->interrupt_handler) {
         if (rt->interrupt_handler(rt, rt->interrupt_opaque)) {
