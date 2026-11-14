@@ -3373,6 +3373,22 @@ static void *js_arena_malloc(JSRuntime *rt, size_t size)
     }
 }
 
+/* An arena just lost its last used block.
+   Keep a bounded number of empty arenas: a batch of deferred frees
+   empties whole arenas and the allocations that follow need them
+   back. An empty arena stays on its class's free list;
+   js_arena_trim releases them after a full collection. */
+static no_inline void js_arena_empty(JSRuntime *rt, JSArena *ar)
+{
+    if (rt->arena_state.n_empty < JS_ARENA_EMPTY_MAX) {
+        rt->arena_state.n_empty++;
+    } else {
+        list_del(&ar->link);
+        list_del(&ar->free_link);
+        rt->mf.js_free(rt->malloc_state.opaque, ar);
+    }
+}
+
 static void js_arena_free(JSRuntime *rt, void *ptr)
 {
     JSMallocBlockHeader *b;
@@ -3400,19 +3416,8 @@ static void js_arena_free(JSRuntime *rt, void *ptr)
             list_add(&ar->free_link,
                      &rt->arena_state.free_arena_list[block_size_idx]);
         ar->n_used_blocks--;
-        if (unlikely(ar->n_used_blocks == 0)) {
-            /* Keep a bounded number of empty arenas: a batch of deferred frees
-               empties whole arenas and the allocations that follow need them
-               back. An empty arena stays on its class's free list;
-               js_arena_trim releases them after a full collection. */
-            if (rt->arena_state.n_empty < JS_ARENA_EMPTY_MAX) {
-                rt->arena_state.n_empty++;
-            } else {
-                list_del(&ar->link);
-                list_del(&ar->free_link);
-                rt->mf.js_free(rt->malloc_state.opaque, ar);
-            }
-        }
+        if (unlikely(ar->n_used_blocks == 0))
+            js_arena_empty(rt, ar);
     }
 }
 
@@ -3636,6 +3641,36 @@ void js_free_rt(JSRuntime *rt, void *ptr)
         return;
 
     s = &rt->malloc_state;
+    if (likely(!JS_ARENA_LARGE_BLOCKS_ONLY)) {
+        /* An arena block: its size class is in the header, so the accounted
+           size, the arena and the free-list push come from one header read
+           (js_arena_usable_size and js_arena_free each re-derive them). */
+        JSMallocBlockHeader *b = container_of(ptr, JSMallocBlockHeader, user_data);
+        unsigned int block_idx = b->u.block_idx;
+        if (likely(block_idx != JS_ARENA_FREE_NIL)) {
+            unsigned int block_size_idx = b->block_size_idx;
+            unsigned int block_size = arena_block_sizes[block_size_idx];
+            size_t sz = block_size - sizeof(JSMallocBlockHeader) + MALLOC_OVERHEAD;
+            JSArena *ar;
+            if (unlikely(sz > s->malloc_size)) {
+                printf("js_free_rt: malloc_size underflow: freeing %zu but only %zu tracked\n", sz, s->malloc_size);
+                abort();
+            }
+            s->malloc_count--;
+            s->malloc_size -= sz;
+            ar = (JSArena *)((uint8_t *)b - (size_t)block_size * block_idx -
+                             sizeof(JSArena));
+            b->u.free_next = ar->first_free_block;
+            ar->first_free_block = block_idx;
+            if (unlikely(ar->n_used_blocks == ar->n_blocks))
+                list_add(&ar->free_link,
+                         &rt->arena_state.free_arena_list[block_size_idx]);
+            ar->n_used_blocks--;
+            if (unlikely(ar->n_used_blocks == 0))
+                js_arena_empty(rt, ar);
+            return;
+        }
+    }
     size_t free_size = js_arena_usable_size(rt, ptr) + MALLOC_OVERHEAD;
     if (unlikely(free_size > s->malloc_size)) {
         printf("js_free_rt: malloc_size underflow: freeing %zu but only %zu tracked\n", free_size, s->malloc_size);
@@ -10653,6 +10688,42 @@ static void free_object(JSRuntime *rt, JSObject *p)
     }
 }
 
+/* free_object for the commonest garbage: a plain object (JS_CLASS_OBJECT, which
+   has no finalizer and no exotic behaviour) without weak references, freed from
+   free_zero_refcount, where gc_phase is DECREF. Nothing outside this call sees
+   the object once it returns, so the free_mark and fail-safe stores, the
+   finalizer lookup and the REMOVE_CYCLES test of free_object are skipped; every
+   other step runs in the same order. */
+static inline __attribute__((always_inline)) void
+free_plain_object(JSRuntime *rt, JSObject *p)
+{
+    int i;
+    JSShape *sh;
+    JSShapeProperty *pr;
+
+    assert(p->class_id == JS_CLASS_OBJECT && !p->first_weak_ref);
+    assert(rt->class_array[JS_CLASS_OBJECT].finalizer == NULL);
+    assert(rt->gc_phase == JS_GC_PHASE_DECREF);
+    sh = p->shape;
+    pr = get_shape_prop(sh);
+    for(i = 0; i < sh->prop_count; i++) {
+        if (likely(!(pr->flags & JS_PROP_TMASK))) {
+            JSValue v = p->prop[i].u.value;
+            if (JS_VALUE_HAS_REF_COUNT(v) &&
+                --JS_REF_COUNT(JS_VALUE_GET_PTR(v)) <= 0)
+                js_free_value_rt(rt, v);
+        } else {
+            free_property(rt, &p->prop[i], pr->flags);
+        }
+        pr++;
+    }
+    if (p->prop_inline_cap == 0)
+        js_free_rt(rt, p->prop);
+    js_free_shape(rt, sh);
+    remove_gc_object(&p->header);
+    js_free_rt(rt, p);
+}
+
 static void free_gc_object(JSRuntime *rt, JSGCObjectHeader *gp)
 {
     switch(JS_GC_TYPE(gp)) {
@@ -10679,7 +10750,12 @@ static void free_zero_refcount(JSRuntime *rt)
             break;
         p = list_entry(el, JSGCObjectHeader, link);
         assert(JS_REF_COUNT(p) == 0);
-        free_gc_object(rt, p);
+        if (likely(JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_JS_OBJECT &&
+                   ((JSObject *)p)->class_id == JS_CLASS_OBJECT &&
+                   ((JSObject *)p)->first_weak_ref == NULL))
+            free_plain_object(rt, (JSObject *)p);
+        else
+            free_gc_object(rt, p);
     }
     rt->gc_phase = JS_GC_PHASE_NONE;
 }
