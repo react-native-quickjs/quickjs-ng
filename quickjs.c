@@ -80958,6 +80958,7 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
     int n = ir->insns ? ir->n_insns : 0, nreg = reg_count > 0 ? reg_count : 1;
     int *blk = NULL, *ph = NULL, *pn = NULL, *pb = NULL, *queue = NULL;
     int *bs = NULL, *be = NULL, *sx = NULL, *sxn = NULL;
+    int *bl = NULL, *boff = NULL;
     uint8_t *blkin = NULL, *blkout = NULL, *inq = NULL, *tmp = NULL;
     uint8_t *ex_entry = NULL;
     uint8_t *blkin_i = NULL, *blkout_i = NULL, *init_i = NULL;
@@ -80965,7 +80966,7 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
     uint8_t *has_def = NULL, *entry_i = NULL, *init_set = NULL;
     uint8_t *undef_set = NULL;
     int init_all = 0;
-    int i, b, k, e, ne = 0, sp = 0, ok = 0;
+    int i, j, b, k, e, ne = 0, sp = 0, ok = 0;
     /* Owned by the IR once the analysis completes; js_regvm_encode frees it. */
     ir->own_init = NULL;
     ir->own_undef = NULL;
@@ -80982,6 +80983,8 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
     queue = js_malloc(ctx, (size_t)n_blocks * sizeof(int));
     bs = js_malloc(ctx, (size_t)n_blocks * sizeof(int));
     be = js_malloc(ctx, (size_t)n_blocks * sizeof(int));
+    bl = js_malloc(ctx, (size_t)n * sizeof(int));
+    boff = js_malloc(ctx, (size_t)(n_blocks + 1) * sizeof(int));
     blkin = js_malloc(ctx, (size_t)n_blocks * nreg);
     blkout = js_malloc(ctx, (size_t)n_blocks * nreg);
     inq = js_malloc(ctx, (size_t)n_blocks);
@@ -80997,7 +81000,7 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
     entry_i = js_malloc(ctx, nreg);
     init_set = js_malloc(ctx, nreg);
     undef_set = js_malloc(ctx, nreg);
-    if (!blk || !ph || !pn || !pb || !queue || !bs || !be ||
+    if (!blk || !ph || !pn || !pb || !queue || !bs || !be || !bl || !boff ||
         !blkin || !blkout || !inq || !tmp || !sx || !sxn || !ex_entry ||
         !blkin_i || !blkout_i || !init_i || !has_def || !entry_i ||
         !weak ||
@@ -81072,13 +81075,24 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
             bs[b] = i;
         be[b] = i + 1;
     }
+    /* Each block's instructions in ascending IR order, `bl[boff[b]..boff[b+1])`:
+       the appended islands put a block's members far apart, so a walk of its
+       `bs..be` range would pass over other blocks' instructions. */
+    memset(boff, 0, (size_t)(n_blocks + 1) * sizeof(int));
+    for (i = 0; i < n; i++)
+        boff[blk[i] + 1]++;
+    for (b = 0; b < n_blocks; b++)
+        boff[b + 1] += boff[b];
+    for (i = 0; i < n; i++)
+        bl[boff[blk[i]]++] = i;
+    for (b = n_blocks; b > 0; b--)
+        boff[b] = boff[b - 1];
+    boff[0] = 0;
     /* A block whose IR indices are not contiguous contains an appended island,
        so its straight-line transfer is not its execution order; it keeps the
        joining update, which only costs precision. */
-    for (b = 0; b < n_blocks; b++) {
-        for (i = bs[b]; bs[b] >= 0 && i < be[b]; i++)
-            if (blk[i] != b) { weak[b] = 1; break; }
-    }
+    for (b = 0; b < n_blocks; b++)
+        weak[b] = bs[b] >= 0 && be[b] - bs[b] != boff[b + 1] - boff[b];
     /* Successors, re-derived from the final IR: the fusion passes add branch
        islands the CFG never named, and a branch to its own block is not in
        `succ`. Over-approximating is sound; a missing edge is not. */
@@ -81091,10 +81105,9 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
         }
     }
     for (b = 0; b < n_blocks; b++) {
-        for (i = bs[b]; bs[b] >= 0 && i < be[b]; i++) {
+        for (j = boff[b]; j < boff[b + 1]; j++) {
             int ti, tgt = -1, pc;
-            if (blk[i] != b)
-                continue;
+            i = bl[j];
             ti = ir->ri[ir->insns[i].rop].tidx;
             if (ti < 0)
                 continue;
@@ -81211,9 +81224,8 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
            */
         memcpy(tmp, in, nreg);
         memcpy(init_i, in_i, nreg);
-        for (i = bs[b]; i >= 0 && i < be[b]; i++) {
-            if (blk[i] != b)
-                continue;
+        for (j = boff[b]; j < boff[b + 1]; j++) {
+            i = bl[j];
             regvm_own_step(&ir->insns[i], tmp, ireg, n_values, reg_count,
                            cycle_reg, weak[b]);
             regvm_own_init_step(&ir->insns[i], init_i, ireg, n_values, reg_count,
@@ -81283,11 +81295,9 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
                 continue;
             memcpy(st, blkin + (size_t)b * nreg, nreg);
             memcpy(init_st, blkin_i + (size_t)b * nreg, nreg);
-            for (i = bs[b]; i < be[b]; i++) {
-                JSRegInsn *in = &ir->insns[i];
+            for (j = boff[b]; j < boff[b + 1]; j++) {
+                JSRegInsn *in = &ir->insns[bl[j]];
                 uint16_t rop = in->rop;
-                if (blk[i] != b)
-                    continue;
                 /* An operand read: a register that may be UNINIT here must be
                    filled at entry. */
                 {
@@ -81361,6 +81371,8 @@ done:
     js_free(ctx, queue);
     js_free(ctx, bs);
     js_free(ctx, be);
+    js_free(ctx, bl);
+    js_free(ctx, boff);
     js_free(ctx, blkin);
     js_free(ctx, blkout);
     js_free(ctx, inq);
