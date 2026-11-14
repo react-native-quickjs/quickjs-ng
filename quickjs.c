@@ -69333,6 +69333,59 @@ QJS_AOT_STUB int qjs_aot_array_const(JSContext *ctx, JSRegRun *f, uint32_t idx,
     return 0;
 }
 
+/* The three forms below are for the code of an INLINED CALLEE (a copy): the copy has the callee's bytecode `b`
+   (bound from the closure its guard proved) and no frame of its own to give the helpers above, whose `f` is the
+   root's. Same operations, from `b`'s pool and without the in-place append (that needs the frame). */
+int qjs_aot_load_const_b(JSContext *ctx, JSFunctionBytecode *b, int kind, uint32_t idx,
+                         JSValue *out)
+{
+    *out = kind == REG_CONST_CPOOL ? js_dup(b->cpool[idx]) : JS_AtomToValue(ctx, idx);
+    return JS_IsException(*out) ? -1 : 0;
+}
+
+int qjs_aot_array_const_b(JSContext *ctx, JSFunctionBytecode *b, uint32_t idx, JSValue *out)
+{
+    *out = regvm_array_from_const(ctx, b->cpool[idx]);
+    return JS_IsException(*out) ? -1 : 0;
+}
+
+/* `a <sub> b` for a copy: only the cases that run no user code and cannot throw but for out of memory (numbers,
+   a short string with a string or an int). 1 with an owned *out, 0 when it is anything else (the copy then leaves
+   at the instruction, before any effect), -1 on out of memory. */
+int qjs_aot_binary_pure(JSContext *ctx, int sub, JSValue a, JSValue b, JSValue *out)
+{
+    int ta = JS_VALUE_GET_TAG(a), tb = JS_VALUE_GET_TAG(b);
+
+    if (regvm_num_fast(sub, a, b, out))
+        return 1;
+    /* numbers and the primitives that convert without running code */
+    if (sub != REG_BIN_INSTANCEOF && sub != REG_BIN_IN && sub != REG_BIN_PRIVATE_IN &&
+        ((uint32_t)ta <= JS_TAG_UNDEFINED || ta == JS_TAG_FLOAT64)) {
+        if ((uint32_t)tb <= JS_TAG_UNDEFINED || tb == JS_TAG_FLOAT64)
+            return js_regvm_binary(ctx, sub, a, b, out) ? -1 : 1;
+    }
+    if (sub == REG_BIN_ADD)
+        return js_concat_short(ctx, a, b, out);
+    return 0;
+}
+
+/* The same with the right operand from the callee's pool (`kind` REG_CONST_CPOOL) or an atom. */
+int qjs_aot_binary_cpool_pure(JSContext *ctx, JSFunctionBytecode *b, int sub, uint32_t idx,
+                              int kind, JSValue a, JSValue *out)
+{
+    JSValue cst;
+    int r;
+
+    if (kind == REG_CONST_CPOOL)
+        return qjs_aot_binary_pure(ctx, sub, a, b->cpool[idx], out);
+    cst = JS_AtomToValue(ctx, (JSAtom)idx);
+    if (JS_IsException(cst))
+        return -1;
+    r = qjs_aot_binary_pure(ctx, sub, a, cst, out);
+    JS_FreeValue(ctx, cst);
+    return r;
+}
+
 QJS_AOT_STUB void qjs_aot_put_local(JSContext *ctx, JSValue *vb, int slot, JSValue v)
 {
     set_value(ctx, &vb[slot], js_dup(v));

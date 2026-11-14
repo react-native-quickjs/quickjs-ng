@@ -612,6 +612,14 @@ int qjs_aot_global_watch(JSContext *ctx, JSValue obj, int atom);
 /* `load_const` of the constant pool (kind 0) or an atom (kind 1): 0 with an OWNED *out,
    -1 on an exception. */
 int qjs_aot_load_const(JSContext *ctx, JSRegRun *f, int kind, uint32_t idx, JSValue *out);
+/* The same, array_const and the pure binary forms with the bytecode of an inlined callee instead of the root's frame
+   (see quickjs.c). The binary forms return 1 with an owned *out, 0 when the operands are not a case that runs no user
+   code (the copy leaves at the instruction), -1 on out of memory. */
+int qjs_aot_load_const_b(JSContext *ctx, struct JSFunctionBytecode *b, int kind, uint32_t idx, JSValue *out);
+int qjs_aot_array_const_b(JSContext *ctx, struct JSFunctionBytecode *b, uint32_t idx, JSValue *out);
+int qjs_aot_binary_pure(JSContext *ctx, int sub, JSValue a, JSValue b, JSValue *out);
+int qjs_aot_binary_cpool_pure(JSContext *ctx, struct JSFunctionBytecode *b, int sub, uint32_t idx, int kind,
+                              JSValue a, JSValue *out);
 
 /* Fills an object literal's properties from `n` registers (`object_fill`): the
    template's shape when the object still has it, else property definitions. The
