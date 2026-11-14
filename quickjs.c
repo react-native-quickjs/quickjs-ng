@@ -10944,6 +10944,20 @@ static void free_zero_refcount(JSRuntime *rt)
         if (el == &rt->gc_zero_ref_count_list)
             break;
         p = list_entry(el, JSGCObjectHeader, link);
+#if QJS_DRC
+        if (JS_REF_COUNT(p) > 0) {
+            /* A parked object that a register (or a job) took a reference on again: it is not garbage. A drain started
+               from inside the reconcile (freeing a symbol runs its weak-reference records, which free values) meets such
+               objects before the reconcile's own pass has put them back. */
+            list_del(&p->link);
+            JS_GC_IN_ZCT(p) = 0;
+            if (JS_GC_NOTRACE(p))
+                list_add_tail(&p->link, &rt->gc_notrace_list);
+            else
+                list_add_tail(&p->link, &rt->gc_obj_list);
+            continue;
+        }
+#endif
         assert(JS_REF_COUNT(p) == 0);
         if (likely(JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_JS_OBJECT &&
                    ((JSObject *)p)->class_id == JS_CLASS_OBJECT &&
