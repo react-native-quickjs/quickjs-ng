@@ -98,7 +98,7 @@ typedef struct JSAotGenLayout {
        baked in, so a unit cannot disagree with its bytecode. */
     uint32_t off_fnbc_pic_count;
     uint32_t off_regpic_shape, off_regpic_slot_off, off_regpic_kind;
-    uint32_t reg_pic_own, reg_pic_proto, reg_ic_none, tag_lazy_json;
+    uint32_t reg_pic_own, reg_pic_proto, reg_ic_none;
     /* The binary sub-operations the inline arithmetic path names, from
        JSRegBinaryOp. */
     uint32_t reg_bin_add, reg_bin_sub, reg_bin_mul, reg_bin_div, reg_bin_mod;
@@ -218,7 +218,7 @@ typedef struct JSAotGenLayout {
        kind, the runtime's epoch, and the object's flag word (where it is, the
        extensible bit, the bits that forbid the replay, and the inline slot
        capacity's mask and shift). */
-    uint32_t off_regpic_misses, reg_pic_add_w, off_rt_ic_epoch, off_rt_lazy_json, off_rt_shape_free_epoch, off_fnbc_regvm_len;
+    uint32_t off_regpic_misses, reg_pic_add_w, off_rt_ic_epoch, off_rt_shape_free_epoch, off_fnbc_regvm_len;
     uint32_t off_object_flags16, object_extensible_mask, object_noadd_mask;
     uint32_t object_inline_cap_mask, object_inline_cap_shift;
     /* A rope whose linearised form is memoised holds the flat string on the left and the

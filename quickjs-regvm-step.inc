@@ -2376,11 +2376,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_element(uint8_t *ip, JSValue *fr, JSReg
 #ifdef QJS_REGVM_COUNT
                         js_regvm_elem[0]++;
 #endif
-                        if (unlikely(js_lazy_marker_is(JS_ARR_VALS(p)[idx])))
-                            val = js_lazy_materialize_slot(ctx,
-                                    &JS_ARR_VALS(p)[idx], p);
-                        else
-                            val = js_dup(JS_ARR_VALS(p)[idx]);
+                        val = js_dup(JS_ARR_VALS(p)[idx]);
                     } else if (js_get_fast_array_element(ctx, p, idx, &val)) {
                         /* the remaining fast classes: arguments, mapped
                            arguments and the typed arrays */
