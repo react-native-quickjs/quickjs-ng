@@ -1357,6 +1357,7 @@ typedef struct JSReReq {
     LRERequired r;
     bool lit8_ok;          /* every unit of r.lit fits in 8 bits */
     uint8_t lit8[LRE_REQ_MAX];
+    const LreAotEntry *aot; /* the matcher this program carries for the bytecode, or NULL */
 } JSReReq;
 
 struct JSContext {
@@ -69718,6 +69719,8 @@ static void aot_dump_shapes(FILE *f, JSRuntime *rt, JSContext *ctx)
     }
 }
 
+static void re_st_prof_dump(FILE *f);
+
 void js_aot_prof_dump(JSRuntime *rt)
 {
     int pass;
@@ -69733,6 +69736,7 @@ void js_aot_prof_dump(JSRuntime *rt)
     fprintf(f, "qjsprof 1 abi=%u fmt=%u drc=%u thr=%u rec=%u callres=1 sitekinds=1 gwrites=1 vmode=%u\n",
             QJS_AOT_ABI, REGVM_FORMAT_VERSION, QJS_DRC,
             QJS_REGVM_THREAD, QJS_REGVM_RECORD, QJS_NAN_BOXING64);
+    re_st_prof_dump(f);
     {
         /* A context is needed only to name atoms; the dump runs at teardown, when
            the runtime's contexts are still alive. */
@@ -99738,9 +99742,12 @@ typedef struct ReStEntry {
     uint16_t srclen;
     char src[102];
     uint64_t created, compiles, compile_cyc;
+    uint8_t *bc;        /* a copy of the compiled bytecode (the profile carries it), NULL if not seen or too long */
+    uint32_t bclen;
     uint64_t bcalls[RE_ST_NB], bcyc[RE_ST_NB];
     uint64_t mcalls, mcyc, mhits, mlen, mscan_hit, mscan_miss, mslen, mslen_max;
     uint64_t mstrat[4];
+    uint64_t mwide;     /* matcher attempts on a subject of 16-bit units */
 } ReStEntry;
 
 #define RE_ST_SLOTS 4096
@@ -99772,18 +99779,21 @@ static inline uint64_t re_st_tsc(void)
 #endif
 }
 
+/* QJS_AOT_PROFILE_OUT also switches the census on (without the report): the profile then carries the matcher cycles and bytecode of every
+   pattern that ran, for the generator's matcher selection. */
 static __attribute__((constructor)) void re_st_init(void)
 {
-    const char *e = getenv("QJS_RE_STATS");
-    if (!e || !*e || (e[0] == '0' && !e[1]))
+    const char *e = getenv("QJS_RE_STATS"), *p = getenv("QJS_AOT_PROFILE_OUT");
+    int report = e && *e && !(e[0] == '0' && !e[1]);
+    if (!report && !(p && *p))
         return;
     re_st_on = 1;
-    if (!(e[0] == '1' && !e[1]))
+    if (report && !(e[0] == '1' && !e[1]))
         re_st_path = strdup(e);
     re_st_tab = calloc(RE_ST_SLOTS, sizeof(ReStEntry));
     if (!re_st_tab)
         re_st_on = 0;
-    else
+    else if (report)
         atexit(re_st_report);
 }
 
@@ -99832,7 +99842,31 @@ static ReStEntry *re_st_entry(JSRegExp *re)
     ReStEntry *e = re_st_find(strv(re->pattern), re->pattern->len,
                               re->pattern->is_wide_char, lre_get_flags(bc));
     e->capcnt = (uint16_t)lre_get_capture_count(bc);
+    if (!e->bc && re->bytecode->len <= 3500 && !re->bytecode->is_wide_char) {
+        e->bc = calloc(1, re->bytecode->len);
+        if (e->bc) {
+            memcpy(e->bc, bc, re->bytecode->len);
+            e->bclen = re->bytecode->len;
+        }
+    }
     return e;
+}
+
+/* The profile's regexp section: `X <matcher cycles> <attempts on 16-bit subjects> <hex bytecode>` per pattern that ran. */
+static void re_st_prof_dump(FILE *f)
+{
+    uint32_t i, k;
+    if (!re_st_tab)
+        return;
+    for (i = 0; i < RE_ST_SLOTS; i++) {
+        ReStEntry *e = &re_st_tab[i];
+        if (!e->used || !e->bc || !e->mcalls)
+            continue;
+        fprintf(f, "X %llu %llu ", (unsigned long long)e->mcyc, (unsigned long long)e->mwide);
+        for (k = 0; k < e->bclen; k++)
+            fprintf(f, "%02x", e->bc[k]);
+        fputc('\n', f);
+    }
 }
 
 /* one matcher attempt, called with the same arguments as the matcher */
@@ -99847,6 +99881,7 @@ static int re_st_match_done(JSRegExp *re, JSString *str, int start_index,
     e->mcalls++;
     e->mcyc += dt;
     e->mslen += str->len;
+    e->mwide += str->is_wide_char;
     if ((uint64_t)str->len > e->mslen_max)
         e->mslen_max = str->len;
     if (strategy >= 0 && strategy < 4)
@@ -102686,6 +102721,7 @@ static inline int js_regexp_match_atom(JSContext *ctx,
 /* Match a pattern with a required literal prefix: scan for the prefix, then
    run the interpreter anchored at each hit. */
 static int js_regexp_match_prefix(JSContext *ctx, uint8_t **capture,
+                                  const LreAotEntry *aot,
                                   const uint8_t *re_bytecode,
                                   const uint8_t *prefix, JSString *str,
                                   int start_index)
@@ -102708,9 +102744,9 @@ static int js_regexp_match_prefix(JSContext *ctx, uint8_t **capture,
             if (candidate < 0)
                 break;
             if (js_regexp_atom_starts_at(str, candidate, prefix)) {
-                ret = lre_exec_at(capture, re_bytecode,
-                                  get_u32(prefix + LRE_META_ENTRY_OFFSET),
-                                  str8(str), candidate, str->len, shift, ctx);
+                ret = lre_exec_at_ex(aot, capture, re_bytecode,
+                                     get_u32(prefix + LRE_META_ENTRY_OFFSET),
+                                     str8(str), candidate, str->len, shift, ctx);
                 if (ret != 0)
                     return ret;
             }
@@ -102785,6 +102821,7 @@ static int js_regexp_first_set_scan8(JSContext *ctx, const uint8_t *bitmap,
    for 8-bit strings), then run the interpreter anchored there. Handles
    patterns like \d+, \w+, [class]... that have no literal prefix. */
 static int js_regexp_match_first_set(JSContext *ctx, uint8_t **capture,
+                                     const LreAotEntry *aot,
                                      const uint8_t *re_bytecode,
                                      const uint8_t *fs, JSString *str,
                                      int start_index)
@@ -102804,8 +102841,8 @@ static int js_regexp_match_first_set(JSContext *ctx, uint8_t **capture,
                 return LRE_RET_TIMEOUT;
             if (candidate >= len)
                 break;
-            ret = lre_exec_at(capture, re_bytecode, entry, s, candidate,
-                              len, 0, ctx);
+            ret = lre_exec_at_ex(aot, capture, re_bytecode, entry, s, candidate,
+                                 len, 0, ctx);
             if (ret != 0)
                 return ret;
             candidate++;
@@ -102818,8 +102855,8 @@ static int js_regexp_match_first_set(JSContext *ctx, uint8_t **capture,
         c = string_get(str, candidate);
         in_set = (c <= 0xff) ? ((bitmap[c >> 3] >> (c & 7)) & 1) : has_wide;
         if (in_set) {
-            ret = lre_exec_at(capture, re_bytecode, entry,
-                              str8(str), candidate, len, shift, ctx);
+            ret = lre_exec_at_ex(aot, capture, re_bytecode, entry,
+                                 str8(str), candidate, len, shift, ctx);
             if (ret != 0)
                 return ret;
         }
@@ -102887,6 +102924,7 @@ static const JSReReq *js_regexp_req(JSContext *ctx, JSRegExp *re)
     if (!bc->is_wide_char) {
         int i;
         lre_analyze2(str8(bc), bc->len, &e->r);
+        e->aot = lre_aot_find(str8(bc), bc->len);
         e->lit8_ok = true;
         for (i = 0; i < e->r.len; i++) {
             if (e->r.lit[i] > 0xff)
@@ -103016,8 +103054,8 @@ static int js_regexp_match_bounded(JSContext *ctx, uint8_t **capture,
         if (s < next)
             s = next;
         for (; s <= at; s++) {
-            rc = lre_exec_at(capture, d->bytecode, e->r.entry, str8(str), s,
-                             str->len, str->is_wide_char, ctx);
+            rc = lre_exec_at_ex(e->aot, capture, d->bytecode, e->r.entry, str8(str), s,
+                                str->len, str->is_wide_char, ctx);
             if (rc != 0)
                 return rc;
         }
@@ -103052,8 +103090,8 @@ static int js_regexp_match_generic(JSContext *ctx, uint8_t **capture,
                 if (s[k] != e->r.apre[k])
                     return 0;
         }
-        return lre_exec_at(capture, d->bytecode, e->r.entry, str8(str), 0,
-                           str->len, str->is_wide_char, ctx);
+        return lre_exec_at_ex(e->aot, capture, d->bytecode, e->r.entry, str8(str), 0,
+                              str->len, str->is_wide_char, ctx);
     }
     {
         int rc = js_regexp_match_bounded(ctx, capture, d, e, str, start_index);
@@ -103062,8 +103100,8 @@ static int js_regexp_match_generic(JSContext *ctx, uint8_t **capture,
     }
     if (!js_regexp_req_start(e, str, &start_index))
         return 0;
-    return lre_exec(capture, d->bytecode, str8(str), start_index,
-                    str->len, str->is_wide_char, ctx);
+    return lre_exec_ex(e ? e->aot : NULL, capture, d->bytecode, str8(str), start_index,
+                       str->len, str->is_wide_char, ctx);
 }
 
 /* Run one match attempt starting at 'start_index', choosing the fastest
@@ -103072,23 +103110,30 @@ static inline int
 js_regexp_match_raw(JSContext *ctx, uint8_t **capture, const JSRegExpExecData *d,
                     JSRegExp *re, JSString *str, int start_index)
 {
+    const LreAotEntry *e_aot = NULL;
+
     switch (d->strategy) {
     case JS_REGEXP_MATCH_ATOM:
         return js_regexp_match_atom(ctx, capture, str, d->metadata, re->pattern,
                                     start_index);
     case JS_REGEXP_MATCH_PREFIX:
-        return js_regexp_match_prefix(ctx, capture, d->bytecode, d->metadata,
-                                      str, start_index);
+        {
+            const JSReReq *e = lre_aot_count ? js_regexp_req(ctx, re) : NULL;
+            return js_regexp_match_prefix(ctx, capture, e ? e->aot : NULL,
+                                          d->bytecode, d->metadata,
+                                          str, start_index);
+        }
     case JS_REGEXP_MATCH_FIRST_SET:
         {
             const JSReReq *e = js_regexp_req(ctx, re);
             int rc = js_regexp_match_bounded(ctx, capture, d, e, str, start_index);
+            e_aot = e ? e->aot : NULL;
             if (rc != JS_REGEXP_NOT_BOUNDED)
                 return rc;
             if (!js_regexp_req_start(e, str, &start_index))
                 return 0;
         }
-        return js_regexp_match_first_set(ctx, capture, d->bytecode,
+        return js_regexp_match_first_set(ctx, capture, e_aot, d->bytecode,
                                          d->metadata, str, start_index);
     case JS_REGEXP_MATCH_GENERIC:
     default:
