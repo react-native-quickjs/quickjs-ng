@@ -3197,7 +3197,7 @@ static void js_gc_rearm_pace(JSRuntime *rt, size_t before, size_t after)
     rt->malloc_gc_threshold = after + step;
 }
 
-static void js_trigger_gc(JSRuntime *rt, size_t size)
+static __attribute__((noinline)) void js_trigger_gc_slow(JSRuntime *rt, size_t size)
 {
     bool force_gc;
 #ifdef FORCE_GC_AT_MALLOC
@@ -3251,6 +3251,17 @@ static void js_trigger_gc(JSRuntime *rt, size_t size)
             js_gc_rearm_pace(rt, before, rt->malloc_state.malloc_size);
         }
     }
+}
+
+/* The threshold test stays inline at every allocation site; the collection itself is out of line. */
+static inline __attribute__((always_inline)) void js_trigger_gc(JSRuntime *rt, size_t size)
+{
+#ifdef FORCE_GC_AT_MALLOC
+    js_trigger_gc_slow(rt, size);
+#else
+    if (unlikely((rt->malloc_state.malloc_size + size) > rt->malloc_gc_threshold))
+        js_trigger_gc_slow(rt, size);
+#endif
 }
 
 static size_t js_malloc_usable_size_unknown(const void *ptr)
