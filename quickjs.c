@@ -6848,8 +6848,12 @@ static void ic_entry_reset(JSRuntime *rt, JSICEntry *e)
    speed, a missed promote would retain memory. */
 static int fnbc_is_acyclic(JSFunctionBytecode *b)
 {
-    return b->cpool_count == 0 && b->objlit_tab == NULL &&
-           b->ic_table == NULL;
+    /* A lazily read body's inline constant pool stays zeroed (JS_TAG_INT 0)
+       until materialized, so marking it does nothing. A body whose
+       materialization failed is excluded: its pool was filled before
+       byte_code_buf was set. */
+    return (b->cpool_count == 0 || (b->is_lazy && !b->lazy_failed)) &&
+           b->objlit_tab == NULL && b->ic_table == NULL;
 }
 
 /* Idempotent: moves b between the two lists so the header bit and the list
