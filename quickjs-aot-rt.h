@@ -326,6 +326,9 @@ QJS_AOT_STUB uint32_t qjs_aot_layout_build(JSContext *ctx, JSValue proto_val,
                                            const JSAtom *atoms, uint32_t n,
                                            void *out, uint32_t out_cap,
                                            uint32_t layout_id);
+/* What the unit promises about one slot of a layout (see JSRuntime.aot_slot_claim). */
+QJS_AOT_STUB int qjs_aot_layout_claim(JSContext *ctx, uint32_t layout_id, uint32_t slot,
+                                      uint32_t claim);
 extern const uint32_t qjs_aot_deopt_site_func[];
 
 /* ABI entry points implemented by the engine. */
