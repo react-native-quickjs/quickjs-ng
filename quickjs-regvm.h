@@ -573,6 +573,12 @@ typedef enum JSRegOpcode {
     /* the product as the right operand */
     ROP_add_mul, ROP_sub_mul,
 
+    /* The debugger trap: the stack VM's `OP_esc1` debug sub-operations, one
+       instruction per trapped statement, operand the `JS_DEBUG_TRACE_*` flags.
+       The handler captures the ip before calling the hook. Never emitted into a
+       light-safe function. */
+    ROP_debug,
+
     ROP_COUNT
 } JSRegOpcode;
 
@@ -616,7 +622,7 @@ enum { REG_CONST_CPOOL = 0, REG_CONST_ATOM };
 /* The register bytecode's format version, checked per function record before
    any instruction is parsed. Bump it whenever an opcode is added, removed or
    renumbered, or an operand's width or meaning changes. */
-#define REGVM_FORMAT_VERSION 16
+#define REGVM_FORMAT_VERSION 17
 
 /* ROP_get_field and ROP_put_field use this site index when the source
    instruction has no inline cache. */

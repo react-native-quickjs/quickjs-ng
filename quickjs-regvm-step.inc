@@ -1460,6 +1460,62 @@ static uint8_t *REGVM_CC regvm_s_ROP_copy_props(uint8_t *ip, JSValue *fr, JSRegR
     return NULL;
 }
 
+static uint8_t *REGVM_CC regvm_s_ROP_debug(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+{
+    JSFunctionBytecode *b = rf->b;
+    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
+    JSRegPIC *pic = rf->pic;
+    uint8_t *rpc = ip;
+    int op = *rpc++;
+    JSValue ret_val = JS_UNDEFINED;
+    JSValue *regs = fr;
+    JSValue *arg_buf = rf->arg_buf;
+    int argc = rf->argc;
+    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ {
+                int dbg_flags = RD_U8();
+#if JS_ENABLE_DEBUGGER
+                if (unlikely(dbg_flags > JS_DEBUG_TRACE_DEBUGGER_STMT)) {
+                    JS_ThrowInternalError(ctx, "invalid debugger trap kind: %d",
+                                          dbg_flags);
+                    goto exception;
+                }
+                /* Armed, not merely installed, so an idle debugger costs
+                   nothing per statement. A `debugger;` trap (DEBUGGER_STMT)
+                   always reaches the handler. */
+                if (unlikely(ctx->debug_trace &&
+                             (js_atomic_load_relaxed(&ctx->debug_trace_armed) ||
+                              (dbg_flags & JS_DEBUG_TRACE_DEBUGGER_STMT)))) {
+                    int dbg_col = 0;
+                    int dbg_line;
+                    int dbg_ret;
+
+                    /* The hook can inspect the stack and throw, so publish the
+                       frame's position first. */
+                    rf->cap_ip = rpc - 1;
+                    dbg_line = find_line_num(ctx, b,
+                                             (uint32_t)(rpc - 1 - b->regvm_code),
+                                             &dbg_col);
+                    dbg_ret = ctx->debug_trace(ctx, b->filename, b->func_name,
+                                               dbg_line, dbg_col, dbg_flags,
+                                               ctx->debug_trace_opaque);
+                    if (dbg_ret != 0 || JS_HasException(ctx)) {
+                        if (dbg_ret != 0 && !JS_HasException(ctx))
+                            JS_ThrowInternalError(ctx, "aborted by debugger");
+                        goto exception;
+                    }
+                }
+#else
+                /* Debugger compiled out: the trap is inert. */
+                (void)dbg_flags;
+#endif
+                REGVM_NEXT();
+            }
+ exception:
+    rf->ret = JS_EXCEPTION;
+    return NULL;
+}
+
 static uint8_t *REGVM_CC regvm_s_ROP_dec(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
 {
     JSFunctionBytecode *b = rf->b;
@@ -6118,6 +6174,7 @@ static const regvm_handler regvm_step_table[ROP_COUNT] = {
     [ROP_mul_sub] = regvm_s_ROP_mul_sub,
     [ROP_add_mul] = regvm_s_ROP_add_mul,
     [ROP_sub_mul] = regvm_s_ROP_sub_mul,
+    [ROP_debug] = regvm_s_ROP_debug,
 };
 
 
@@ -6349,6 +6406,7 @@ static const uint8_t regvm_step_covered[ROP_COUNT] = {
     [ROP_mul_sub] = 1,
     [ROP_add_mul] = 1,
     [ROP_sub_mul] = 1,
+    [ROP_debug] = 1,
 };
 
 
