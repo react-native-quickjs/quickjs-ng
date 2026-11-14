@@ -25486,6 +25486,8 @@ static void close_lexical_var(JSContext *ctx, JSFunctionBytecode *b,
 /* A compiled coroutine left a guard: the register interpreter continues the parked frame at the
    pc in sf->cur_pc (not as a resumption of a yield), without entering compiled code again. */
 #define JS_CALL_FLAG_AOT_DEOPT   (1 << 3)
+/* with AOT_DEOPT on a coroutine resume: the instruction the frame continues at is the one it is resuming (a yield or await), not a fresh one */
+#define JS_CALL_FLAG_AOT_KEEP_MARKER (1 << 4)
 
 static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
                                   JSValueConst this_obj,
@@ -35346,7 +35348,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                while the frame is running */
             sf->cur_pc = NULL;
             /* a deopt continues at an instruction, it does not resume a yield */
-            if (unlikely(flags & JS_CALL_FLAG_AOT_DEOPT))
+            if (unlikely((flags & (JS_CALL_FLAG_AOT_DEOPT | JS_CALL_FLAG_AOT_KEEP_MARKER)) == JS_CALL_FLAG_AOT_DEOPT))
                 regvm_resume_marker = NULL;
             regvm_nctl = JS_VALUE_GET_INT(regs[regvm_frame_regs(b)]);
         }
@@ -45136,7 +45138,8 @@ static JSValue js_aot_run_coroutine(JSContext *ctx, JSAsyncFunctionState *s,
         return js_regvm_execute(ctx, JS_MKPTR(JS_TAG_INT, s), s->this_val, JS_UNDEFINED,
                                 s->argc, vc(sf->arg_buf), sf, b, sf->arg_buf, sf->arg_buf,
                                 sf->var_buf, regs, sp, pc,
-                                JS_CALL_FLAG_GENERATOR | JS_CALL_FLAG_AOT_DEOPT, 0);
+                                JS_CALL_FLAG_GENERATOR | JS_CALL_FLAG_AOT_DEOPT |
+                                    (run.deopt_pc == entry_pc ? JS_CALL_FLAG_AOT_KEEP_MARKER : 0), 0);
     }
     sf->cur_pc = run.sf->cur_pc;
     sf->cur_sp = run.sf->cur_sp;
@@ -45177,7 +45180,7 @@ static JSValue js_regvm_resume_coroutine(JSContext *ctx, JSAsyncFunctionState *s
     rt->current_stack_frame = sf;
     throw_pending = s->throw_flag != 0;
 #if QJS_AOT && QJS_REGVM && QJS_DRC
-    if (b->aot_fn != NULL && !throw_pending && b->regvm_compiled) {
+    if (b->aot_fn != NULL && !throw_pending && b->regvm_compiled && pc != NULL) {   /* pc is NULL for the first run of the coroutine: that is no resume */
         JSAotRun *ar = rt->aot_run;
 
         if (likely(ar == NULL || ar->disabled == NULL ||
