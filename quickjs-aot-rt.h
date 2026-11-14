@@ -54,6 +54,14 @@ typedef struct JSAotGenLayout {
        ABI constants it compares against (the entry kind, the no-site marker and
        the lazy-JSON tag). */
     uint32_t sizeof_JSRegPIC;
+    /* The number of caching ways a site owns. A polymorphic site installs its
+       later shapes in way 1 and up, so a reader that looks only at way 0 misses
+       them; the inline read probes every way, as the interpreter does. */
+    uint32_t reg_pic_ways;
+    /* Where JSFunctionBytecode holds the number of PIC sites: the stride
+       between a site's ways, read from the running function rather than
+       baked in, so a unit cannot disagree with its bytecode. */
+    uint32_t off_fnbc_pic_count;
     uint32_t off_regpic_shape, off_regpic_slot_off, off_regpic_kind;
     uint32_t reg_pic_own, reg_pic_proto, reg_ic_none, tag_lazy_json;
     /* The binary sub-operations the inline arithmetic path names, from
