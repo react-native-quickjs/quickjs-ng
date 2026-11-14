@@ -209,6 +209,11 @@ QJS_AOT_STUB const void *qjs_aot_array_iterator_next_fn(void);
 /* The function pointer of Array.prototype.push (0) or pop (1), which a C function object holds,
    with magic 0, when it is that builtin. */
 QJS_AOT_STUB const void *qjs_aot_array_builtin_fn(int which);
+/* The function pointer of the builtin `Function.prototype.apply`, which a C function object holds,
+   with cproto generic_magic and magic 0, when it is that builtin. A unit that bypasses a
+   `f.apply(this, arguments)` compares the `apply` it would bypass against this, so a program that
+   replaced `apply` keeps its own. */
+QJS_AOT_STUB const void *qjs_aot_function_apply_fn(void);
 
 /* Fold every field after `hash` (the hash field itself is excluded). Shared by
    the generator and the runtime. */
