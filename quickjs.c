@@ -73381,7 +73381,7 @@ static void regvm_build_pc2line(JSContext *ctx, JSFunctionBytecode *b,
 /* create a function object from a function definition. The function
    definition is freed. All the child functions are also created. It
    must be done this way to resolve all the variables. */
-#if !QJS_REGVM || QJS_AOT
+#if !QJS_REGVM
 static void js_scan_argv_safe(JSFunctionBytecode *b);
 #endif
 static void js_scan_arg_flags_raw(const uint8_t *bc, int len,
@@ -73549,10 +73549,11 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     closure_var_offset = function_size;
     function_size += fd->closure_var_count * sizeof(*fd->closure_var);
     byte_code_offset = function_size;
-#if QJS_REGVM && !QJS_AOT
+#if QJS_REGVM
     /* A register build keeps no stack bytecode after lowering; the slot stays
        in the struct, empty. args_captured/argv_safe come from the register
-       program below. */
+       program below. Keyed on QJS_REGVM alone: the bundle format does not
+       depend on whether AOT is enabled. */
 #else
     function_size += fd->byte_code.size;
 #endif
@@ -73616,7 +73617,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     b->ic_count = fd->ic_count;
     b->ic_entries = JS_IC_ENTRIES;
 
-#if QJS_REGVM && !QJS_AOT
+#if QJS_REGVM
     /* No stack bytecode: byte_code_buf stays NULL and byte_code_len 0.
        fd->byte_code lives until the register block, for the cross-check below,
        then is freed. */
@@ -76167,8 +76168,11 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
     bc_put_leb128(s, b->arg_count);
     bc_put_leb128(s, b->var_count);
     bc_put_leb128(s, b->defined_arg_count);
-#if QJS_REGVM && !QJS_AOT
-    /* A register bundle carries no stack bytecode; the field is always zero. */
+#if QJS_REGVM
+    /* A register bundle carries no stack bytecode; the field is always zero.
+       Keyed on QJS_REGVM alone: the bundle format must not depend on whether
+       the build that wrote it also had AOT enabled, or a bundle written by one
+       build cannot be read by the other. */
     bc_put_leb128(s, 0);            /* stack_size */
 #else
     bc_put_leb128(s, b->stack_size);
@@ -76176,14 +76180,14 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
     bc_put_leb128(s, b->var_ref_count);
     bc_put_leb128(s, b->closure_var_count);
     bc_put_leb128(s, b->cpool_count);
-#if QJS_REGVM && !QJS_AOT
+#if QJS_REGVM
     bc_put_leb128(s, 0);            /* byte_code_len */
 #else
     bc_put_leb128(s, b->byte_code_len);
 #endif
     /* IC table size only; contents are runtime-only (doc/ic-design.md §1). The
        _ic opcodes are already in byte_code, so a nonzero count round-trips. */
-#if QJS_REGVM && !QJS_AOT
+#if QJS_REGVM
     bc_put_leb128(s, 0);            /* ic_count */
 #else
     bc_put_leb128(s, b->ic_count);
@@ -76203,20 +76207,10 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
         bc_put_leb128(s, b->regvm_ctl_count);
         bc_put_leb128(s, b->regvm_pic_count);
         bc_put_leb128(s, b->regvm_len); /* exec_len: the decoded length */
-#if QJS_AOT
-        /* AOT keeps the exec code in the header. */
-        rbuf = js_malloc(s->ctx, b->regvm_len);
-        if (!rbuf)
-            goto fail;
-        memcpy(rbuf, b->regvm_code, b->regvm_len);
-        if (regvm_map_atoms(rbuf, b->regvm_len, 1 /* register operands are two bytes */,
-                            regvm_writer_atom, s))
-            goto fail;
-        dbuf_put(&s->dbuf, rbuf, b->regvm_len);
-        js_free(s->ctx, rbuf);
-        rbuf = NULL;
-#endif
-        /* Otherwise the program goes to the lazy region in wire form. */
+        /* The program goes to the lazy region in wire form, in every build.
+           Inlining the exec code in the header for AOT made the bundle format
+           depend on the writer's build, so a bundle written without AOT (every
+           checked-in `builtin-*.regvm.h`) could not be read with it. */
     }
 #endif
 
@@ -76275,7 +76269,7 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
             goto fail;
     }
 
-#if QJS_REGVM && !QJS_AOT
+#if QJS_REGVM
     /* The register program, in wire form, replaces the stack bytecode. */
     if (b->regvm_compiled && regvm_wire_encode(s, b))
         goto fail;
@@ -76289,7 +76283,7 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
     for (i = 0; i < b->objlit_count; i++) {
         JSObjLitTemplate *tpl = &b->objlit_tab[i];
         uint16_t k;
-#if QJS_REGVM && !QJS_AOT
+#if QJS_REGVM
         /* The register program names its templates by order, so no stack pc is
            written. */
 #else
@@ -77033,7 +77027,7 @@ static void js_scan_arg_flags_raw(const uint8_t *bc, int len,
     *argv_safe = true;
 }
 
-#if !QJS_REGVM || QJS_AOT
+#if !QJS_REGVM
 static void js_scan_argv_safe(JSFunctionBytecode *b)
 {
     bool argv_safe, args_captured;
@@ -78150,9 +78144,10 @@ static int JS_ReadFunctionBody(BCReaderState *s, JSFunctionBytecode *b,
     }
     {
         bc_read_trace(s, "bytecode {\n");
-#if QJS_REGVM && !QJS_AOT
+#if QJS_REGVM
         /* No stack bytecode: decode the register program from the wire, which
-           interns atoms, validates, and sets args_captured/argv_safe. */
+           interns atoms, validates, and sets args_captured/argv_safe. Keyed on
+           QJS_REGVM alone, to match the writer. */
         if (b->regvm_compiled) {
             uint32_t wire_len;
             if (bc_get_leb128(s, &wire_len))
@@ -78180,7 +78175,7 @@ static int JS_ReadFunctionBody(BCReaderState *s, JSFunctionBytecode *b,
         uint32_t *template_pcs = NULL;
         if (bc_get_leb128(s, &template_count) || template_count > UINT16_MAX)
             return -1;
-#if !QJS_REGVM || QJS_AOT
+#if !QJS_REGVM
         if (template_count != 0) {
             template_pcs = js_malloc(s->ctx,
                                      sizeof(*template_pcs) * template_count);
@@ -78232,9 +78227,9 @@ static int JS_ReadFunctionBody(BCReaderState *s, JSFunctionBytecode *b,
             b->objlit_count = (uint16_t)template_count;
         }
         for (i = 0; i < (int)template_count; i++) {
-#if QJS_REGVM && !QJS_AOT
+#if QJS_REGVM
             /* Templates are named by order, so there is no stack pc to
-               cross-check. */
+               cross-check. Keyed on QJS_REGVM alone, to match the writer. */
             pc = 0;
             if (bc_get_leb128(s, &prop_count) ||
                 prop_count == 0 || prop_count > JS_OBJLIT_MAX_PROPS)
@@ -78452,22 +78447,12 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
                 JS_ThrowSyntaxError(ctx, "invalid register program header");
                 goto fail;
             }
-#if QJS_AOT
-            /* The AOT layout keeps the exec code in the header, so it must fit
-               in the remaining input. */
-            if ((size_t)regvm_len > (size_t)(s->buf_end - s->ptr)) {
-                JS_ThrowSyntaxError(ctx, "invalid register program header");
-                goto fail;
-            }
-#else
-            /* The exec code is decoded from the wire in the lazy region. The
-               wire is never smaller than 1/16 of the decoded length, which
-               bounds the allocation. */
+            /* `regvm_len` is the *decoded* length and the wire that follows is
+               shorter, so the bound is 16x it, in every build. */
             if ((size_t)regvm_len > (size_t)(s->buf_end - s->ptr) * 16) {
                 JS_ThrowSyntaxError(ctx, "invalid register program header");
                 goto fail;
             }
-#endif
             bc.regvm_compiled = 1;
             bc.regvm_reg_count = reg_count;
             bc.regvm_ctl_count = ctl_count;
@@ -78512,67 +78497,7 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
     if (b->regvm_compiled) {
         b->regvm_code = (void *)((uint8_t*)b + layout.byte_code_offset +
                                  b->byte_code_len);
-#if QJS_AOT
-        {
-        int wide = 1;                   /* register operands are two bytes */
-        int acquired = 0;
-        if (bc_get_buf(s, b->regvm_code, b->regvm_len)) {
-            b->regvm_code = NULL;
-            b->regvm_compiled = 0;
-            goto fail_unregistered;
-        }
-        /*
-         * Intern the program's atoms, which the function then owns, and
-           validate the
-         * program before anything can run it.
-         *
-         * Both steps can fail on untrusted input, and `b` is neither a GC
-           object nor
-         * `obj` yet, so failures unwind by hand. A dry walk first leaves the
-           rewriting
-         * walk's only failure an allocation inside the interning callback,
-           which is
-         * undone by walking the same prefix again; regvm_owns_atoms is then
-           cleared.
-         */
-        if (regvm_map_atoms2(b->regvm_code, b->regvm_len, wide, NULL, NULL,
-                             1, NULL))
-            goto fail_unregistered;
-        b->regvm_owns_atoms = 1;
-        if (regvm_map_atoms2(b->regvm_code, b->regvm_len, wide,
-                             regvm_reader_atom, s, 0, &acquired)) {
-            regvm_unmap_atoms(b->regvm_code, b->regvm_len, wide, acquired,
-                              ctx->rt);
-            b->regvm_owns_atoms = 0;
-            goto fail_unregistered;
-        }
-        if (regvm_validate_code(ctx, b)) {
-            /* every atom in the program was interned, so all of them go back */
-            regvm_map_atoms(b->regvm_code, b->regvm_len, wide,
-                            regvm_free_atom, ctx->rt);
-            b->regvm_owns_atoms = 0;
-            goto fail_unregistered;
-        }
-        /* `argv_safe` and `args_captured` are never serialized: recompute both
-           from the register program. `argv_safe` clears on a parameter write as
-           well as a capture. */
-        {
-            bool rs_argv, rs_args;
-            regvm_scan_arg_flags(b->regvm_code, b->regvm_len, &rs_argv, &rs_args);
-#if !defined(NDEBUG)
-            /* The stack scan JS_ReadFunctionBytecode ran must agree, in the
-               same direction as at compile time. */
-            assert(!rs_argv || b->argv_safe);
-            assert(rs_args == (b->args_captured != 0));
-#endif
-            b->args_captured |= rs_args;
-            b->argv_safe = rs_argv;
-        }
-        }
-#else
-        /* The exec code is decoded from the wire by JS_ReadFunctionBody, which
-           interns atoms, validates, and sets args_captured/argv_safe. */
-#endif
+
     }
 #endif
 
