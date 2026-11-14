@@ -586,6 +586,7 @@ QJS_AOT_STUB JSValue qjs_aot_throw_here(JSContext *ctx, JSRegRun *f, uint32_t pc
    read-only target does, because a frameless body has no frame the engine could ask. */
 int qjs_aot_put_global(JSContext *ctx, void *b, int atom, JSValue v, int init);
 int qjs_aot_global_fold(JSContext *ctx, int atom, int32_t v);
+int qjs_aot_global_watch(JSContext *ctx, JSValue obj, int atom);
 /* `load_const` of the constant pool (kind 0) or an atom (kind 1): 0 with an OWNED *out,
    -1 on an exception. */
 int qjs_aot_load_const(JSContext *ctx, JSRegRun *f, int kind, uint32_t idx, JSValue *out);

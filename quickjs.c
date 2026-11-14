@@ -597,7 +597,7 @@ typedef struct JSAotRun {
 #define QJS_AOT_CLAIM_MAX_LAYOUTS 63
 _Static_assert(QJS_AOT_CLAIM_MAX_LAYOUTS == (QJS_AOT_CLAIM_OBJ_NN(63) & 0x3f), "a layout id fits in 6 bits");
 #endif
-#define JS_AOT_GWATCH_MAX 16
+#define JS_AOT_GWATCH_MAX 256
 struct JSRuntime {
     JSMallocFunctions mf;
     JSMallocState malloc_state;
@@ -776,7 +776,6 @@ struct JSRuntime {
     uint32_t shape_obs_epoch;
     /* Atoms of global-object properties a compiled body holds as literals. A write to one moves
        `aot_pic_epoch`; the cells of such a property never take the direct store. */
-    JSAtom aot_gwatch[JS_AOT_GWATCH_MAX];
     uint32_t aot_gwatch_n;
     /* The contracted layouts: the shape each one ends, their count, and a bit per
        layout set once an object is seen to leave it. Empty without a unit. */
@@ -883,6 +882,10 @@ struct JSRuntime {
        hang where the nested path raises RangeError. Runtime-scoped and appended
        last to keep the hot fields' offsets. */
     uint32_t regvm_tail_chain;
+    /* kept at the end so that the offsets of the fields generated code reads do not move: the list itself and its filter (bit (atom & 255) per watched atom: most stores of a
+       watched object name an unwatched atom and skip the list) */
+    JSAtom aot_gwatch[JS_AOT_GWATCH_MAX];
+    uint64_t aot_gwatch_bloom[4];
 };
 
 #if QJS_REGVM_RECORD
@@ -16882,6 +16885,8 @@ static void js_aot_content_store_slow(JSRuntime *rt, JSObject *p, uint32_t slot,
 static inline bool js_aot_gwatched(JSRuntime *rt, JSAtom atom)
 {
     uint32_t i;
+    if (likely(rt->aot_gwatch_n == 0) || !(rt->aot_gwatch_bloom[(atom >> 6) & 3] & ((uint64_t)1 << (atom & 63))))
+        return false;
     for (i = 0; i < rt->aot_gwatch_n; i++)
         if (rt->aot_gwatch[i] == atom)
             return true;
@@ -16894,6 +16899,26 @@ static inline void js_aot_gwrite(JSRuntime *rt, JSAtom atom)
 {
     if (unlikely(rt->aot_gwatch_n != 0) && js_aot_gwatched(rt, atom))
         AOT_EPOCH_BUMP(rt, 5);
+}
+
+static void js_aot_obj_event(JSRuntime *rt, JSObject *p, int ev, JSAtom atom, JSValueConst val);
+
+/* A global binding is being written directly (not through the content-store hooks): besides the epoch, a watched atom reports the store to the fact groups, so a
+   fact that expects the property's value breaks. Only atoms on the watch list pay for the scan. */
+static __attribute__((noinline)) void js_aot_gwrite_slow(JSRuntime *rt, JSObject *p, JSAtom atom, JSValueConst v)
+{
+    if (!js_aot_gwatched(rt, atom))
+        return;
+    AOT_EPOCH_BUMP(rt, 5);
+    if (rt->aot_facts != NULL)
+        js_aot_obj_event(rt, p, JS_AOT_EV_STORE, atom, v);
+}
+
+static inline void js_aot_gwrite_val(JSRuntime *rt, JSObject *p, JSAtom atom, JSValueConst v)
+{
+    /* the filter bit first: most stores name an unwatched atom and pay a load and a test */
+    if (unlikely(rt->aot_gwatch_n != 0) && unlikely(rt->aot_gwatch_bloom[(atom >> 6) & 3] & ((uint64_t)1 << (atom & 63))))
+        js_aot_gwrite_slow(rt, p, atom, v);
 }
 
 static void js_aot_gwrite_slot(JSRuntime *rt, JSObject *p, uint32_t slot)
@@ -18437,7 +18462,7 @@ static inline int JS_SetGlobalVarS(JSContext *ctx, JSAtom prop, JSValue val,
             if (flag != 1 && likely((prs->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE)) ==
                                     JS_PROP_WRITABLE))
                 js_gv_cell_fill(ctx, prop, p, pr, prs->flags);
-            js_aot_gwrite(ctx->rt, prop);
+            js_aot_gwrite_val(ctx->rt, p, prop, val);
             set_value(ctx, &pr->u.value, val);
             return 0;
         }
@@ -18450,7 +18475,7 @@ static inline int JS_SetGlobalVarS(JSContext *ctx, JSAtom prop, JSValue val,
                                   JS_PROP_LENGTH)) == JS_PROP_WRITABLE)) {
             /* fast path */
             js_gv_cell_fill(ctx, prop, p, pr, prs->flags);
-            js_aot_gwrite(ctx->rt, prop);
+            js_aot_gwrite_val(ctx->rt, p, prop, val);
             set_value(ctx, &pr->u.value, val);
             return 0;
         }
@@ -67377,6 +67402,26 @@ int qjs_aot_special_object(JSContext *ctx, JSRegRun *f, int kind, JSValue *out)
    plain data property of the global object, shadowed by no lexical binding, that holds exactly
    `v` now. From then on every write to it moves `aot_pic_epoch`. The body takes the check at
    the entry that follows an epoch change. */
+/* A unit holds the value of the global data property `atom` of `obj` (the global object or the lexical object) behind a fact: put the atom on the watch list so
+   that every direct write of the binding reports to the fact groups. 1 when `obj` is not a global object (nothing to watch) or the atom is watched; 0 when the list is full. */
+int qjs_aot_global_watch(JSContext *ctx, JSValue obj, int atom)
+{
+    JSRuntime *rt = ctx->rt;
+
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT ||
+        (JS_VALUE_GET_OBJ(obj) != JS_VALUE_GET_OBJ(ctx->global_obj) && JS_VALUE_GET_OBJ(obj) != JS_VALUE_GET_OBJ(ctx->global_var_obj)))
+        return 1;
+    if (!js_aot_gwatched(rt, (JSAtom)atom)) {
+        if (rt->aot_gwatch_n >= JS_AOT_GWATCH_MAX)
+            return 0;
+        rt->aot_gwatch[rt->aot_gwatch_n++] = JS_DupAtomRT(rt, (JSAtom)atom);
+        rt->aot_gwatch_bloom[((uint32_t)atom >> 6) & 3] |= (uint64_t)1 << ((uint32_t)atom & 63);
+        /* the cells filled so far may take the direct store */
+        js_gv_cell_invalidate(rt);
+    }
+    return 1;
+}
+
 int qjs_aot_global_fold(JSContext *ctx, int atom, int32_t v)
 {
     JSRuntime *rt = ctx->rt;
@@ -67396,6 +67441,7 @@ int qjs_aot_global_fold(JSContext *ctx, int atom, int32_t v)
         if (rt->aot_gwatch_n >= JS_AOT_GWATCH_MAX)
             return 0;
         rt->aot_gwatch[rt->aot_gwatch_n++] = JS_DupAtomRT(rt, (JSAtom)atom);
+        rt->aot_gwatch_bloom[((uint32_t)atom >> 6) & 3] |= (uint64_t)1 << ((uint32_t)atom & 63);
         /* the cells filled so far may take the direct store */
         js_gv_cell_invalidate(rt);
     }
@@ -67428,7 +67474,7 @@ int qjs_aot_put_global(JSContext *ctx, void *b, int atom, JSValue v, int init)
             if (likely(po != NULL) &&
                 (get_shape_prop(po->shape)[slot - po->prop].flags &
                  (JS_PROP_TMASK | JS_PROP_WRITABLE | JS_PROP_LENGTH)) == JS_PROP_WRITABLE) {
-                js_aot_gwrite(ctx->rt, (JSAtom)atom);
+                js_aot_gwrite_val(ctx->rt, po, (JSAtom)atom, v);
                 set_value(ctx, &slot->u.value, js_dup(v));
                 return 0;
             }
