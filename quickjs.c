@@ -1289,6 +1289,12 @@ typedef struct JSFunctionBytecode {
        blob gets (the field is never serialized). */
     uint16_t *regvm_fill;
     uint16_t regvm_fill_count;
+    /* Precomputed call descriptor, set by regvm_set_call_desc() whenever its
+       inputs change (compile, deserialize, lazy materialization).
+       `regvm_call_ready` is `regvm_record_eligible`'s conjunction as one byte;
+       `regvm_frame_need` is the borrow-case (arg_slots == 0) arena size. */
+    uint8_t regvm_call_ready;
+    uint32_t regvm_frame_need;
 #endif
 } JSFunctionBytecode;
 
@@ -26239,10 +26245,9 @@ static inline int regvm_inloop_eligible(JSFunctionBytecode *cb)
 static int regvm_record_alloc(JSRuntime *rt, JSFunctionBytecode *b, int arg_slots,
                               JSRegRecordLayout *out)
 {
-    size_t nv = (size_t)arg_slots + b->var_count + b->regvm_reg_count + REGVM_HS;
-    size_t need = sizeof(JSRegRun) + sizeof(JSValue) * nv
-        + sizeof(JSVarRef *) * b->var_ref_count
-        + sizeof(JSRegCtl) * b->regvm_ctl_count;
+    /* `regvm_frame_need` is the arg_slots == 0 size, so only the reserved
+       copy's argument area is added. */
+    size_t need = b->regvm_frame_need + sizeof(JSValue) * (size_t)arg_slots;
     uint8_t *base = regvm_arena_push(rt, need);
     uint8_t *q;
 
@@ -26411,8 +26416,21 @@ static uint8_t *REGVM_CC regvm_t_unwind_loop(REGVM_ARGS)
  */
 static int regvm_record_eligible(JSFunctionBytecode *cb)
 {
-    return cb->func_kind == JS_FUNC_NORMAL && cb->regvm_compiled && !cb->is_lazy
-        && cb->regvm_all_threaded;
+    return cb->regvm_call_ready != 0;
+}
+
+/* Precompute the record call descriptor once a function's bytecode and
+   metadata are final: end of js_create_function, non-lazy deserialize, lazy
+   materialization. `regvm_all_threaded` is never serialized, so a blob
+   function stays ineligible. */
+static void regvm_set_call_desc(JSFunctionBytecode *b)
+{
+    b->regvm_call_ready = (b->func_kind == JS_FUNC_NORMAL && b->regvm_compiled
+                           && !b->is_lazy && b->regvm_all_threaded) ? 1 : 0;
+    b->regvm_frame_need = sizeof(JSRegRun)
+        + sizeof(JSValue) * (size_t)(b->var_count + b->regvm_reg_count + REGVM_HS)
+        + sizeof(JSVarRef *) * (size_t)b->var_ref_count
+        + sizeof(JSRegCtl) * (size_t)b->regvm_ctl_count;
 }
 
 /*
@@ -63165,6 +63183,10 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     b->backtrace_barrier = fd->backtrace_barrier;
     b->realm = JS_DupContext(ctx);
 
+#if QJS_REGVM_RECORD
+    regvm_set_call_desc(b);
+#endif
+
     add_gc_object(ctx->rt, &b->header, JS_GC_OBJ_TYPE_FUNCTION_BYTECODE);
     js_fnbc_gc_update(ctx->rt, b);
 
@@ -67267,6 +67289,9 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
                                    layout.byte_code_offset, has_debug_info))
         goto fail;
     b->realm = JS_DupContext(ctx);
+#if QJS_REGVM_RECORD
+    regvm_set_call_desc(b);
+#endif
     js_fnbc_gc_update(ctx->rt, b);
     return obj;
 
@@ -68074,6 +68099,9 @@ static int js_materialize_function_body(JSContext *ctx, JSFunctionBytecode *b)
     bc_reader_free(s);
 
     if (ret == 0) {
+#if QJS_REGVM_RECORD
+        regvm_set_call_desc(b);
+#endif
         js_fnbc_gc_update(ctx->rt, b);
         b->lazy_src = NULL;
         b->lazy_off = b->lazy_len = 0;
