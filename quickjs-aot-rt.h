@@ -146,6 +146,8 @@ typedef struct JSAotGenLayout {
        property is plainly writable. */
     uint32_t off_ctx_gv_cells, sizeof_gv_cell, gv_cell_sets, gv_cell_ways;
     uint32_t off_gvc_atom, off_gvc_gen, off_gvc_slot, off_gvc_wr;
+    /* Where the runtime counts changes of its property cache entries. */
+    uint32_t off_rt_pic_epoch;
     /* The rest of the light-frame header a generated native entry writes, so
        it can build the frame the engine's own light call builds. The header is
        the frame's first `light_prefix_slots` words; `off_regrun_fr` is where
