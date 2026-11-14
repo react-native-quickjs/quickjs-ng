@@ -80301,6 +80301,149 @@ static int regvm_sim_step(const JSFunctionDef *fd, const uint8_t *bc, int pos,
     return 0;
 }
 
+/* The operand-stack simulation of every reachable instruction, recorded by the
+   first analysis walk after the SSA fixed point (liveness). The later walks
+   (value owners, intervals, last uses, phi coalescing) seed each block from the
+   same entry stacks and slot states and pass the same simulation inputs, so
+   they read the record instead of simulating again. A walk reads only the
+   step's event and results, never the simulated stack after it. */
+typedef struct JSRegSimRec {
+    int np, ns, depth;
+    int slot_k, slot_role, slot_value;
+    int split_v, split_src, copy_v, copy_src, home_k;
+    int off; /* its pops, then its results, in JSRegSimLog.val */
+} JSRegSimRec;
+
+typedef struct JSRegSimLog {
+    int ok;          /* every reachable instruction is recorded */
+    int *rec_of_pc;  /* bytecode pc -> record index, -1 if none */
+    JSRegSimRec *rec;
+    int n_rec, cap_rec;
+    int32_t *val;    /* pops then results of each record */
+    uint8_t *def;    /* parallel to val: a result's pdef */
+    int n_val, cap_val;
+} JSRegSimLog;
+
+static void regvm_simlog_free(JSContext *ctx, JSRegSimLog *log)
+{
+    js_free(ctx, log->rec_of_pc);
+    js_free(ctx, log->rec);
+    js_free(ctx, log->val);
+    js_free(ctx, log->def);
+    memset(log, 0, sizeof(*log));
+}
+
+/* Record one step; a failed allocation turns the log off (the walks simulate). */
+static void regvm_simlog_add(JSContext *ctx, JSRegSimLog *log, int pos,
+                             const JSRegStepEv *ev, const int32_t *pv,
+                             const uint8_t *pdef)
+{
+    JSRegSimRec *r;
+    int i, need;
+
+    if (!log->ok)
+        return;
+    if (log->n_rec >= log->cap_rec) {
+        int cap = log->cap_rec ? log->cap_rec * 2 : 64;
+        JSRegSimRec *nr = js_realloc(ctx, log->rec, (size_t)cap * sizeof(*nr));
+        if (!nr) { log->ok = 0; return; }
+        log->rec = nr;
+        log->cap_rec = cap;
+    }
+    need = log->n_val + ev->np + ev->ns;
+    if (need > log->cap_val) {
+        int cap = log->cap_val ? log->cap_val : 256;
+        int32_t *nv;
+        uint8_t *nd;
+        while (cap < need)
+            cap *= 2;
+        nv = js_realloc(ctx, log->val, (size_t)cap * sizeof(*nv));
+        if (!nv) { log->ok = 0; return; }
+        log->val = nv;
+        nd = js_realloc(ctx, log->def, (size_t)cap);
+        if (!nd) { log->ok = 0; return; }
+        log->def = nd;
+        log->cap_val = cap;
+    }
+    r = &log->rec[log->n_rec];
+    r->np = ev->np;
+    r->ns = ev->ns;
+    r->depth = ev->depth;
+    r->slot_k = ev->slot_k;
+    r->slot_role = ev->slot_role;
+    r->slot_value = ev->slot_value;
+    r->split_v = ev->split_v;
+    r->split_src = ev->split_src;
+    r->copy_v = ev->copy_v;
+    r->copy_src = ev->copy_src;
+    r->home_k = ev->home_k;
+    r->off = log->n_val;
+    for (i = 0; i < ev->np; i++) {
+        log->val[log->n_val] = ev->pop[i];
+        log->def[log->n_val++] = 0;
+    }
+    for (i = 0; i < ev->ns; i++) {
+        log->val[log->n_val] = pv[i];
+        log->def[log->n_val++] = pdef[i];
+    }
+    log->rec_of_pc[pos] = log->n_rec++;
+}
+
+/* One step of a walk after the liveness walk: the recorded event when the log
+   has it, else the simulation. Under QJS_REGVM_VERIFY the simulation also runs
+   and must agree with the record. */
+static int regvm_sim_replay(const JSRegSimLog *log, const JSFunctionDef *fd,
+                            const uint8_t *bc, int pos, int *scratch, int *pd,
+                            const int *push_base, JSRegSlotSim *sim,
+                            int32_t *pv, uint8_t *pdef, JSRegStepEv *ev,
+                            int *popbuf, int popcap)
+{
+    const JSRegSimRec *r;
+    int i;
+
+    if (!log->ok || log->rec_of_pc[pos] < 0)
+        return regvm_sim_step(fd, bc, pos, scratch, pd, push_base, sim, pv,
+                              pdef, ev, popbuf, popcap, NULL, NULL);
+    r = &log->rec[log->rec_of_pc[pos]];
+#if QJS_REGVM_VERIFY
+    if (regvm_sim_step(fd, bc, pos, scratch, pd, push_base, sim, pv, pdef, ev,
+                       popbuf, popcap, NULL, NULL) ||
+        ev->np != r->np || ev->ns != r->ns || ev->depth != r->depth ||
+        ev->slot_k != r->slot_k || ev->slot_role != r->slot_role ||
+        ev->slot_value != r->slot_value || ev->split_v != r->split_v ||
+        ev->split_src != r->split_src || ev->copy_v != r->copy_v ||
+        ev->copy_src != r->copy_src || ev->home_k != r->home_k)
+        abort();
+    for (i = 0; i < r->np; i++)
+        if (ev->pop[i] != log->val[r->off + i])
+            abort();
+    for (i = 0; i < r->ns; i++)
+        if (pv[i] != log->val[r->off + r->np + i] ||
+            pdef[i] != log->def[r->off + r->np + i])
+            abort();
+#endif
+    memset(ev, 0, sizeof(*ev));
+    ev->pop = popbuf;
+    ev->np = r->np;
+    ev->ns = r->ns;
+    ev->depth = r->depth;
+    ev->slot_k = r->slot_k;
+    ev->slot_role = r->slot_role;
+    ev->slot_value = r->slot_value;
+    ev->split_v = r->split_v;
+    ev->split_src = r->split_src;
+    ev->copy_v = r->copy_v;
+    ev->copy_src = r->copy_src;
+    ev->home_k = r->home_k;
+    for (i = 0; i < r->np; i++)
+        popbuf[i] = log->val[r->off + i];
+    for (i = 0; i < r->ns; i++) {
+        pv[i] = log->val[r->off + r->np + i];
+        pdef[i] = log->def[r->off + r->np + i];
+    }
+    return 0;
+}
+
 #ifdef QJS_REGVM_COUNT
 /* Instruction adjacency, counted on the finished IR at encode time. */
 static uint64_t js_regvm_adj[ROP_COUNT * ROP_COUNT];
@@ -82456,6 +82599,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
     int bc_len = fd->byte_code.size;
     int *bof = NULL, *bstart = NULL, *succ = NULL, *exc = NULL;
     int *in_depth = NULL, *out_depth = NULL, *bterm = NULL;
+    JSRegSimLog slog = { 0 };
     int *pred_off = NULL, *pred = NULL, *n_pred = NULL;
     int *ent_off = NULL, *ent = NULL, *out_off = NULL, *out = NULL;
     int *phi_b = NULL, *phi_i = NULL, *scratch = NULL, *popbuf = NULL;
@@ -83569,6 +83713,12 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
         memset(live_in, 0, nbits);
         memset(live_out, 0, nbits);
 
+        slog.rec_of_pc = js_malloc(ctx, (size_t)(bc_len > 0 ? bc_len : 1) * sizeof(int));
+        if (slog.rec_of_pc) {
+            for (i = 0; i < bc_len; i++)
+                slog.rec_of_pc[i] = -1;
+            slog.ok = 1;
+        }
         for (b = 0; b < n_blocks; b++) {
             int d;
             uint64_t *U, *D;
@@ -83621,6 +83771,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                 if (regvm_sim_step(fd, bc, pos, scratch, &d, push_base, &sim,
                                    pv, pdef, &ev, popbuf, popcap, NULL, NULL))
                     REGVM_DEFER("the stack-shape simulator refused an instruction (liveness)");
+                regvm_simlog_add(ctx, &slog, pos, &ev, pv, pdef);
                 prom_role = ev.slot_role;
                 prom_k = ev.slot_k;
                 if (sim.apply_homes && ev.split_v >= 0) {
@@ -83914,9 +84065,9 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                                          n_ver, split_of, copy_of,
                                          home_slot_of_def, home_mode >= 1, 0,
                                          NULL };
-                    if (regvm_sim_step(fd, bc, pos, scratch, &d2, push_base,
-                                       &sim, pv, pdef, &ev, popbuf, popcap,
-                                       NULL, NULL))
+                    if (regvm_sim_replay(&slog, fd, bc, pos, scratch, &d2,
+                                         push_base, &sim, pv, pdef, &ev, popbuf,
+                                         popcap))
                         REGVM_DEFER("the stack-shape simulator refused an instruction (value owners)");
                     if (ev.split_v >= 0 && ev.split_src >= 0 &&
                         ev.split_src < n_values &&
@@ -84216,8 +84367,8 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                 JSRegSlotSim sim = { slot_ok, ok_index, sst, home_of, n_ver,
                                      split_of, copy_of, home_slot_of_def,
                                      home_mode >= 1, 0, NULL };
-                if (regvm_sim_step(fd, bc, pos, scratch, &d2, push_base, &sim,
-                                   pv, pdef, &ev, popbuf, popcap, NULL, NULL))
+                if (regvm_sim_replay(&slog, fd, bc, pos, scratch, &d2, push_base,
+                                     &sim, pv, pdef, &ev, popbuf, popcap))
                     REGVM_DEFER("the stack-shape simulator refused an instruction (intervals)");
                 if (sim.apply_homes && ev.split_v >= 0) {
                     if (lin[pos] < istart[ev.split_v])
@@ -84325,8 +84476,8 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                 JSRegSlotSim sim = { slot_ok, ok_index, sst, home_of, n_ver,
                                      split_of, copy_of, home_slot_of_def,
                                      home_mode >= 1, 0, NULL };
-                if (regvm_sim_step(fd, bc, pos, scratch, &dd, push_base, &sim,
-                                   pv, pdef, &ev, popbuf, popcap, NULL, NULL))
+                if (regvm_sim_replay(&slog, fd, bc, pos, scratch, &dd, push_base,
+                                     &sim, pv, pdef, &ev, popbuf, popcap))
                     REGVM_DEFER("the stack-shape simulator refused an instruction (last uses)");
                 if (sim.apply_homes && ev.split_v >= 0 &&
                     ev.split_src >= 0 && ev.split_src < n_values &&
@@ -84627,10 +84778,9 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                                                      home_of, n_ver, split_of,
                                                      copy_of, home_slot_of_def,
                                                      home_mode >= 1, 0, NULL };
-                                if (regvm_sim_step(fd, bc, pos, scratch, &d2,
-                                                   push_base, &sim, pv2, pd2,
-                                                   &ev, popbuf, popcap,
-                                                   NULL, NULL)) {
+                                if (regvm_sim_replay(&slog, fd, bc, pos, scratch,
+                                                     &d2, push_base, &sim, pv2,
+                                                     pd2, &ev, popbuf, popcap)) {
                                     bad = 1;
                                     break;
                                 }
@@ -84849,6 +84999,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
     js_free(ctx, in_depth);
     js_free(ctx, out_depth);
     js_free(ctx, bterm);
+    regvm_simlog_free(ctx, &slog);
     js_free(ctx, n_pred);
     js_free(ctx, pred_off);
     js_free(ctx, pred);
