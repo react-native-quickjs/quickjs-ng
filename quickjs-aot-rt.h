@@ -61,6 +61,9 @@ typedef struct JSAotFlRec {
     JSValue *roots;
     JSObject *ifunc;
     uint32_t ipc;
+    /* 1 once the record is on rt->aot_fl_top: a body links it only around a safepoint (a call, a collection, a poll), so a call that
+       returns without one pays nothing for it. */
+    uint32_t linked;
 } JSAotFlRec;
 
 typedef struct JSAotGenLayout {
@@ -76,6 +79,7 @@ typedef struct JSAotGenLayout {
     /* The contracted layouts: the id in a JSShape, the runtime's shape array and
        count, and the bit word that records a broken contract. */
     uint32_t off_shape_layout_id;
+    uint32_t class_proxy;
     uint32_t off_rt_layout_broken, off_rt_layout_shape, off_rt_layout_count;
     uint32_t off_rt_htmldda;
     uint32_t off_string_len_bits, off_string_strv;
@@ -130,7 +134,7 @@ typedef struct JSAotGenLayout {
     /* What a direct call to a compiled leaf checks on its callee: the function
        object's bytecode, that bytecode's compiled entry, and its caches. */
     uint32_t off_object_func_bytecode, class_bytecode_function;
-    uint32_t off_fnbc_aot_fn, off_fnbc_regvm_pic;
+    uint32_t off_fnbc_aot_fn, off_fnbc_regvm_pic, off_fnbc_aot_ident;
     /* The array element read: a fast array's length and element vector, and
        the class id of an ordinary array. Read inline so a compiled `a[i]` is
        a class check, a bounds check and a load. */
@@ -182,6 +186,18 @@ typedef struct JSAotGenLayout {
     uint32_t off_regrun_hdr_pack, off_regrun_cap_ip;
     uint32_t off_fnbc_realm;
     uint32_t off_rt_regvm_cur, off_rt_stack_limit, off_rt_fl_top;
+    /* Parking a plain object inline (the side array of parked objects, see JSRuntime.zpark), the state it reads and the
+       parked bit of the allocator header (a byte `off_zct_back` before the object, bit mask `zct_mask`). */
+    uint32_t off_rt_zpark, off_rt_zpark_len, off_rt_zpark_cap, off_rt_zct_nobj, off_rt_drc_in_reconcile, off_rt_gc_phase;
+    uint32_t off_zct_back, zct_mask, class_object;
+    uint32_t off_rt_drc_pend, off_rt_drc_pend_i;
+    /* Allocating a plain object of an inline-capacity shape in compiled code (js_new_plain_object's cached-block path): the runtime's
+       block cache, its accounting words and GC list head, the object literal template, and per inline capacity 0..4 the arena class,
+       the accounting delta of a block, and the first 8 bytes of the object body from the flags (what js_new_plain_object stores). */
+    uint32_t off_rt_blkcache, off_rt_blkcache_n, off_rt_malloc_count, off_rt_malloc_size, off_rt_malloc_limit, off_rt_gc_obj_list;
+    uint32_t off_fnbc_objlit_tab, sizeof_objlit_tpl, off_tpl_shape, off_tpl_prop_count, off_object_u, plain_gcbyte, js_obj_inline_props;
+    uint32_t plain_bsi[5], plain_acct[5], plain_hdr_lo[5], plain_hdr_hi[5];
+    uint32_t off_fnbc_ctor_final_shape, off_fnbc_ctor_fn_shape, off_fnbc_ctor_proto_slot, off_fnbc_ctor_fused_ok, off_fnbc_inst_inline_cap, object_ctor_mask;
     uint32_t off_object_func_var_refs;
     uint32_t light_prefix_slots;
     /* The frame flags a generated native entry composes, from REGVM_FLAG_*. */
@@ -642,6 +658,9 @@ int qjs_aot_strproto_slot(JSContext *ctx, uint32_t atom, const void **shape,
    prototype shadows it); revalidates after a watched change. */
 int qjs_aot_ta_len_valid(JSContext *ctx);
 int qjs_aot_instanceof(JSContext *ctx, JSValue a, JSValue b);
+int qjs_aot_instof_fill(JSContext *ctx, JSValue b, void **ic);
+JSValue qjs_aot_new_fused(JSContext *ctx, JSObject *ctor, JSValue *argv, int na, const uint32_t *fm, uint32_t steal);
+void qjs_aot_fused_learn(JSContext *ctx, JSObject *ctor, JSValue inst, const uint32_t *fm);
 /* Stores a number into an in-range element of a typed array; 0 when the case is not that. */
 int qjs_aot_typed_put(JSValue recv, uint32_t idx, JSValue v);
 /* `f.apply(this, arguments)`: with the builtin `apply` and this frame's arguments not
@@ -739,6 +758,13 @@ int qjs_aot_nullish(JSValue v);
 QJS_AOT_STUB int qjs_aot_array_const(JSContext *ctx, JSRegRun *f, uint32_t idx,
                                      JSValue *out);
 
+QJS_AOT_STUB int qjs_aot_local_check(JSContext *ctx, JSRegRun *f, int slot);
+QJS_AOT_STUB void qjs_aot_close_local(JSContext *ctx, JSRegRun *f, int slot);
+QJS_AOT_STUB int qjs_aot_set_name(JSContext *ctx, JSValue v, JSAtom atom);
+/* 0 with an owned closure over the function in the pool at idx, -1 on exception. */
+QJS_AOT_STUB int qjs_aot_make_closure(JSContext *ctx, JSRegRun *f, uint32_t idx,
+                                      JSValue *out);
+
 /* --- AOT typed-region helpers ----------------------------------------------
  *
  * A region carries a value as (double, isint) and boxes only at an exit or a
@@ -791,6 +817,11 @@ QJS_AOT_STUB int qjs_aot_call_b(JSContext *ctx, int na, JSValue callee, JSValue 
    an uncaught throw inside it is finished by the interpreter on that same
    frame. 1 with an owned *out, 0 when the callee is not enterable this way,
    -1 on exception. */
+/* A call to a bytecode function the unit cannot enter natively, made directly instead of through the step engine: JS_UNINITIALIZED
+   with nothing done when `callee` is not one; otherwise the owned result or an exception. `cap` is the call's byte offset. */
+JSValue qjs_aot_call_generic(JSContext *ctx, JSRegRun *f, JSValue callee, JSValue this_obj, JSValue *argv, int na, uint32_t cap);
+
+JSValue qjs_aot_construct_learn(JSContext *ctx, JSObject *ctor, JSValue *argv, int na, const uint32_t *fm);
 int qjs_aot_call_light(JSContext *ctx, JSRegRun *caller_f, int na,
                         JSValue callee, JSValue this_obj, JSValue *argv,
                         JSValue *out);
