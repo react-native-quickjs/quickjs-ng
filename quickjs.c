@@ -34497,6 +34497,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSVarRef **var_refs;
     size_t alloca_size;
 
+#if QJS_REGVM && !defined(NDEBUG)
+    /* When a C caller's argv is used in place the callee must not write any
+       argument slot: snapshot the arguments on entry and check them before
+       returning. */
+    JSValue argv_snapshot[16];
+    int argv_snapshot_n = 0;
+#endif
+
 #if QJS_REGVM
     /* Set on the generator-rejection resume path and handed to the register
        interpreter, which unwinds from there. */
@@ -34612,6 +34620,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         arg_allocated_size = 0;
     }
 
+#if QJS_REGVM && !defined(NDEBUG)
+    /* Nothing was copied and the callee is not argument-captured, so a C
+       caller's argv is used in place. Snapshot it for the return-path check. */
+    if ((flags & JS_CALL_FLAG_COPY_ARGV) && arg_allocated_size == 0) {
+        int n = min_int(argc, b->arg_count);
+        if (n > 0 && n <= (int)(sizeof(argv_snapshot) / sizeof(argv_snapshot[0]))) {
+            memcpy(argv_snapshot, argv, sizeof(JSValue) * n);
+            argv_snapshot_n = n;
+        }
+    }
+#endif
+
 #if QJS_REGVM
     /* The register frame's temporary area is the allocator's register count,
        not the stack VM's maximum depth. */
@@ -34718,12 +34738,29 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         ast.resume_marker = NULL;
         ast.resume_pending = 0;
         ast.resume_rpc = NULL;
-        return regvm_asm_enter(&ast);
+        {
+            JSValue _r = regvm_asm_enter(&ast);
+#if !defined(NDEBUG)
+            if (argv_snapshot_n > 0)
+                assert(memcmp(argv, argv_snapshot,
+                              sizeof(JSValue) * argv_snapshot_n) == 0);
+#endif
+            return _r;
+        }
     }
 #else
-    return js_regvm_execute(caller_ctx, func_obj, this_obj, new_target, argc,
-                            argv, sf, b, local_buf, arg_buf, var_buf,
-                            stack_buf, sp, pc, flags, regvm_throw_pending);
+    {
+        JSValue _r = js_regvm_execute(caller_ctx, func_obj, this_obj,
+                                      new_target, argc, argv, sf, b, local_buf,
+                                      arg_buf, var_buf, stack_buf, sp, pc,
+                                      flags, regvm_throw_pending);
+#if !defined(NDEBUG)
+        if (argv_snapshot_n > 0)
+            assert(memcmp(argv, argv_snapshot,
+                          sizeof(JSValue) * argv_snapshot_n) == 0);
+#endif
+        return _r;
+    }
 #endif
 
 #else
