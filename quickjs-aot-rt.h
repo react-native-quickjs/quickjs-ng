@@ -78,13 +78,28 @@ extern const uint32_t qjs_aot_layout;
 uint8_t *qjs_aot_cells(JSContext *ctx);
 int qjs_aot_func_disabled(JSContext *ctx, uint32_t fn);
 /* A failed guard: count it against its deopt site, and disable the site's
-   function once the count reaches the limit. */
-void qjs_aot_note_deopt(JSContext *ctx, uint32_t site);
+   function once the count reaches the limit. Returns 1 when this call disabled
+   the function. `QJS_AOT_NO_SITE` is never counted. */
+int qjs_aot_note_deopt(JSContext *ctx, uint32_t site);
+QJS_AOT_STUB JSValue qjs_aot_deopt(JSContext *ctx, JSRegRun *f, JSValue *fr,
+                                   uint32_t pc, uint32_t site);
+/* A deopt-everywhere unit asks before a guard whether the sweep wants this
+   execution to fail. Only such a unit calls it; a normal unit has no sweep. */
+QJS_AOT_STUB int qjs_aot_should_deopt(JSContext *ctx, uint32_t site);
 
 /* Sentinels returned by qjs_aot_step; they mirror REGVM_COLD_RET and
    REGVM_STEP_SUSPEND in quickjs.c. */
 #define QJS_AOT_COLD_RET ((uint8_t *)1)
 #define QJS_AOT_SUSPEND  ((uint8_t *)2)
+
+/* `JSRegRun.deopt_pc` holds this when the activation is not deopting. */
+#define QJS_AOT_NO_DEOPT 0xffffffffu
+
+/* A deopt with no guard site: an entry that is not pc 0, a control transfer
+   the compiled graph does not model, or an unwind that resumes in the
+   interpreter. It is not counted against any guard, so nothing gets disabled
+   for leaving compiled code on a path it never compiled. */
+#define QJS_AOT_NO_SITE 0xffffffffu
 
 /* One generated function: digest, entry, reserved flags. The table is sorted
    by `digest`. */
