@@ -8987,6 +8987,27 @@ static inline void ic_watchpoint_bump(JSRuntime *rt)
 
 /* Fill an add-transition IC entry: shape `from_sh` + adding the site's atom yields
    `to_sh` with the new value at `offset`. Mirrors ic_read_update's slot/poly policy. */
+/* Whether a store of `atom` into an object of shape `pre_sh` can only have been a plain add: no object on its prototype chain
+   is exotic or has a property of that name that changes what the store does (a setter or a read-only property; a writable data
+   property is shadowed by the store's own add and does not count). A store that ends with the property added by other means (a setter that defines it itself) must not be cached
+   as "append this property", because the replay would skip the setter. Used at fill time only. */
+static bool ic_store_is_plain_add(JSShape *pre_sh, JSAtom atom)
+{
+    JSObject *po;
+    JSProperty *ppr;
+    JSShapeProperty *prs;
+
+    for (po = pre_sh->proto; po != NULL; po = po->shape->proto) {
+        if (po->is_exotic)
+            return false;
+        prs = find_own_property(&ppr, po, atom);
+        /* A writable data property on a prototype is shadowed by the store, which adds an own property: the plain add. */
+        if (prs != NULL && ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL || !(prs->flags & JS_PROP_WRITABLE)))
+            return false;
+    }
+    return true;
+}
+
 static void ic_add_transition_update(JSRuntime *rt, JSFunctionBytecode *b,
                                      uint32_t ic_idx, JSShape *from_sh,
                                      JSShape *to_sh, uint32_t offset)
@@ -26529,7 +26550,10 @@ regvm_pic_install(rt, &pic[site], &b->regvm_pic_holder[site],
        only while no interceptor has appeared on a prototype since. */
     if (pre_sh != NULL) {
         JSShape *nsh = p->shape;
-        if (nsh != pre_sh && nsh->is_hashed && nsh->prop_count == pre_count + 1) {
+        /* Saturated: the epoch can no longer say that a prototype changed. The store is replayed as "append this property"
+           only when it was a plain add (see ic_store_is_plain_add). */
+        int plain_add = rt->ic_watchpoint_epoch < JS_IC_EPOCH_MAX && ic_store_is_plain_add(pre_sh, atom);
+        if (plain_add && nsh != pre_sh && nsh->is_hashed && nsh->prop_count == pre_count + 1) {
             int s2 = b->regvm_pic_count + site;
             AOT_THRASH(b, site);
 regvm_pic_install(rt, &pic[s2], &b->regvm_pic_holder[s2],
@@ -42177,7 +42201,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                             JSShapeProperty *prs1 = find_own_property(&pr1, po, atom);
                             if (prs1 &&
                                 (prs1->flags & (JS_PROP_TMASK | JS_PROP_WRITABLE |
-                                                JS_PROP_LENGTH)) == JS_PROP_WRITABLE)
+                                                JS_PROP_LENGTH)) == JS_PROP_WRITABLE &&
+                                ic_store_is_plain_add(pre_sh, atom))
                                 ic_add_transition_update(ctx->rt, b, ic_idx, pre_sh, nsh,
                                                          (uint32_t)(pr1 - po->prop));
                         }
