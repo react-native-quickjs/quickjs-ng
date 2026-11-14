@@ -62197,7 +62197,14 @@ static void regvm_rotate_loop_test(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
             continue;
         br->rop = ROP_branch_cmp_reg_reg;
         br->n_ops = 4;
-        br->ops[0] = test->ops[0] ^ REG_CMP_INVERT;
+        /* The latch takes the opposite sense of the header test: REG_CMP_INVERT
+           for a real sub-op; the two pseudo tag tests are each other's
+           negation, so they swap. */
+        if ((unsigned)(test->ops[0] - REG_BIN_IS_UNDEF) < 2)
+            br->ops[0] = test->ops[0] ^
+                         (REG_BIN_IS_UNDEF ^ REG_BIN_IS_NOT_UNDEF);
+        else
+            br->ops[0] = test->ops[0] ^ REG_CMP_INVERT;
         br->ops[1] = test->ops[1];
         br->ops[2] = test->ops[2];
         br->ops[3] = insn_pc[nxt];
