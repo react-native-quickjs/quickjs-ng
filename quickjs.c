@@ -767,6 +767,9 @@ static inline void regvm_sf_materialize(JSRuntime *rt, JSStackFrame *sf)
    real-frame chain so a light function's own strict mode wins. */
 static bool regvm_cur_strict(JSRuntime *rt);
 static JSValueConst regvm_cur_func(JSRuntime *rt);
+/* `regvm_cur`/`rv_light` may hold a record frame as the caller; readers
+   filter through this. */
+static struct JSRegRun *regvm_light_head(struct JSRegRun *p);
 #endif
 
 #if QJS_DRC || QJS_DRC_VALIDATE
@@ -787,14 +790,13 @@ static void regvm_for_each_root_range(JSRuntime *rt, JSRegRootFn fn,
     JSStackFrame *sf;
 
 #if QJS_REGVM
-    regvm_light_walk(rt->regvm_cur, fn, opaque);
+    regvm_light_walk(regvm_light_head(rt->regvm_cur), fn, opaque);
 #endif
     for (sf = rt->current_stack_frame; sf != NULL; sf = sf->prev_frame) {
         if (sf->rv_regs && sf->rv_nregs)
             fn(opaque, sf->rv_regs, sf->rv_nregs);
 #if QJS_REGVM
-        if (sf->rv_light)
-            regvm_light_walk(sf->rv_light, fn, opaque);
+        regvm_light_walk(regvm_light_head(sf->rv_light), fn, opaque);
 #endif
     }
 }
@@ -2534,7 +2536,7 @@ static void js_trigger_gc(JSRuntime *rt, size_t size)
     if (force_gc) {
         /* deferred: collect at the next safepoint, not under running JS */
         if (rt->gc_deferred && (rt->current_stack_frame != NULL
-                                || rt->regvm_cur != NULL) &&
+                                || regvm_light_head(rt->regvm_cur) != NULL) &&
             (rt->malloc_state.malloc_size + size) < rt->gc_deferred_limit) {
             rt->gc_pending = true;
             rt->malloc_gc_threshold = rt->malloc_state.malloc_size +
@@ -4744,7 +4746,7 @@ void JS_UpdateStackTop(JSRuntime *rt)
 static inline bool is_strict_mode(JSContext *ctx)
 {
 #if QJS_REGVM
-    if (ctx->rt->regvm_cur)
+    if (regvm_light_head(ctx->rt->regvm_cur))
         return regvm_cur_strict(ctx->rt);
 #endif
     JSStackFrame *sf = ctx->rt->current_stack_frame;
@@ -10417,7 +10419,8 @@ void JS_RunPendingGC(JSRuntime *rt)
 {
     if (!rt->gc_pending)
         return;
-    assert(rt->current_stack_frame == NULL && rt->regvm_cur == NULL);
+    assert(rt->current_stack_frame == NULL
+           && regvm_light_head(rt->regvm_cur) == NULL);
     rt->gc_pending = false;
     JS_RunGC(rt);
     rt->malloc_gc_threshold = rt->malloc_state.malloc_size +
@@ -21716,7 +21719,7 @@ static __exception int JS_CopyDataProperties(JSContext *ctx,
 static JSValueConst JS_GetActiveFunction(JSContext *ctx)
 {
 #if QJS_REGVM
-    if (ctx->rt->regvm_cur)
+    if (regvm_light_head(ctx->rt->regvm_cur))
         return regvm_cur_func(ctx->rt);
 #endif
     return ctx->rt->current_stack_frame->cur_func;
@@ -24515,6 +24518,14 @@ _Static_assert(offsetof(JSRegRun, ret_dst) == offsetof(JSRegRun, hdr_pack) &&
                offsetof(JSRegRun, nctl) == offsetof(JSRegRun, hdr_pack) + 6,
                "hdr_pack field order");
 
+/* The return path stores its caller into `regvm_cur` without testing for a
+   record frame. A light frame is one with `sf == NULL`, so every reader of
+   `regvm_cur` or `rv_light` filters through here. */
+static inline JSRegRun *regvm_light_head(JSRegRun *p)
+{
+    return (p != NULL && p->sf == NULL) ? p : NULL;
+}
+
 #if QJS_REGVM && (QJS_DRC || QJS_DRC_VALIDATE)
 /* Walk one light chain, innermost first, publishing each frame's register
    window as a root range (registers borrow under DRC). The chain ends at the
@@ -24542,7 +24553,7 @@ static int regvm_fill_backtrace_frames(JSRuntime *rt, JSRegBtFrame *bt, int max)
     JSRegRun *lf;
     JSStackFrame *sf;
 
-    for (lf = rt->regvm_cur;
+    for (lf = regvm_light_head(rt->regvm_cur);
          lf != NULL && nb < max;
          lf = (lf->caller && lf->caller->sf == NULL) ? lf->caller : NULL) {
         bt[nb].func = JS_MKPTR(JS_TAG_OBJECT, lf->func);
@@ -24563,7 +24574,7 @@ static int regvm_fill_backtrace_frames(JSRuntime *rt, JSRegBtFrame *bt, int max)
         bt[nb].rpc = fb ? regvm_frame_pc(rt, sf, fb) : -1;
         bt[nb].sf = sf;
         nb++;
-        for (lf = sf->rv_light;
+        for (lf = regvm_light_head(sf->rv_light);
              lf != NULL && nb < max;
              lf = (lf->caller && lf->caller->sf == NULL) ? lf->caller : NULL) {
             bt[nb].func = JS_MKPTR(JS_TAG_OBJECT, lf->func);
@@ -24580,14 +24591,14 @@ static int regvm_fill_backtrace_frames(JSRuntime *rt, JSRegBtFrame *bt, int max)
    JSRegRun so `is_strict_mode` and `JS_GetActiveFunction` can read it. */
 static bool regvm_cur_strict(JSRuntime *rt)
 {
-    JSRegRun *lf = rt->regvm_cur;
+    JSRegRun *lf = regvm_light_head(rt->regvm_cur);
 
     return lf != NULL && lf->b->is_strict_mode;
 }
 
 static JSValueConst regvm_cur_func(JSRuntime *rt)
 {
-    JSRegRun *lf = rt->regvm_cur;
+    JSRegRun *lf = regvm_light_head(rt->regvm_cur);
 
     return lf ? JS_MKPTR(JS_TAG_OBJECT, lf->func) : JS_UNDEFINED;
 }
@@ -25877,7 +25888,7 @@ static uint8_t *REGVM_CC regvm_t_return(REGVM_ARGS)
                 __attribute__((musttail))
                     return regvm_t_return_light_chunk(REGVM_PASS);
             }
-            ctx->rt->regvm_cur = (c->sf == NULL) ? c : NULL;
+            ctx->rt->regvm_cur = c;
             *(JSValue *)((uint8_t *)c->fr + dst) = v;
             /* No `regvm_tail_chain` reset: a light frame never tail-calls and
                its return does not end the caller's chain. */
@@ -25943,7 +25954,7 @@ static uint8_t *REGVM_CC regvm_t_return_undefined(REGVM_ARGS)
                 __attribute__((musttail))
                     return regvm_t_return_light_chunk(REGVM_PASS);
             }
-            ctx->rt->regvm_cur = (c->sf == NULL) ? c : NULL;
+            ctx->rt->regvm_cur = c;
             *(JSValue *)((uint8_t *)c->fr + dst) = JS_UNDEFINED;
             /* No `regvm_tail_chain` reset: a light frame never tail-calls and
                its return does not end the caller's chain. */
@@ -26480,7 +26491,7 @@ regvm_t_return_light_chunk(REGVM_ARGS)
     JSValue v = f->ret;
 
     regvm_arena_pop_chunk(ctx->rt);
-    ctx->rt->regvm_cur = (c->sf == NULL) ? c : NULL;
+    ctx->rt->regvm_cur = c;
     *(JSValue *)((uint8_t *)c->fr + dst) = v;
     ctx->rt->regvm_tail_chain = 0;
     f = c;
@@ -26514,7 +26525,7 @@ regvm_t_return_light_nested(REGVM_ARGS)
         if (unlikely(top == 0 && ctx->rt->regvm_chunk->prev))
             regvm_arena_pop_chunk(ctx->rt);
     }
-    ctx->rt->regvm_cur = (c->sf == NULL) ? c : NULL;
+    ctx->rt->regvm_cur = c;
     *(JSValue *)((uint8_t *)c->fr + dst) = v;
 #if QJS_DRC
     /* `regvm_t_return` duplicated `v` before the release walk; the caller's
@@ -29065,7 +29076,7 @@ static uint8_t *REGVM_CC regvm_t_unwind_loop(REGVM_ARGS)
             if (unlikely(top == 0 && ctx->rt->regvm_chunk->prev))
                 regvm_arena_pop_chunk(ctx->rt);
         }
-        ctx->rt->regvm_cur = (c->sf == NULL) ? c : NULL;
+        ctx->rt->regvm_cur = c;
         f = c;
         fr = c->fr;
         __attribute__((musttail)) return regvm_t_unwind_loop(REGVM_PASS);
@@ -39071,7 +39082,8 @@ JSValue JS_Call(JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj,
     JSValue res = JS_CallInternal(ctx, func_obj, this_obj, JS_UNDEFINED,
                                   argc, argv, JS_CALL_FLAG_COPY_ARGV);
 #if QJS_DRC
-    if (ctx->rt->current_stack_frame == NULL && ctx->rt->regvm_cur == NULL)
+    if (ctx->rt->current_stack_frame == NULL
+        && regvm_light_head(ctx->rt->regvm_cur) == NULL)
         js_drc_safepoint(ctx->rt);
 #endif
     return res;
@@ -69653,7 +69665,7 @@ static JSValue JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     if (unlikely(!ctx->eval_internal)) {
         return JS_ThrowTypeError(ctx, "eval is not supported");
     }
-    if (!rt->current_stack_frame && !rt->regvm_cur) {
+    if (!rt->current_stack_frame && !regvm_light_head(rt->regvm_cur)) {
         JS_FreeValueRT(rt, ctx->error_back_trace);
         ctx->error_back_trace = JS_UNDEFINED;
     }
