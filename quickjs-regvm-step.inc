@@ -2472,6 +2472,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_global(uint8_t *ip, JSValue *fr, JSRegR
                 int d = RD_REG();
                 JSAtom atom = RD_U32();
                 int throwing = RD_U8();
+                (void)RD_U16();
                 JSValue val;
                 /* The cell cache first, as the stack VM's OP_get_var does. A
                    filled cell has passed the TDZ test, and both a write of
