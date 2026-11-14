@@ -1780,6 +1780,31 @@ JS_EXTERN const char* JS_GetVersion(void);
 /* Integration point for quickjs-libc.c, not for public use. */
 JS_EXTERN uintptr_t js_std_cmd(int cmd, ...);
 
+/* ---- fact groups (AOT-REDESIGN.md section 4) ----------------------------------------------------
+   One group per watched object: its [[prototype]] (PROTO), the values of the listed own data properties, and with CLOSED no other
+   own property. PENDING until `qjs_aot_fact_validate` finds the object matching; VALID until any mutator changes it; then BROKEN for good.
+   `qjs_aot_fact_depend` ties a bit of a word the caller owns to the group: set while VALID, cleared on break. FRESH: a construct of the
+   object (a constructor) while the group is still PENDING breaks it, because an instance made earlier has another prototype.
+   Per runtime: a group belongs to the runtime of the context that made it. */
+typedef struct JSAotFact JSAotFact;
+#define QJS_AOT_FACT_PROTO  1u
+#define QJS_AOT_FACT_CLOSED 2u
+#define QJS_AOT_FACT_FRESH  4u
+enum { QJS_AOT_FACT_PENDING = 0, QJS_AOT_FACT_VALID = 1, QJS_AOT_FACT_BROKEN = 2 };
+JS_EXTERN JSAotFact *qjs_aot_fact_new(JSContext *ctx, JSValueConst obj, JSValueConst proto, uint32_t flags,
+                            const JSAtom *atoms, int natoms);
+JS_EXTERN int qjs_aot_fact_expect(JSContext *ctx, JSAotFact *g, JSAtom atom, JSValueConst val);
+JS_EXTERN int qjs_aot_fact_expect_proto(JSContext *ctx, JSAotFact *g, JSValueConst proto);
+JS_EXTERN int qjs_aot_fact_validate(JSContext *ctx, JSAotFact *g);
+JS_EXTERN int qjs_aot_fact_state(const JSAotFact *g);
+JS_EXTERN void qjs_aot_fact_depend(JSAotFact *g, uint32_t *word, uint32_t mask);
+JS_EXTERN void qjs_aot_fact_break(JSContext *ctx, JSAotFact *g);
+JS_EXTERN uint32_t qjs_aot_facts_breaks(JSRuntime *rt);
+/* A compiled unit serves one runtime at a time (the first to bind a function owns it; another binds nothing and interprets). These
+   report the number of functions bound in `rt`, and the bundle tag the unit was generated for (0: none). */
+JS_EXTERN uint32_t qjs_aot_runtime_bound(JSRuntime *rt);
+JS_EXTERN uint64_t qjs_aot_runtime_bundle(JSRuntime *rt);
+
 #ifdef __cplusplus
 } /* extern "C" { */
 #endif

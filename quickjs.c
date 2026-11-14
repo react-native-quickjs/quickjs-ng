@@ -796,6 +796,10 @@ struct JSRuntime {
     /* Prototype/global watchpoint bumps, counted because the AOT
        prototype-epoch guard assumes prototypes settle after startup. */
     uint64_t aot_epoch_bumps;
+    /* Fact groups (see the block before js_aot_content_store); NULL until the first one is made. */
+    struct JSAotFacts *aot_facts;
+    /* The bundle tag of the unit this runtime is bound to (0: none). */
+    uint64_t aot_unit_tag;
 
 #if QJS_AOT_PROFILE
     /* Nonzero when QJS_AOT_PROFILE_OUT named a file: the profiler's switch. */
@@ -2971,6 +2975,14 @@ static int js_shape_prepare_update(JSContext *ctx, JSObject *p,
                                    JSShapeProperty **pprs);
 static inline void js_aot_layout_leave(JSRuntime *rt, JSShape *old_sh);
 static inline void js_aot_mark_prototype(JSRuntime *rt, JSObject *p);
+/* What a watched object (JSObject.gv_watched) reports to the fact groups, from the engine's lowest-level mutators. */
+enum { JS_AOT_EV_ADD = 1, JS_AOT_EV_STORE, JS_AOT_EV_EDIT, JS_AOT_EV_PROTO, JS_AOT_EV_CONSTRUCT };
+static void js_aot_obj_event(JSRuntime *rt, JSObject *p, int ev, JSAtom atom, JSValueConst val);
+static void js_aot_facts_free(JSRuntime *rt);
+#if QJS_AOT
+static void js_aot_unit_release(JSRuntime *rt);
+#endif
+static void js_aot_facts_eval_scan(JSContext *ctx, JSFunctionBytecode *b);
 static inline void js_aot_content_store(JSRuntime *rt, JSObject *p, uint32_t slot, JSValue v);
 static inline void js_aot_content_enter(JSRuntime *rt, JSObject *p);
 static inline void js_aot_content_filled(JSRuntime *rt, JSObject *p);
@@ -4436,6 +4448,7 @@ void JS_FreeRuntime(JSRuntime *rt)
     }
     while (rt->aot_gwatch_n != 0)
         JS_FreeAtomRT(rt, rt->aot_gwatch[--rt->aot_gwatch_n]);
+    js_aot_facts_free(rt);
     for (int i = 0; i < JS_PIN_MEMO_SIZE; i++) {
         if (rt->pin_memo_shape[i]) {
             js_free_shape(rt, rt->pin_memo_shape[i]);
@@ -4564,6 +4577,9 @@ void JS_FreeRuntime(JSRuntime *rt)
     }
 #if QJS_AOT || QJS_AOT_GEN
     js_free_rt(rt, rt->aot_bound);
+#endif
+#if QJS_AOT
+    js_aot_unit_release(rt);
 #endif
     js_free_rt(rt, rt->class_array);
 
@@ -9333,8 +9349,10 @@ static int add_shape_property(JSContext *ctx, JSShape **psh,
     intptr_t h;
 
     /* A watched object gaining a property can shadow a cached name. */
-    if (unlikely(p != NULL && p->gv_watched))
+    if (unlikely(p != NULL && p->gv_watched)) {
         js_gv_cell_invalidate(ctx->rt);
+        js_aot_obj_event(ctx->rt, p, JS_AOT_EV_ADD, atom, JS_UNDEFINED);
+    }
 
     /* update the shape hash */
     if (sh->is_hashed) {
@@ -13272,6 +13290,8 @@ static int JS_SetPrototypeInternal(JSContext *ctx, JSValueConst obj,
         js_dup(proto_val);
     }
 
+    if (unlikely(p->gv_watched))
+        js_aot_obj_event(ctx->rt, p, JS_AOT_EV_PROTO, JS_ATOM_NULL, JS_UNDEFINED);
     if (js_shape_prepare_update(ctx, p, NULL))
         return -1;
     sh = p->shape;
@@ -14795,8 +14815,10 @@ static JSProperty *add_property(JSContext *ctx,
     JSShape *sh, *new_sh;
 
     /* Covers add_property's find_hashed_shape_prop fast branch. */
-    if (unlikely(p->gv_watched))
+    if (unlikely(p->gv_watched)) {
         js_gv_cell_invalidate(ctx->rt);
+        js_aot_obj_event(ctx->rt, p, JS_AOT_EV_ADD, prop, JS_UNDEFINED);
+    }
 
     if (unlikely(p->is_prototype)) {
         /* track addition of small integer properties to
@@ -16758,6 +16780,385 @@ static void js_aot_gwrite_slot(JSRuntime *rt, JSObject *p, uint32_t slot)
         js_aot_gwrite(rt, get_shape_prop(p->shape)[slot].atom);
 }
 
+/* ---- fact groups (AOT-REDESIGN.md section 4) -----------------------------------------------
+   A fact group states what compiled code was built on about ONE object: its [[prototype]], the values of some of its own data
+   properties (function identities, mostly) and, when CLOSED, that it has no other own property. It has three states:
+     PENDING   made, not yet checked against the heap (or checked and different);
+     VALID     the object matches and every lowest-level mutator reports a change to it;
+     BROKEN    some mutator changed it (permanent: there is no re-promotion).
+   A dependent is a word and a mask in the unit's statics: the bit is set while the group is VALID and cleared when it breaks.
+   The object is flagged `gv_watched`, which the engine's mutators (add_shape_property, add_property, js_shape_prepare_update,
+   js_aot_content_store, the IC add paths, JS_SetPrototypeInternal, js_create_from_ctor_cap) already test, so every way of changing it
+   (bytecode, builtins, Reflect, defineProperty, freeze, spread, the C API) reports here. It is also marked a prototype, which keeps
+   the interpreter's add and store caches off it. Everything is per runtime: nothing in this block is process-global. */
+struct JSAotFactDep { uint32_t *word; uint32_t mask; };
+struct JSAotFactProp { JSAtom atom; JSValue val; };
+struct JSAotFact {
+    JSRuntime *rt;
+    JSObject *obj;
+    JSValue objv;           /* the counted reference that keeps obj alive */
+    JSValue proto;          /* the expected [[prototype]] when QJS_AOT_FACT_PROTO is set */
+    uint32_t flags;
+    uint8_t state;
+    int nprops;
+    struct JSAotFactProp *props;
+    int ndep, depcap;
+    struct JSAotFactDep *dep;
+};
+typedef struct JSAotFacts {
+    JSAotFact **g;
+    int n, cap;
+    uint32_t breaks;
+} JSAotFacts;
+
+#ifdef QJS_KIT_TEST_KNOBS
+/* The vkit's negative controls: QJS_AOT_FACTS_OFF=add,store,edit,proto,construct,eval,all switches a mechanism off so its case can be
+   seen to fail. */
+static uint32_t js_aot_facts_off_mask(void)
+{
+    static int init;
+    static uint32_t m;
+    if (!init) {
+        const char *s = getenv("QJS_AOT_FACTS_OFF");
+        init = 1;
+        if (s != NULL) {
+            if (strstr(s, "all")) m = ~0u;
+            if (strstr(s, "add")) m |= 1u << JS_AOT_EV_ADD;
+            if (strstr(s, "store")) m |= 1u << JS_AOT_EV_STORE;
+            if (strstr(s, "edit")) m |= 1u << JS_AOT_EV_EDIT;
+            if (strstr(s, "proto")) m |= 1u << JS_AOT_EV_PROTO;
+            if (strstr(s, "construct")) m |= 1u << JS_AOT_EV_CONSTRUCT;
+            if (strstr(s, "eval")) m |= 1u << 31;
+        }
+    }
+    return m;
+}
+#else
+#define js_aot_facts_off_mask() 0u
+#endif
+
+static bool js_aot_fact_same(JSValueConst a, JSValueConst b)
+{
+    int tag = JS_VALUE_GET_TAG(a);
+    if (tag != JS_VALUE_GET_TAG(b))
+        return false;
+    if (JS_VALUE_HAS_REF_COUNT(a))
+        return JS_VALUE_GET_PTR(a) == JS_VALUE_GET_PTR(b);
+    if (JS_TAG_IS_FLOAT64(tag)) {
+        double x = JS_VALUE_GET_FLOAT64(a), y = JS_VALUE_GET_FLOAT64(b);
+        return memcmp(&x, &y, sizeof(x)) == 0;
+    }
+    if (tag == JS_TAG_INT || tag == JS_TAG_BOOL)
+        return JS_VALUE_GET_INT(a) == JS_VALUE_GET_INT(b);
+    return true;
+}
+
+static int js_aot_fact_listed(const JSAotFact *g, JSAtom atom)
+{
+    int i;
+    for (i = 0; i < g->nprops; i++)
+        if (g->props[i].atom == atom)
+            return i;
+    return -1;
+}
+
+/* Whether the object is, right now, what the group says. */
+static bool js_aot_fact_matches(const JSAotFact *g)
+{
+    JSObject *p = g->obj;
+    int i;
+    if (p->class_id == JS_CLASS_PROXY || p->class_id == JS_CLASS_MODULE_NS)
+        return false;
+    if (g->flags & QJS_AOT_FACT_PROTO) {
+        JSObject *sp = p->shape->proto;
+        if (JS_IsNull(g->proto) ? sp != NULL : sp != JS_VALUE_GET_OBJ(g->proto))
+            return false;
+    }
+    for (i = 0; i < g->nprops; i++) {
+        JSProperty *pr;
+        JSShapeProperty *prs = find_own_property(&pr, p, g->props[i].atom);
+        if (prs == NULL || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL || !js_aot_fact_same(pr->u.value, g->props[i].val))
+            return false;
+    }
+    if ((g->flags & QJS_AOT_FACT_CLOSED) &&
+        p->shape->prop_count - p->shape->deleted_prop_count != g->nprops)
+        return false;
+    return true;
+}
+
+static void js_aot_fact_set_deps(JSAotFact *g, int on)
+{
+    int i;
+    for (i = 0; i < g->ndep; i++) {
+        if (on)
+            *g->dep[i].word |= g->dep[i].mask;
+        else
+            *g->dep[i].word &= ~g->dep[i].mask;
+    }
+}
+
+/* Break a group: from a mutator, so nothing here allocates, frees or calls out. Its references are released later (sweep). */
+static void js_aot_fact_break_now(JSAotFacts *F, JSAotFact *g)
+{
+    if (g->state == QJS_AOT_FACT_BROKEN)
+        return;
+    g->state = QJS_AOT_FACT_BROKEN;
+    F->breaks++;
+    js_aot_fact_set_deps(g, 0);
+}
+
+static void js_aot_obj_event(JSRuntime *rt, JSObject *p, int ev, JSAtom atom, JSValueConst val)
+{
+    JSAotFacts *F = rt->aot_facts;
+    int i;
+    if (F == NULL || (js_aot_facts_off_mask() & (1u << ev)))
+        return;
+    for (i = 0; i < F->n; i++) {
+        JSAotFact *g = F->g[i];
+        int k;
+        if (g->obj != p || g->state == QJS_AOT_FACT_BROKEN)
+            continue;
+        if (ev == JS_AOT_EV_CONSTRUCT) {
+            /* an instance made before the group was valid has a prototype the group does not know */
+            if (g->state == QJS_AOT_FACT_PENDING && (g->flags & QJS_AOT_FACT_FRESH))
+                js_aot_fact_break_now(F, g);
+            continue;
+        }
+        if (g->state != QJS_AOT_FACT_VALID)
+            continue;
+        k = atom != JS_ATOM_NULL ? js_aot_fact_listed(g, atom) : -1;
+        switch (ev) {
+        case JS_AOT_EV_ADD:
+            if (k >= 0 || (g->flags & QJS_AOT_FACT_CLOSED))
+                js_aot_fact_break_now(F, g);
+            break;
+        case JS_AOT_EV_STORE:
+            if (k >= 0 && !js_aot_fact_same(val, g->props[k].val))
+                js_aot_fact_break_now(F, g);
+            break;
+        case JS_AOT_EV_EDIT:
+            /* a delete, an attribute change or a redefinition of a listed property, or of any property of a closed object (an edit
+               that names no property is a prototype change or an array conversion, which the PROTO event covers) */
+            if (k >= 0 || (g->flags & QJS_AOT_FACT_CLOSED))
+                js_aot_fact_break_now(F, g);
+            break;
+        case JS_AOT_EV_PROTO:
+            if (g->flags & QJS_AOT_FACT_PROTO)
+                js_aot_fact_break_now(F, g);
+            break;
+        }
+    }
+}
+
+/* Release what broken groups hold. Not from a mutator: freeing a value can run a finalizer. */
+static void js_aot_facts_sweep(JSRuntime *rt)
+{
+    JSAotFacts *F = rt->aot_facts;
+    int i, j;
+    if (F == NULL)
+        return;
+    for (i = 0; i < F->n; i++) {
+        JSAotFact *g = F->g[i];
+        if (g->state != QJS_AOT_FACT_BROKEN || JS_IsUndefined(g->objv))
+            continue;
+        for (j = 0; j < g->nprops; j++) {
+            JS_FreeValueRT(rt, g->props[j].val);
+            JS_FreeAtomRT(rt, g->props[j].atom);
+        }
+        g->nprops = 0;
+        JS_FreeValueRT(rt, g->proto);
+        g->proto = JS_UNDEFINED;
+        JS_FreeValueRT(rt, g->objv);
+        g->objv = JS_UNDEFINED;
+        g->obj = NULL;
+    }
+}
+
+static void js_aot_facts_free(JSRuntime *rt)
+{
+    JSAotFacts *F = rt->aot_facts;
+    int i;
+    if (F == NULL)
+        return;
+    for (i = 0; i < F->n; i++)
+        F->g[i]->state = QJS_AOT_FACT_BROKEN;
+    js_aot_facts_sweep(rt);
+    for (i = 0; i < F->n; i++) {
+        js_free_rt(rt, F->g[i]->props);
+        js_free_rt(rt, F->g[i]->dep);
+        js_free_rt(rt, F->g[i]);
+    }
+    js_free_rt(rt, F->g);
+    js_free_rt(rt, F);
+    rt->aot_facts = NULL;
+}
+
+JSAotFact *qjs_aot_fact_new(JSContext *ctx, JSValueConst obj, JSValueConst proto, uint32_t flags,
+                            const JSAtom *atoms, int natoms)
+{
+    JSRuntime *rt = ctx->rt;
+    JSAotFacts *F;
+    JSAotFact *g;
+    JSObject *p;
+    int i;
+
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+        return NULL;
+    p = JS_VALUE_GET_OBJ(obj);
+    if (p->class_id == JS_CLASS_PROXY || p->class_id == JS_CLASS_MODULE_NS)
+        return NULL;
+    if (rt->aot_facts == NULL) {
+        rt->aot_facts = js_mallocz_rt(rt, sizeof(JSAotFacts));
+        if (rt->aot_facts == NULL)
+            return NULL;
+    }
+    js_aot_facts_sweep(rt);
+    F = rt->aot_facts;
+    g = js_mallocz_rt(rt, sizeof(*g));
+    if (g == NULL)
+        return NULL;
+    g->props = natoms > 0 ? js_mallocz_rt(rt, sizeof(g->props[0]) * (size_t)natoms) : NULL;
+    if (natoms > 0 && g->props == NULL) {
+        js_free_rt(rt, g);
+        return NULL;
+    }
+    g->rt = rt;
+    g->objv = js_dup(obj);
+    g->obj = p;
+    g->flags = flags;
+    g->proto = JS_UNDEFINED;
+    if (flags & QJS_AOT_FACT_PROTO)
+        g->proto = js_dup(JS_VALUE_GET_TAG(proto) == JS_TAG_OBJECT ? proto : JS_NULL);
+    for (i = 0; i < natoms; i++) {
+        JSProperty *pr;
+        JSShapeProperty *prs = find_own_property(&pr, p, atoms[i]);
+        if (prs == NULL || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+            goto fail;
+        g->props[g->nprops].atom = JS_DupAtom(ctx, atoms[i]);
+        g->props[g->nprops].val = js_dup(pr->u.value);
+        g->nprops++;
+    }
+    if (F->n == F->cap) {
+        int ncap = F->cap ? F->cap * 2 : 16;
+        JSAotFact **ng = js_realloc_rt(rt, F->g, sizeof(F->g[0]) * (size_t)ncap);
+        if (ng == NULL)
+            goto fail;
+        F->g = ng;
+        F->cap = ncap;
+    }
+    F->g[F->n++] = g;
+    /* From now on every mutator of the object reports to the groups. The object is a prototype as far as the engine's caches are
+       concerned (they stay off it), and the flag is one-way, like gv_watched. */
+    p->gv_watched = 1;
+    js_aot_mark_prototype(rt, p);
+    return g;
+fail:
+    for (i = 0; i < g->nprops; i++) {
+        JS_FreeValueRT(rt, g->props[i].val);
+        JS_FreeAtomRT(rt, g->props[i].atom);
+    }
+    JS_FreeValueRT(rt, g->proto);
+    JS_FreeValueRT(rt, g->objv);
+    js_free_rt(rt, g->props);
+    js_free_rt(rt, g);
+    return NULL;
+}
+
+/* Say what a PENDING group should find: the value of one own data property (replacing an earlier expectation of it), and the [[prototype]].
+   A group is made when its object first exists, before the program has finished building it; the expectation is its final state. */
+int qjs_aot_fact_expect(JSContext *ctx, JSAotFact *g, JSAtom atom, JSValueConst val)
+{
+    int k;
+    if (g->state != QJS_AOT_FACT_PENDING)
+        return -1;
+    k = js_aot_fact_listed(g, atom);
+    if (k >= 0) {
+        JSValue old = g->props[k].val;
+        g->props[k].val = js_dup(val);
+        JS_FreeValue(ctx, old);
+        return 0;
+    }
+    {
+        struct JSAotFactProp *np = js_realloc_rt(g->rt, g->props, sizeof(g->props[0]) * (size_t)(g->nprops + 1));
+        if (np == NULL)
+            return -1;
+        g->props = np;
+        g->props[g->nprops].atom = JS_DupAtom(ctx, atom);
+        g->props[g->nprops].val = js_dup(val);
+        g->nprops++;
+    }
+    return 0;
+}
+
+int qjs_aot_fact_expect_proto(JSContext *ctx, JSAotFact *g, JSValueConst proto)
+{
+    JSValue old;
+    if (g->state != QJS_AOT_FACT_PENDING)
+        return -1;
+    old = g->proto;
+    g->proto = js_dup(JS_VALUE_GET_TAG(proto) == JS_TAG_OBJECT ? proto : JS_NULL);
+    g->flags |= QJS_AOT_FACT_PROTO;
+    JS_FreeValue(ctx, old);
+    return 0;
+}
+
+int qjs_aot_fact_validate(JSContext *ctx, JSAotFact *g)
+{
+    (void)ctx;
+    if (g->state == QJS_AOT_FACT_PENDING && js_aot_fact_matches(g)) {
+        g->state = QJS_AOT_FACT_VALID;
+        js_aot_fact_set_deps(g, 1);
+    }
+    return g->state;
+}
+
+int qjs_aot_fact_state(const JSAotFact *g)
+{
+    return g->state;
+}
+
+void qjs_aot_fact_depend(JSAotFact *g, uint32_t *word, uint32_t mask)
+{
+    if (g->ndep == g->depcap) {
+        int ncap = g->depcap ? g->depcap * 2 : 4;
+        struct JSAotFactDep *nd = js_realloc_rt(g->rt, g->dep, sizeof(g->dep[0]) * (size_t)ncap);
+        if (nd == NULL)
+            return;
+        g->dep = nd;
+        g->depcap = ncap;
+    }
+    g->dep[g->ndep].word = word;
+    g->dep[g->ndep].mask = mask;
+    g->ndep++;
+    if (g->state == QJS_AOT_FACT_VALID)
+        *word |= mask;
+}
+
+void qjs_aot_fact_break(JSContext *ctx, JSAotFact *g)
+{
+    JSAotFacts *F = ctx->rt->aot_facts;
+    if (F != NULL)
+        js_aot_fact_break_now(F, g);
+}
+
+uint32_t qjs_aot_facts_breaks(JSRuntime *rt)
+{
+    return rt->aot_facts != NULL ? rt->aot_facts->breaks : 0;
+}
+
+#if !QJS_AOT
+uint32_t qjs_aot_runtime_bound(JSRuntime *rt)
+{
+    (void)rt;
+    return 0;
+}
+
+uint64_t qjs_aot_runtime_bundle(JSRuntime *rt)
+{
+    return rt->aot_unit_tag;
+}
+#endif
+
 static inline void js_aot_content_store(JSRuntime *rt, JSObject *p, uint32_t slot, JSValue v)
 {
 #if QJS_AOT_PROFILE
@@ -16765,8 +17166,11 @@ static inline void js_aot_content_store(JSRuntime *rt, JSObject *p, uint32_t slo
 #endif
     if (unlikely(p->shape->layout_id != 0))
         js_aot_content_store_slow(rt, p, slot, v);
-    if (unlikely(p->gv_watched))
+    if (unlikely(p->gv_watched)) {
         js_aot_gwrite_slot(rt, p, slot);
+        if (unlikely(rt->aot_facts != NULL) && slot < (uint32_t)p->shape->prop_count)
+            js_aot_obj_event(rt, p, JS_AOT_EV_STORE, get_shape_prop(p->shape)[slot].atom, v);
+    }
 }
 
 /* An object has just adopted a contracted shape, or a template filled one. Every slot but the
@@ -16841,8 +17245,10 @@ static int js_shape_prepare_update(JSContext *ctx, JSObject *p,
     uint32_t idx = 0;    /* prevent warning */
 
     /* Every in-place shape-property mutation passes through here. */
-    if (unlikely(p->gv_watched))
+    if (unlikely(p->gv_watched)) {
         js_gv_cell_invalidate(ctx->rt);
+        js_aot_obj_event(ctx->rt, p, JS_AOT_EV_EDIT, pprs != NULL && *pprs != NULL ? (*pprs)->atom : JS_ATOM_NULL, JS_UNDEFINED);
+    }
 
     sh = p->shape;
     if (sh->is_hashed) {
@@ -26618,8 +27024,10 @@ static int regvm_put_field_add_hit(JSContext *ctx, JSFunctionBytecode *b,
     osh = p->shape;
     /* a watched object (the global objects) gaining a property invalidates
        every cached cell, the same as the generic add paths do */
-    if (unlikely(p->gv_watched))
+    if (unlikely(p->gv_watched)) {
         js_gv_cell_invalidate(ctx->rt);
+        js_aot_obj_event(ctx->rt, p, JS_AOT_EV_ADD, JS_ATOM_NULL, JS_UNDEFINED);
+    }
     if (nsh->prop_size != osh->prop_size &&
         (uint32_t)nsh->prop_size > p->prop_inline_cap) {
         JSProperty *np = js_prop_grow(ctx, p,
@@ -42144,8 +42552,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 JSShape *osh = p->shape;
                                 /* a watched object gaining a property invalidates
                                    every cached cell, as the generic add paths do */
-                                if (unlikely(p->gv_watched))
+                                if (unlikely(p->gv_watched)) {
                                     js_gv_cell_invalidate(ctx->rt);
+                                    js_aot_obj_event(ctx->rt, p, JS_AOT_EV_ADD, JS_ATOM_NULL, JS_UNDEFINED);
+                                }
                                 if (nsh->prop_size != osh->prop_size) {
                                     JSProperty *np = js_prop_grow(ctx, p,
                                             sizeof(p->prop[0]) * nsh->prop_size);
@@ -43740,6 +44150,8 @@ static JSValue js_create_from_ctor_cap(JSContext *ctx, JSValueConst ctor,
     JSProperty *ppr = NULL;
     JSFunctionBytecode *fb = NULL;
 
+    if (unlikely(ctx->rt->aot_facts != NULL) && JS_VALUE_GET_TAG(ctor) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(ctor)->gv_watched)
+        js_aot_obj_event(ctx->rt, JS_VALUE_GET_OBJ(ctor), JS_AOT_EV_CONSTRUCT, JS_ATOM_NULL, JS_UNDEFINED);
     if (JS_IsUndefined(ctor)) {
         proto = js_dup(ctx->class_proto[class_id]);
     } else {
@@ -45546,6 +45958,116 @@ static const JSOpCode opcode_info[OP_COUNT + (OP_TEMP_END - OP_TEMP_START)] = {
 #define short_opcode_info(op)           \
     opcode_info[(op) >= OP_TEMP_START ? \
                 (op) + (OP_TEMP_END - OP_TEMP_START) : (op)]
+
+/* ---- the eval scan --------------------------------------------------------------------------
+   Code that arrives as text (eval, indirect eval, new Function, a module loaded at run time, JS_Eval from the host) is looked at before
+   it first runs: the atoms it writes by name, and whether it can write a name it does not spell (a computed key, a spread, `with`,
+   delete, a prototype change, a nested eval). A group that lists a written atom, and every group when the code writes by a computed
+   key, is broken before the code runs, so a compiled body that depends on it leaves at its next test even if the store the engine's
+   hooks would have caught is never reached. Code that only reads costs nothing. */
+typedef struct JSAotScan {
+    JSAtom atoms[64];
+    int n;
+    bool dyn;
+} JSAotScan;
+
+static void js_aot_scan_atom(JSAotScan *s, JSAtom a)
+{
+    int i;
+    for (i = 0; i < s->n; i++)
+        if (s->atoms[i] == a)
+            return;
+    if (s->n < 64)
+        s->atoms[s->n++] = a;
+    else
+        s->dyn = true;
+}
+
+static void js_aot_scan_bytecode(JSFunctionBytecode *b, JSAotScan *s, int depth);
+#if !QJS_REGVM
+static void js_aot_scan_bytecode(JSFunctionBytecode *b, JSAotScan *s, int depth)
+{
+    int pos = 0, len, op, i;
+    const uint8_t *bc = b->byte_code_buf;
+    int bc_len = b->byte_code_len;
+    if (bc == NULL) {
+        /* no stack bytecode to read: assume the worst */
+        s->dyn = true;
+        return;
+    }
+    while (pos < bc_len) {
+        const JSOpCode *oi;
+        op = bc[pos];
+        oi = &short_opcode_info(op);
+        len = oi->size;
+        if (len <= 0)
+            break;
+        switch (op) {
+        case OP_put_field:
+        case OP_put_field_ic:
+        case OP_define_field:
+        case OP_define_method:
+        case OP_put_var:
+        case OP_put_var_init:
+        case OP_define_func:
+            if (pos + 5 <= bc_len)
+                js_aot_scan_atom(s, get_u32(bc + pos + 1));
+            break;
+        case OP_put_array_el:
+        case OP_put_ref_value:
+        case OP_put_super_value:
+        case OP_define_array_el:
+        case OP_define_method_computed:
+        case OP_copy_data_properties:
+        case OP_set_proto:
+        case OP_delete:
+        case OP_delete_var:
+        case OP_with_put_var:
+        case OP_with_delete_var:
+        case OP_eval:
+        case OP_apply_eval:
+            s->dyn = true;
+            break;
+        default:
+            break;
+        }
+        pos += len;
+    }
+    if (depth < 8 && b->cpool != NULL)
+        for (i = 0; i < b->cpool_count; i++)
+            if (JS_VALUE_GET_TAG(b->cpool[i]) == JS_TAG_FUNCTION_BYTECODE)
+                js_aot_scan_bytecode(JS_VALUE_GET_PTR(b->cpool[i]), s, depth + 1);
+}
+
+#endif
+
+static void js_aot_facts_eval_scan(JSContext *ctx, JSFunctionBytecode *b)
+{
+    JSRuntime *rt = ctx->rt;
+    JSAotFacts *F = rt->aot_facts;
+    JSAotScan s;
+    int i, j;
+    if (F == NULL || F->n == 0 || (js_aot_facts_off_mask() & (1u << 31)))
+        return;
+    s.n = 0;
+    s.dyn = false;
+    js_aot_scan_bytecode(b, &s, 0);
+    for (i = 0; i < F->n; i++) {
+        JSAotFact *g = F->g[i];
+        if (g->state != QJS_AOT_FACT_VALID)
+            continue;
+        if (s.dyn) {
+            js_aot_fact_break_now(F, g);
+            continue;
+        }
+        for (j = 0; j < s.n; j++)
+            if (js_aot_fact_listed(g, s.atoms[j]) >= 0) {
+                js_aot_fact_break_now(F, g);
+                break;
+            }
+    }
+}
+
 
 #if QJS_REGVM
 #include "quickjs-regvm.h"
@@ -62600,6 +63122,86 @@ static int regvm_fmt_size(const char *fmt, int wide, uint16_t rop)
     return n;
 }
 
+#if QJS_REGVM
+/* The eval scan over a register program (see js_aot_facts_eval_scan): the atoms its stores name, and whether it can write a name it does not
+   spell. A function that is not materialized yet (lazy) is read when it first runs; its stores reach the objects' hooks like any other. */
+static void js_aot_scan_bytecode(JSFunctionBytecode *b, JSAotScan *s, int depth)
+{
+    const uint8_t *code = b->regvm_code;
+    int len = b->regvm_len, off = 0, i;
+
+    if (b->is_lazy)
+        return;
+    if (code == NULL) {
+        s->dyn = true;
+        return;
+    }
+    while (off < len) {
+        int op = code[off], sz;
+        const char *fmt;
+        if (op <= 0 || op >= ROP_COUNT || (fmt = regvm_rop_fmt[op]) == NULL ||
+            (sz = regvm_fmt_size(fmt, 1, (uint16_t)op)) < 0 || off + 1 + sz > len) {
+            s->dyn = true;
+            break;
+        }
+        switch (op) {
+        case ROP_put_field:
+        case ROP_put_field_xfer:
+        case ROP_define_field:
+        case ROP_define_method:
+        case ROP_define_class:
+        case ROP_put_global:
+        case ROP_define_global:
+        case ROP_define_global_func: {
+            const uint8_t *p = code + off + 1;
+            const char *f;
+            int nar = regvm_rop_narrow((uint16_t)op);
+            for (f = fmt; *f; f++) {
+                if (*f == 'a') {
+                    js_aot_scan_atom(s, regvm_ld_u32(p));
+                    break;
+                }
+                switch (*f) {
+                case 'r': p += nar ? 1 : 2; break;
+                case 'i': case 'b': p += 1; break;
+                case 'u': case 's': p += 2; break;
+                case 't': p += nar ? 1 : 4; break;
+                default: p += 4; break;
+                }
+            }
+            break;
+        }
+        case ROP_put_element:
+        case ROP_put_element_xfer:
+        case ROP_define_element:
+        case ROP_define_method_computed:
+        case ROP_define_class_computed:
+        case ROP_put_ref_value:
+        case ROP_put_ref:
+        case ROP_put_super_value:
+        case ROP_super_put:
+        case ROP_copy_props:
+        case ROP_set_proto:
+        case ROP_delete:
+        case ROP_delete_var:
+        case ROP_with_put:
+        case ROP_with_delete:
+        case ROP_eval:
+        case ROP_apply_eval:
+            s->dyn = true;
+            break;
+        default:
+            break;
+        }
+        off += 1 + sz;
+    }
+    if (depth < 8 && b->cpool != NULL)
+        for (i = 0; i < b->cpool_count; i++)
+            if (JS_VALUE_GET_TAG(b->cpool[i]) == JS_TAG_FUNCTION_BYTECODE)
+                js_aot_scan_bytecode(JS_VALUE_GET_PTR(b->cpool[i]), s, depth + 1);
+}
+#endif
+
 /* Does every opcode in a register program have a threaded handler? Read from
    the encoded bytes, the final form. `regvm_all_threaded` is never serialized,
    so the bundle read path runs the same walk. */
@@ -64628,6 +65230,8 @@ extern const uint32_t qjs_aot_abi __attribute__((weak));
 extern const uint32_t qjs_aot_layout __attribute__((weak));
 extern const uint32_t qjs_aot_cell_count __attribute__((weak));
 extern const uint32_t qjs_aot_site_count __attribute__((weak));
+/* The bundle the unit was generated from: a hash of its function digests. */
+extern const uint64_t qjs_aot_bundle_tag __attribute__((weak));
 extern const uint32_t qjs_aot_deopt_site_func[] __attribute__((weak));
 #endif
 
@@ -65040,6 +65644,47 @@ int qjs_aot_poly_fill(
 }
 #endif /* QJS_AOT || QJS_AOT_GEN */
 
+/* A compiled unit keeps one set of cached facts per function in its statics, so it serves ONE runtime at a time (a worklet runs its own
+   bundle, which has its own unit). The first runtime to bind a function owns the unit; another runtime binds nothing and interprets,
+   until the owner is freed. */
+static JSRuntime *volatile js_aot_unit_owner;
+
+static bool js_aot_unit_claim(JSRuntime *rt)
+{
+    JSRuntime *expected = NULL;
+#ifdef QJS_KIT_TEST_KNOBS
+    if (getenv("QJS_AOT_UNIT_SHARED") != NULL)
+        return true;
+#endif
+    if (__atomic_compare_exchange_n(&js_aot_unit_owner, &expected, rt, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        if (&qjs_aot_bundle_tag != NULL)
+            rt->aot_unit_tag = qjs_aot_bundle_tag;
+        return true;
+    }
+    return expected == rt;
+}
+
+static void js_aot_unit_release(JSRuntime *rt)
+{
+    JSRuntime *expected = rt;
+    __atomic_compare_exchange_n(&js_aot_unit_owner, &expected, NULL, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+
+uint32_t qjs_aot_runtime_bound(JSRuntime *rt)
+{
+    uint32_t i, n = 0;
+    if (rt->aot_bound == NULL || &qjs_aot_count == NULL)
+        return 0;
+    for (i = 0; i < qjs_aot_count; i++)
+        n += rt->aot_bound[i] != 0;
+    return n;
+}
+
+uint64_t qjs_aot_runtime_bundle(JSRuntime *rt)
+{
+    return rt->aot_unit_tag;
+}
+
 static void js_aot_bind(JSFunctionBytecode *b)
 {
     uint8_t digest[16];
@@ -65080,6 +65725,8 @@ static void js_aot_bind(JSFunctionBytecode *b)
 #endif
             if (b->realm->rt->aot_bound == NULL)
                 b->realm->rt->aot_bound = js_mallocz_rt(b->realm->rt, qjs_aot_count);
+            if (!js_aot_unit_claim(b->realm->rt))
+                return;         /* the unit is bound in another runtime: this one interprets */
             if (b->realm->rt->aot_bound == NULL || b->realm->rt->aot_bound[mid])
                 return;         /* another live bytecode holds this function */
             b->realm->rt->aot_bound[mid] = 1;
@@ -79656,6 +80303,12 @@ static JSValue JS_EvalFunctionInternal(JSContext *ctx, JSValue fun_obj,
     uint32_t tag;
 
     tag = JS_VALUE_GET_TAG(fun_obj);
+    if (unlikely(ctx->rt->aot_facts != NULL)) {
+        if (tag == JS_TAG_FUNCTION_BYTECODE)
+            js_aot_facts_eval_scan(ctx, JS_VALUE_GET_PTR(fun_obj));
+        else if (tag == JS_TAG_MODULE && JS_VALUE_GET_TAG(((JSModuleDef *)JS_VALUE_GET_PTR(fun_obj))->func_obj) == JS_TAG_FUNCTION_BYTECODE)
+            js_aot_facts_eval_scan(ctx, JS_VALUE_GET_PTR(((JSModuleDef *)JS_VALUE_GET_PTR(fun_obj))->func_obj));
+    }
     if (tag == JS_TAG_FUNCTION_BYTECODE) {
         fun_obj = js_closure(ctx, fun_obj, var_refs, sf);
         ret_val = JS_CallFree(ctx, fun_obj, this_obj, 0, NULL);
