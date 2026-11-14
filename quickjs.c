@@ -1465,6 +1465,20 @@ struct JSContext {
     int re_species_idx;
     JSValue re_species;
 
+    /* The legacy RegExp statics of this realm (RegExp.$1, lastMatch, ...): the subject of the last match by a
+       regexp of this realm's %RegExp%, its group count and the matcher's capture pointers into the subject for the
+       match and $1..$9 (re_legacy_cap) and for the last group (re_legacy_last); a NULL pointer is a group that did
+       not take part. The getters turn them into substrings. re_input is RegExp.input once it is assigned (a string;
+       JS_UNINITIALIZED while RegExp.input is the subject, which a match restores).
+       re_legacy_valid is false after a match by a subclass instance or a regexp of another realm: the getters throw. */
+    uint32_t realm_id;
+    bool re_legacy_valid;
+    int re_legacy_n;
+    JSValue re_input;
+    JSValue re_subject;
+    const uint8_t *re_legacy_cap[20];
+    const uint8_t *re_legacy_last[2];
+
     /* LAST FIELD ON PURPOSE: 8 KB, allocated once per context. */
     JSGVCell gv_cells[JS_GV_CELL_SETS][JS_GV_CELL_WAYS]; /* zeroed */
 };
@@ -2417,10 +2431,12 @@ typedef struct JSForInIterator {
 typedef struct JSRegExp {
     JSString *pattern;
     JSString *bytecode; /* also contains the flags */
-    /* borrowed pointer into 'bytecode' at the start of the optimization
-       metadata header, or NULL if the pattern has no metadata. Always
-       re-derived from 'bytecode' by js_regexp_set_compiled_data(). */
-    const uint8_t *metadata;
+    /* offset in 'bytecode' of the optimization metadata header, or 0 if the
+       pattern has no metadata. Always re-derived from 'bytecode' by
+       js_regexp_set_compiled_data(). */
+    uint32_t meta_off;
+    uint32_t realm_id : 31; /* JSContext.realm_id of the realm that made it ([[Realm]]) */
+    uint32_t legacy : 1;    /* made by that realm's %RegExp%, not a subclass ([[LegacyFeaturesEnabled]]) */
 } JSRegExp;
 
 typedef struct JSProxyData {
@@ -5675,6 +5691,19 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
     ctx->iterator_ctor = JS_NULL;
     ctx->iterator_ctor_getset = JS_NULL;
     ctx->regexp_ctor = JS_NULL;
+    {
+        static uint32_t realm_id_next;
+        uint32_t id;
+        do
+            id = __atomic_add_fetch(&realm_id_next, 1, __ATOMIC_RELAXED) & 0x7fffffff;
+        while (id == 0);
+        ctx->realm_id = id;
+    }
+    ctx->re_legacy_valid = true;
+    ctx->re_input = JS_UNINITIALIZED;
+    ctx->re_subject = JS_AtomToString(ctx, JS_ATOM_empty_string);
+    ctx->re_legacy_n = 1;
+    ctx->re_legacy_cap[0] = ctx->re_legacy_cap[1] = str8(JS_VALUE_GET_STRING(ctx->re_subject));
     ctx->promise_ctor = JS_NULL;
     ctx->error_ctor = JS_NULL;
     ctx->error_back_trace = JS_UNDEFINED;
@@ -6453,6 +6482,8 @@ void JS_FreeContext(JSContext *ctx)
     JS_FreeValue(ctx, ctx->promise_ctor);
     JS_FreeValue(ctx, ctx->array_ctor);
     JS_FreeValue(ctx, ctx->regexp_ctor);
+    JS_FreeValue(ctx, ctx->re_input);
+    JS_FreeValue(ctx, ctx->re_subject);
     JS_FreeValue(ctx, ctx->function_ctor);
     JS_FreeValue(ctx, ctx->function_proto);
 
@@ -10824,7 +10855,9 @@ static JSValue JS_NewObjectFromShapeCapExtra(JSContext *ctx, JSShape *sh,
     case JS_CLASS_REGEXP:
         p->u.regexp.pattern = NULL;
         p->u.regexp.bytecode = NULL;
-        p->u.regexp.metadata = NULL;
+        p->u.regexp.meta_off = 0;
+        p->u.regexp.realm_id = 0;
+        p->u.regexp.legacy = 0;
         goto set_exotic;
     default:
     set_exotic:
@@ -102376,10 +102409,11 @@ static void js_regexp_set_compiled_data(JSRegExp *re, JSString *pattern,
 
     re->pattern = pattern;
     re->bytecode = bytecode;
-    re->metadata = NULL;
+    re->meta_off = 0;
     if (!bytecode->is_wide_char &&
         lre_get_metadata(str8(bytecode), bytecode->len, &metadata) == 1) {
-        re->metadata = metadata.payload - LRE_META_HEADER_LEN;
+        re->meta_off = metadata.payload - LRE_META_HEADER_LEN - str8(bytecode);
+        assert(re->meta_off != 0);
     }
 }
 
@@ -102416,6 +102450,10 @@ static JSValue js_regexp_constructor_internal(JSContext *ctx, JSValueConst ctor,
     re = &p->u.regexp;
     js_regexp_set_compiled_data(re, JS_VALUE_GET_STRING(pattern),
                                 JS_VALUE_GET_STRING(bc));
+    re->realm_id = ctx->realm_id;
+    re->legacy = JS_IsUndefined(ctor) ||
+                 (JS_VALUE_GET_TAG(ctor) == JS_TAG_OBJECT &&
+                  JS_VALUE_GET_PTR(ctor) == JS_VALUE_GET_PTR(ctx->regexp_ctor));
     if (unlikely(re_st_on))
         re_st_note_created(re);
     return obj;
@@ -102542,6 +102580,9 @@ static JSValue js_regexp_compile(JSContext *ctx, JSValueConst this_val,
     re = js_get_regexp(ctx, this_val, true);
     if (!re)
         return JS_EXCEPTION;
+    /* Annex B: only a regexp of this realm made by its %RegExp% can be recompiled */
+    if (re->realm_id != ctx->realm_id || !re->legacy)
+        return JS_ThrowTypeError(ctx, "RegExp.prototype.compile: not a RegExp of this realm made by RegExp");
     pattern1 = argv[0];
     flags1 = argv[1];
     re1 = js_get_regexp(ctx, pattern1, false);
@@ -103354,7 +103395,7 @@ js_regexp_exec_data_init(JSRegExpExecData *d, JSRegExp *re, int capture_count)
 {
     d->bytecode = str8(re->bytecode);
     d->re_flags = lre_get_flags(d->bytecode);
-    d->metadata = re->metadata;
+    d->metadata = re->meta_off ? d->bytecode + re->meta_off : NULL;
     d->strategy = JS_REGEXP_MATCH_GENERIC;
     if (d->metadata) {
         switch (d->metadata[LRE_META_KIND_OFFSET]) {
@@ -103642,13 +103683,111 @@ js_regexp_match_counted(JSContext *ctx, uint8_t **capture,
     return re_st_match_done(re, str, start_index, d->strategy, rc, capture, t0);
 }
 
-static inline int
+/* A successful RegExpBuiltinExec sets the legacy statics of the current realm (UpdateLegacyRegExpStaticProperties):
+   the subject, and the capture pointers of the match, $1..$9 and the last group (the getters make the substrings).
+   A regexp of another realm, or one made by a subclass, invalidates them instead. */
+static inline __attribute__((always_inline)) void js_regexp_legacy_update(JSContext *ctx, uint8_t **capture,
+                                           const JSRegExpExecData *d, JSRegExp *re,
+                                           JSString *str)
+{
+    int n;
+
+    if (unlikely(!re->legacy || re->realm_id != ctx->realm_id)) {
+        ctx->re_legacy_valid = false;
+        return;
+    }
+    ctx->re_legacy_valid = true;
+    if (unlikely(JS_VALUE_GET_PTR(ctx->re_subject) != str)) {
+        JS_FreeValue(ctx, ctx->re_subject);
+        ctx->re_subject = js_dup(JS_MKPTR(JS_TAG_STRING, str));
+    }
+    if (unlikely(!JS_IsUninitialized(ctx->re_input))) {
+        JS_FreeValue(ctx, ctx->re_input);
+        ctx->re_input = JS_UNINITIALIZED;
+    }
+    n = lre_get_capture_count(d->bytecode);
+    /* A fixed copy of the match and $1..$9: every capture buffer has at least JS_REGEXP_CAPTURE_STACK_SIZE entries (the
+       stack one, or a larger allocation), and the getters read no group at or past n. */
+    static_assert(JS_REGEXP_CAPTURE_STACK_SIZE >= 20, "legacy statics copy 20 capture pointers");
+    memcpy(ctx->re_legacy_cap, capture, sizeof(ctx->re_legacy_cap));
+    ctx->re_legacy_last[0] = capture[2 * n - 2];
+    ctx->re_legacy_last[1] = capture[2 * n - 1];
+    ctx->re_legacy_n = n;
+}
+
+static inline __attribute__((always_inline)) int
 js_regexp_match(JSContext *ctx, uint8_t **capture, const JSRegExpExecData *d,
                 JSRegExp *re, JSString *str, int start_index)
 {
+    int rc;
+
     if (unlikely(re_st_on))
-        return js_regexp_match_counted(ctx, capture, d, re, str, start_index);
-    return js_regexp_match_raw(ctx, capture, d, re, str, start_index);
+        rc = js_regexp_match_counted(ctx, capture, d, re, str, start_index);
+    else
+        rc = js_regexp_match_raw(ctx, capture, d, re, str, start_index);
+    if (rc == 1)
+        js_regexp_legacy_update(ctx, capture, d, re, str);
+    return rc;
+}
+
+/* get RegExp.input, lastMatch, lastParen, leftContext, rightContext, $1..$9 (magic 0..4, 5..13) and their $ aliases:
+   GetLegacyRegExpStaticProperty. Only %RegExp% of the getter's realm has them, and only while they are valid. */
+static JSValue js_regexp_legacy_get(JSContext *ctx, JSValueConst this_val, int magic)
+{
+    const uint8_t *const *cap = ctx->re_legacy_cap;
+    const uint8_t *base;
+    JSString *sp;
+    int a, b, k, shift;
+
+    if (JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT ||
+        JS_VALUE_GET_PTR(this_val) != JS_VALUE_GET_PTR(ctx->regexp_ctor))
+        return JS_ThrowTypeError(ctx, "RegExp legacy static accessor called on an incompatible receiver");
+    if (!ctx->re_legacy_valid)
+        return JS_ThrowTypeError(ctx, "RegExp legacy static properties are not available");
+    if (magic == 0)
+        return js_dup(JS_IsUninitialized(ctx->re_input) ? ctx->re_subject : ctx->re_input);
+    sp = JS_VALUE_GET_STRING(ctx->re_subject);
+    base = str8(sp);
+    shift = sp->is_wide_char;
+    if (magic == 2) {                                   /* lastParen */
+        if (ctx->re_legacy_n < 2)
+            return js_empty_string(ctx->rt);
+        cap = ctx->re_legacy_last;
+        k = 0;
+    } else {
+        k = magic >= 5 ? magic - 4 : 0;                 /* $1..$9, or the match */
+        if (k >= ctx->re_legacy_n)
+            return js_empty_string(ctx->rt);
+    }
+    if (!cap[2 * k] || !cap[2 * k + 1])
+        return js_empty_string(ctx->rt);
+    a = (cap[2 * k] - base) >> shift;
+    b = (cap[2 * k + 1] - base) >> shift;
+    if (magic == 3) {                                   /* leftContext */
+        b = a;
+        a = 0;
+    } else if (magic == 4) {                            /* rightContext */
+        a = b;
+        b = sp->len;
+    }
+    return js_sub_string(ctx, sp, a, b);
+}
+
+/* set RegExp.input and RegExp.$_: SetLegacyRegExpStaticProperty */
+static JSValue js_regexp_legacy_set_input(JSContext *ctx, JSValueConst this_val, JSValueConst val, int magic)
+{
+    JSValue str;
+
+    (void)magic;
+    if (JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT ||
+        JS_VALUE_GET_PTR(this_val) != JS_VALUE_GET_PTR(ctx->regexp_ctor))
+        return JS_ThrowTypeError(ctx, "RegExp legacy static accessor called on an incompatible receiver");
+    str = JS_ToString(ctx, val);
+    if (JS_IsException(str))
+        return JS_EXCEPTION;
+    JS_FreeValue(ctx, ctx->re_input);
+    ctx->re_input = str;
+    return JS_UNDEFINED;
 }
 
 /* Prepare the shared capture buffer and execution strategy. Callers retain
@@ -105891,6 +106030,25 @@ done:
 static const JSCFunctionListEntry js_regexp_funcs[] = {
     JS_CFUNC_DEF("escape", 1, js_regexp_escape ),
     JS_CGETSET_DEF("[Symbol.species]", js_get_this, NULL ),
+    JS_CGETSET_MAGIC_DEF("input", js_regexp_legacy_get, js_regexp_legacy_set_input, 0 ),
+    JS_CGETSET_MAGIC_DEF("$_", js_regexp_legacy_get, js_regexp_legacy_set_input, 0 ),
+    JS_CGETSET_MAGIC_DEF("lastMatch", js_regexp_legacy_get, NULL, 1 ),
+    JS_CGETSET_MAGIC_DEF("$&", js_regexp_legacy_get, NULL, 1 ),
+    JS_CGETSET_MAGIC_DEF("lastParen", js_regexp_legacy_get, NULL, 2 ),
+    JS_CGETSET_MAGIC_DEF("$+", js_regexp_legacy_get, NULL, 2 ),
+    JS_CGETSET_MAGIC_DEF("leftContext", js_regexp_legacy_get, NULL, 3 ),
+    JS_CGETSET_MAGIC_DEF("$`", js_regexp_legacy_get, NULL, 3 ),
+    JS_CGETSET_MAGIC_DEF("rightContext", js_regexp_legacy_get, NULL, 4 ),
+    JS_CGETSET_MAGIC_DEF("$'", js_regexp_legacy_get, NULL, 4 ),
+    JS_CGETSET_MAGIC_DEF("$1", js_regexp_legacy_get, NULL, 5 ),
+    JS_CGETSET_MAGIC_DEF("$2", js_regexp_legacy_get, NULL, 6 ),
+    JS_CGETSET_MAGIC_DEF("$3", js_regexp_legacy_get, NULL, 7 ),
+    JS_CGETSET_MAGIC_DEF("$4", js_regexp_legacy_get, NULL, 8 ),
+    JS_CGETSET_MAGIC_DEF("$5", js_regexp_legacy_get, NULL, 9 ),
+    JS_CGETSET_MAGIC_DEF("$6", js_regexp_legacy_get, NULL, 10 ),
+    JS_CGETSET_MAGIC_DEF("$7", js_regexp_legacy_get, NULL, 11 ),
+    JS_CGETSET_MAGIC_DEF("$8", js_regexp_legacy_get, NULL, 12 ),
+    JS_CGETSET_MAGIC_DEF("$9", js_regexp_legacy_get, NULL, 13 ),
 };
 
 static const JSCFunctionListEntry js_regexp_proto_funcs[] = {
