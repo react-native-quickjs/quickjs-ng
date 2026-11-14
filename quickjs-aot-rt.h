@@ -239,6 +239,7 @@ QJS_AOT_STUB void qjs_aot_shape_release(JSRuntime *rt, void *shape);
    fields are written, and a global binding's value without running code (borrowed). */
 QJS_AOT_STUB void *qjs_aot_class_shape(JSContext *ctx, JSValue proto, const uint32_t *atoms, int n);
 QJS_AOT_STUB JSValue qjs_aot_new_from_shape(JSContext *ctx, void *shape);
+QJS_AOT_STUB JSValue qjs_aot_new_from_shape_cap(JSContext *ctx, void *shape, uint32_t cap);
 QJS_AOT_STUB void qjs_aot_object_filled(JSContext *ctx, JSValue obj);
 /* the engine's once-per-constructor work before a first construct (the unit's layout chain), for a region that constructs the class itself */
 QJS_AOT_STUB void qjs_aot_ctor_prepare(JSContext *ctx, JSValue fn);
@@ -549,6 +550,7 @@ void qjs_aot_construct_done(JSObject *ctor, JSValue inst);
    non-derived light bytecode constructor (the caller takes the generic path); -1 on an
    exception. Runs no JavaScript. */
 int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out);
+int qjs_aot_construct_this_cap(JSContext *ctx, JSObject *ctor, JSValue *out, uint32_t cap);
 JSValue qjs_aot_wrap_init(JSContext *ctx, JSRegRun *caller_f, JSObject *co, JSValue thisv, JSValue *argv,
                           int argc, void **wc, int init_off, int apply_off);
 /* `new C(...)` for a constructor wrapper C: the allocation and qjs_aot_wrap_init in one call, both through the

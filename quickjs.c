@@ -66785,14 +66785,16 @@ QJS_AOT_STUB void *qjs_aot_class_shape(JSContext *ctx, JSValue proto, const uint
 }
 
 /* A new ordinary object of a class shape (qjs_aot_class_shape), every field undefined. The caller writes the fields and then calls
-   qjs_aot_object_filled, which checks the slot claims of a contracted layout as the last add of a field would. */
-QJS_AOT_STUB JSValue qjs_aot_new_from_shape(JSContext *ctx, void *shape)
+   qjs_aot_object_filled, which checks the slot claims of a contracted layout as the last add of a field would.
+   `cap` is the number of slots to reserve: the fields the object gains after its constructor then fit without growing the array. A cap
+   that is not above the shape's field count, or above what an inline array can hold, reserves exactly the field count. */
+QJS_AOT_STUB JSValue qjs_aot_new_from_shape_cap(JSContext *ctx, void *shape, uint32_t cap)
 {
     JSShape *sh = (JSShape *)shape;
     JSRuntime *rt = ctx->rt;
     JSObject *p;
     JSProperty *pr;
-    int i, n = sh->prop_count;
+    uint32_t i, n = sh->prop_count;
 
     if (unlikely(n > JS_OBJ_LEARNED_INLINE_MAX)) {
         JSValue obj = JS_NewObjectFromShape(ctx, js_dup_shape(sh), JS_CLASS_OBJECT, NULL);
@@ -66803,12 +66805,26 @@ QJS_AOT_STUB JSValue qjs_aot_new_from_shape(JSContext *ctx, void *shape)
             p->prop[i].u.value = JS_UNDEFINED;
         return obj;
     }
-    /* what JS_NewObjectFromShapeCapExtra does for a plain object, without its class switch: one block holding the body and the n slots */
+    if (cap <= n || cap > JS_OBJ_LEARNED_INLINE_MAX) {
+        cap = n;
+    } else {
+        /* the property array of a shape doubles as fields are added, and an add that changes the shape's size needs the inline capacity to cover the
+           new size (the generated code cannot grow an array): the room is the size the shape has reached when it holds `cap` fields */
+        uint32_t size = sh->prop_size, cnt = n;
+
+        while (cnt < cap) {
+            cnt++;
+            if (cnt > size)
+                size = size * 2 > cnt ? size * 2 : cnt;
+        }
+        cap = size <= JS_OBJ_LEARNED_INLINE_MAX ? size : n;
+    }
+    /* what JS_NewObjectFromShapeCapExtra does for a plain object, without its class switch: one block holding the body and the cap slots */
     js_trigger_gc(rt, sizeof(JSObject));
-    p = js_malloc(ctx, offsetof(JSObject, u) + n * sizeof(JSProperty));
+    p = js_malloc(ctx, offsetof(JSObject, u) + cap * sizeof(JSProperty));
     if (unlikely(!p))
         return JS_EXCEPTION;   /* the generic path also drops the shape reference it was given; here none was taken yet */
-    p->prop_inline_cap = n;
+    p->prop_inline_cap = cap;
     p->class_id = JS_CLASS_OBJECT;
     p->values_inline = 0;
     p->arr_kind = JS_ARR_KIND_GENERIC;
@@ -66827,11 +66843,16 @@ QJS_AOT_STUB JSValue qjs_aot_new_from_shape(JSContext *ctx, void *shape)
     p->shape = js_dup_shape(sh);
     pr = (JSProperty *)((uint8_t *)p + offsetof(JSObject, u));
     p->prop = pr;
-    for (i = 0; i < n; i++)
+    for (i = 0; i < cap; i++)
         pr[i].u.value = JS_UNDEFINED;
     JS_REF_COUNT(p) = 1;
     add_gc_object(rt, &p->header, JS_GC_OBJ_TYPE_JS_OBJECT);
     return JS_MKPTR(JS_TAG_OBJECT, p);
+}
+
+QJS_AOT_STUB JSValue qjs_aot_new_from_shape(JSContext *ctx, void *shape)
+{
+    return qjs_aot_new_from_shape_cap(ctx, shape, 0);
 }
 
 /* What the engine's construct path does once per constructor before its first construct (the unit's layout chain for it, built against
@@ -67912,7 +67933,8 @@ int qjs_aot_apply_arguments(JSContext *ctx, JSRegRun *f, JSValue *window,
     return 1;
 }
 
-int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out)
+int qjs_aot_construct_this_cap(JSContext *ctx, JSObject *ctor, JSValue *out,
+                               uint32_t cap)
 {
     JSFunctionBytecode *cb;
     JSValue obj;
@@ -67923,12 +67945,27 @@ int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out)
     if (cb->is_derived_class_constructor ||
         !(cb->aot_fn != NULL ? cb->aot_light : cb->regvm_light))
         return 0;
+    if (cap > cb->inst_inline_cap && cap <= JS_OBJ_LEARNED_INLINE_MAX) {
+        /* shapes double their property array, and an add that changes the size needs the inline capacity to cover it: a power of two */
+        uint32_t size = 1;
+
+        while (size < cap)
+            size *= 2;
+        cap = size;
+    } else {
+        cap = cb->inst_inline_cap;
+    }
     obj = js_create_from_ctor_cap(ctx, JS_MKPTR(JS_TAG_OBJECT, ctor),
-                                  JS_CLASS_OBJECT, cb->inst_inline_cap);
+                                  JS_CLASS_OBJECT, cap);
     if (JS_IsException(obj))
         return -1;
     *out = obj;
     return 1;
+}
+
+int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out)
+{
+    return qjs_aot_construct_this_cap(ctx, ctor, out, 0);
 }
 
 /* A constructor wrapper `function () { this.X.apply(this, arguments); }` (the generator recognises it by its register
