@@ -12776,6 +12776,12 @@ static void y_collect(JSRuntime *rt)
             if (c->rec) continue;
             for (; blk + stride <= c->bump; blk += stride) {
                 JSObject *p = (JSObject *)(blk + 8);
+#ifdef QJS_GC_STRESS
+                if (Y_IS(p) && p->has_weak_ref) {
+                    fprintf(stderr, "QJS_GC_STRESS: young cell %p has weak references (it would die without clearing them)\n", (void *)p);
+                    abort();
+                }
+#endif
                 if (Y_IS(p) && Y_RCN(JS_REF_COUNT(p)) > 0 && !js_rc(p)->mark) {
                     if (y_cnt[11]++ < 5) {
                         struct list_head *el_; int nh = 0;
@@ -110218,6 +110224,10 @@ static JSWeakRefRecord **weak_slot(JSRuntime *rt, JSObject *p, bool create)
     }
     if (!create)
         return NULL;
+    /* A young collection drops a dead cell without visiting it, so a cell with weak references must be old: its weak records are
+       then cleared when it dies, through the ordinary free. */
+    if (Y_IS(p))
+        y_promote_now(p);
     t->key[i] = p;
     t->head[i] = NULL;
     t->n++;
