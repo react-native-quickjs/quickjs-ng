@@ -459,6 +459,14 @@ struct JSRuntime {
 
     struct JSStackFrame *current_stack_frame;
 
+    /* for-in element-load memo: in forin_shape, forin_atom is at forin_idx. A
+       property of the shape alone, so a reader that sees the same shape may
+       trust the index. The counted reference keeps the shape from being mutated
+       in place and keeps forin_atom alive. */
+    JSShape *forin_shape;
+    JSAtom forin_atom;
+    uint32_t forin_idx;
+
     JSInterruptHandler *interrupt_handler;
     void *interrupt_opaque;
 
@@ -2957,6 +2965,11 @@ void JS_FreeRuntime(JSRuntime *rt)
     bool leak = false;
     int i;
 
+    if (rt->forin_shape) {
+        js_free_shape(rt, rt->forin_shape);
+        rt->forin_shape = NULL;
+        rt->forin_atom = JS_ATOM_NULL;
+    }
     rt->in_free = true;
 #ifdef QJS_ICSTAT
     js_icstat_dump();
@@ -3845,6 +3858,12 @@ void JS_FreeContext(JSContext *ctx)
     if (--JS_REF_COUNT(ctx) > 0)
         return;
     assert(JS_REF_COUNT(ctx) == 0);
+
+    if (rt->forin_shape) {
+        js_free_shape(rt, rt->forin_shape);
+        rt->forin_shape = NULL;
+        rt->forin_atom = JS_ATOM_NULL;
+    }
 
 #ifdef ENABLE_DUMPS // JS_DUMP_ATOMS
     if (check_dump_flag(rt, JS_DUMP_ATOMS))
@@ -11579,6 +11598,32 @@ static bool js_get_fast_array_element(JSContext *ctx, JSObject *p,
     }
 }
 
+/* for-in element-load memo, read side. On a shape and key match the index is
+ * already known, replacing JS_ValueToAtom, the hash probe and the prototype
+ * walk.
+ *
+ * The key pointer compare is exact because JS_AtomToValue on a string atom
+ * returns that atom's own JSString. Re-deriving the atom from the shape turns a
+ * bookkeeping bug into a miss, and the TMASK test is required: two objects with
+ * an accessor at the same slot share a shape. */
+static bool js_forinreg_lookup(JSRuntime *rt, JSObject *p, JSValueConst prop,
+                               JSValue *pval)
+{
+    JSShapeProperty *prs;
+
+    if (p->shape != rt->forin_shape)
+        return false;
+    if (JS_VALUE_GET_PTR(prop) != (void *)rt->atom_array[rt->forin_atom])
+        return false;
+    if (p->class_id != JS_CLASS_OBJECT || p->is_exotic || p->fast_array)
+        return false;
+    prs = &get_shape_prop(p->shape)[rt->forin_idx];
+    if (prs->atom != rt->forin_atom || (prs->flags & JS_PROP_TMASK) != 0)
+        return false;
+    *pval = js_dup(p->prop[rt->forin_idx].u.value);
+    return true;
+}
+
 static JSValue JS_GetPropertyValueConst(JSContext *ctx, JSValueConst this_obj,
                                         JSValueConst prop)
 {
@@ -11594,6 +11639,13 @@ static JSValue JS_GetPropertyValueConst(JSContext *ctx, JSValueConst this_obj,
             JSValue val;
             /* fast path for array and typed array access */
             if (js_get_fast_array_element(ctx, p, idx, &val))
+                return val;
+        } else if (JS_VALUE_GET_TAG(prop) == JS_TAG_STRING) {
+            /* One site rather than in the interpreter's CASE bodies: extra live
+               values there cost recursion depth. */
+            JSValue val;
+            if (js_forinreg_lookup(ctx->rt, JS_VALUE_GET_OBJ(this_obj), prop,
+                                   &val))
                 return val;
         }
     } else if (unlikely(tag == JS_TAG_NULL || tag == JS_TAG_UNDEFINED)) {
@@ -19021,6 +19073,16 @@ static __exception int js_for_in_next(JSContext *ctx, JSValue *sp)
                 return ret;
             if (ret)
                 break;
+        }
+        {
+            JSRuntime *rt = ctx->rt;
+            if (rt->forin_shape != pin) {
+                if (rt->forin_shape)
+                    js_free_shape(rt, rt->forin_shape);
+                rt->forin_shape = js_dup_shape(pin);
+            }
+            rt->forin_atom = prop;
+            rt->forin_idx = it->idx - 1;
         }
         sp[0] = JS_AtomToValue(ctx, prop);
         sp[1] = JS_FALSE;
