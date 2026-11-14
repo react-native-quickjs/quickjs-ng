@@ -29,7 +29,7 @@ typedef struct JSRegRun JSRegRun;
 #endif
 
 #ifndef QJS_AOT_ABI
-#define QJS_AOT_ABI (3u | ((uint32_t)QJS_DRC << 8))
+#define QJS_AOT_ABI (4u | ((uint32_t)QJS_DRC << 8))
 #endif
 
 /* The engine's object layouts the generated code reads at constant offsets.
@@ -197,9 +197,12 @@ QJS_AOT_STUB int qjs_aot_poll(JSContext *ctx);
    by `digest`. */
 typedef JSValue (*JSAotFn)(JSContext *ctx, JSRegRun *f, JSValue *fr,
                            uint32_t entry_pc);
+typedef JSValue (*JSAotNFn)(JSContext *ctx, JSRegRun *caller_f, JSObject *co,
+                            JSValue this_obj, JSValue *argv, int argc);
 typedef struct JSAotEntry {
     uint8_t digest[16];
     JSAotFn fn;
+    JSAotNFn nfn;        /* the native entry, or NULL: a caller enters here without a frame */
     uint32_t flags;
     uint32_t code_crc;   /* IRVERIFY: hash of the register program */
 } JSAotEntry;
