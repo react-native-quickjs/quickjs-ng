@@ -2385,6 +2385,60 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_field2(uint8_t *ip, JSValue *fr, JSRegR
     return NULL;
 }
 
+static uint8_t *REGVM_CC regvm_s_ROP_get_this_field(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+{
+    JSFunctionBytecode *b = rf->b;
+    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
+    JSRegPIC *pic = rf->pic;
+    uint8_t *rpc = ip;
+    int op = *rpc++;
+    JSValue ret_val = JS_UNDEFINED;
+    JSValue *regs = fr;
+    JSValue *arg_buf = rf->arg_buf;
+    int argc = rf->argc;
+    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ {
+                const uint8_t *i_start = rpc - 1;
+                int d = RD_REG();
+                int r = RD_REG();
+                JSAtom atom = RD_U32();
+                int site = RD_U16();
+                JSValue val;
+                if (!b->is_strict_mode) {
+                    uint32_t tag = JS_VALUE_GET_TAG(rf->this_obj);
+                    if (tag == JS_TAG_NULL || tag == JS_TAG_UNDEFINED) {
+                        SET_REG_B(r, ctx->global_obj);
+                    } else if (likely(tag == JS_TAG_OBJECT)) {
+                        SET_REG_B(r, rf->this_obj);
+                    } else {
+                        val = JS_ToObject(ctx, rf->this_obj);
+                        if (JS_IsException(val))
+                            goto exception;
+                        SET_REG_P(r, val);
+                    }
+                } else {
+                    SET_REG_B(r, rf->this_obj);
+                }
+                if (regvm_own_read_hit(pic, b->regvm_pic_holder, regs[r], site, &val)) {
+                    SET_REG_B(d, val);
+                    REGVM_NEXT();
+                }
+                REGVM_CAPTURE_IP_MONO(i_start);
+                if (site == REG_IC_NONE) {
+                    val = JS_GetProperty(ctx, regs[r], atom);
+                } else {
+                    val = regvm_get_field_ic(ctx, b, &pic, regs[r], atom, site);
+                }
+                if (JS_IsException(val))
+                    goto exception;
+                SET_REG_P(d, val);
+                REGVM_NEXT();
+            }
+ exception:
+    rf->ret = JS_EXCEPTION;
+    return NULL;
+}
+
 static uint8_t *REGVM_CC regvm_s_ROP_get_field_chain(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
 {
     JSFunctionBytecode *b = rf->b;
@@ -6417,6 +6471,8 @@ static const regvm_handler regvm_step_table[ROP_COUNT] = {
     [ROP_inc_branch_lt_s] = regvm_s_ROP_inc_branch_lt_s,
     [ROP_slot_get] = regvm_s_ROP_slot_get,
     [ROP_slot_put] = regvm_s_ROP_slot_put,
+    [ROP_get_this_field] = regvm_s_ROP_get_this_field,
+    [ROP_get_this_field2] = regvm_s_ROP_get_this_field,
 };
 
 
@@ -6653,6 +6709,8 @@ static const uint8_t regvm_step_covered[ROP_COUNT] = {
     [ROP_inc_branch_lt_s] = 1,
     [ROP_slot_get] = 1,
     [ROP_slot_put] = 1,
+    [ROP_get_this_field] = 1,
+    [ROP_get_this_field2] = 1,
 };
 
 
