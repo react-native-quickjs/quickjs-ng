@@ -65245,6 +65245,46 @@ static void aot_dump_one(FILE *f, JSRuntime *rt, JSFunctionBytecode *b)
     }
 }
 
+/* The constructor of a prototype that has no own `constructor` (the
+   `Sub.prototype = new Base()` idiom): the one bytecode function digest among the
+   live functions whose own plain data `prototype` is exactly `po`. Found by
+   scanning the collector's object list, so no JS runs and nothing is allocated or
+   kept alive. Returns 1 and fills `dg` only when every such function has the same
+   digest (closures of one function agree); none, or two different functions
+   sharing a prototype, returns 0 and the shape stays unnamed. The unit later
+   checks the same claim when it builds the layout: `proto == F.prototype` at the
+   function's creation. */
+static int aot_proto_ctor_digest(JSRuntime *rt, JSObject *po, uint8_t dg[16])
+{
+    struct list_head *el;
+    int found = 0;
+
+    list_for_each(el, &rt->gc_obj_list) {
+        JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
+        JSObject *fo;
+        JSProperty *pr;
+        JSShapeProperty *prs;
+        uint8_t d[16];
+
+        if (JS_GC_TYPE(gp) != JS_GC_OBJ_TYPE_JS_OBJECT)
+            continue;
+        fo = (JSObject *)gp;
+        if (fo->class_id != JS_CLASS_BYTECODE_FUNCTION)
+            continue;
+        prs = find_own_property(&pr, fo, JS_ATOM_prototype);
+        if (prs == NULL || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL ||
+            JS_VALUE_GET_TAG(pr->u.value) != JS_TAG_OBJECT ||
+            JS_VALUE_GET_OBJ(pr->u.value) != po)
+            continue;
+        js_aot_digest(fo->u.func.function_bytecode, d);
+        if (found && memcmp(d, dg, 16) != 0)
+            return 0;
+        memcpy(dg, d, 16);
+        found = 1;
+    }
+    return found;
+}
+
 /* The shape table the generator reads: one `P` line per distinct shape a field
    site observed, printed once, with the prototype it belongs to and its ordered
    property list. A site's `shape%d=` entry carries the table index instead of a
@@ -65292,6 +65332,19 @@ static void aot_dump_shapes(FILE *f, JSRuntime *rt, JSContext *ctx)
                     for (b = 0; b < 16; b++)
                         snprintf(hx + b * 2, 3, "%02x", dg[b]);
                     fprintf(f, "fn:%s", hx);
+                    named = 1;
+                }
+            }
+            if (!named && po->class_id == JS_CLASS_OBJECT && !po->is_exotic) {
+                /* No own constructor: name it by the function whose `prototype`
+                   it is, if there is exactly one (see aot_proto_ctor_digest). */
+                uint8_t dg[16];
+                char hx[33];
+                uint32_t b;
+                if (aot_proto_ctor_digest(rt, po, dg)) {
+                    for (b = 0; b < 16; b++)
+                        snprintf(hx + b * 2, 3, "%02x", dg[b]);
+                    fprintf(f, "fn:%s via=scan", hx);
                     named = 1;
                 }
             }
