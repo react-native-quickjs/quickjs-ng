@@ -70614,9 +70614,14 @@ QJS_AOT_STUB const void *qjs_aot_array_iterator_next_fn(void)
     return (const void *)js_array_iterator_next;
 }
 
+static JSValue js_string_replace(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv,
+                                 int is_replaceAll);
+
 QJS_AOT_STUB const void *qjs_aot_array_builtin_fn(int which)
 {
-    return which == 0 ? (const void *)js_array_push : which == 1 ? (const void *)js_array_pop : NULL;
+    return which == 0 ? (const void *)js_array_push : which == 1 ? (const void *)js_array_pop :
+           which == 2 ? (const void *)js_string_replace : NULL;
 }
 
 /* The push of a compiled body that does not fit the array's capacity (or its packed element kind): the builtin itself, on a receiver the
@@ -103291,6 +103296,7 @@ static void js_regexp_snapshot(JSContext *ctx)
         n++;
     }
     atoms[n++] = JS_ATOM_Symbol_match;
+    atoms[n++] = JS_ATOM_Symbol_replace;
     for (i = 0; i < n; i++) {
         idx[i] = js_regexp_snap_slot(ctx, proto, atoms[i], &getter[i]);
         if (idx[i] < 0)
@@ -104667,6 +104673,62 @@ static int js_is_standard_regexp(JSContext *ctx, JSValueConst rx)
         JS_FreeValue(ctx, val);
     }
     return res;
+}
+
+/* `str.replace(re, rep).length` of a compiled body, without making the result string: `this_val` and `rep` are flat strings, `rx` a pristine
+   RegExp (its replace method, its exec and its flags are the original ones), `rep` has no `$`. The length is the one the replacement
+   would have; a global RegExp's lastIndex is left at 0 as replace leaves it. Returns 0 with nothing observable done when any of that does
+   not hold (or the match failed in a way that throws: the exception is cleared and the caller's ordinary call throws it), so the
+   caller repeats the call. */
+QJS_AOT_STUB int qjs_aot_replace_len(JSContext *ctx, JSValue this_val, JSValue rx, JSValue rep, int32_t *out)
+{
+    JSRegExp *re;
+    const uint8_t *bc;
+    JSString *sp, *rp;
+    JSReMatches m;
+    int flags, ncap, next = 0;
+    bool global;
+    int64_t total = 0;
+    size_t mi;
+
+    if (JS_VALUE_GET_TAG(this_val) != JS_TAG_STRING || JS_VALUE_GET_TAG(rep) != JS_TAG_STRING)
+        return 0;
+    re = js_regexp_fast(ctx, rx);
+    if (!re)
+        return 0;
+    sp = JS_VALUE_GET_STRING(this_val);
+    rp = JS_VALUE_GET_STRING(rep);
+    if (string_indexof_char(rp, '$', 0) >= 0)
+        return 0;
+    bc = str8(re->bytecode);
+    flags = lre_get_flags(bc);
+    ncap = lre_get_capture_count(bc);
+    global = (flags & LRE_FLAG_GLOBAL) != 0;
+    if ((flags & LRE_FLAG_NAMED_GROUPS) || ((flags & LRE_FLAG_STICKY) && !global))
+        return 0;
+    js_re_matches_init(&m, ctx, ncap);
+    if (global)
+        JS_VALUE_GET_OBJ(rx)->prop[0].u.value = js_int32(0);
+    if (js_regexp_match_loop(ctx, re, sp, global,
+                             (flags & (LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)) != 0,
+                             &m)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        js_re_matches_free(&m);
+        return 0;
+    }
+    for (mi = 0; mi < m.n; mi++) {
+        const int32_t *e = m.v + mi * m.stride;
+        if (e[0] >= next) {
+            total += (int64_t)(e[0] - next) + rp->len;
+            next = e[1];
+        }
+    }
+    total += (int64_t)sp->len - next;
+    js_re_matches_free(&m);
+    if (total > JS_STRING_LEN_MAX)
+        return 0;
+    *out = (int32_t)total;
+    return 1;
 }
 
 static JSValue js_regexp_Symbol_replace_body(JSContext *ctx, JSValueConst this_val,

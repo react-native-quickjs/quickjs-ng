@@ -241,9 +241,11 @@ typedef struct JSAotGenLayout {
 /* The function pointer of Array Iterator's `next`, which a C function object holds when it is
    that builtin. */
 QJS_AOT_STUB const void *qjs_aot_array_iterator_next_fn(void);
-/* The function pointer of Array.prototype.push (0) or pop (1), which a C function object holds,
+/* The function pointer of Array.prototype.push (0), pop (1) or String.prototype.replace (2), which a C function object holds,
    with magic 0, when it is that builtin. */
 QJS_AOT_STUB const void *qjs_aot_array_builtin_fn(int which);
+/* `str.replace(re, rep).length` without the result string (see quickjs.c); 0 = not applicable, nothing done */
+QJS_AOT_STUB int qjs_aot_replace_len(JSContext *ctx, JSValue this_val, JSValue rx, JSValue rep, int32_t *out);
 /* push of one value through the builtin on a plain array the body checked (the capacity miss of the inline push); 0 = it threw and nothing happened */
 QJS_AOT_STUB int qjs_aot_array_push_slow(JSContext *ctx, JSValue arr, JSValue v, JSValue *out);
 /* the byte offset of the own data property `atom` in objects of `shape`, or 0 when it is not one (a compiled copy resolves its receiver's slots from the shape) */
