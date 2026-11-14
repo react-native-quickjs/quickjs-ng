@@ -133,6 +133,12 @@ typedef struct JSRegRopInfo {
     uint8_t rd_own;  /* register operands other than di and di2: the reads the ownership report checks */
     uint8_t rd_arg;  /* register operands other than dst and dst2: the reads the argument index counts */
 } JSRegRopInfo;
+/* An instruction's operand bytes in the wide register form, or -1 when the
+   opcode has no format. */
+static inline int regvm_rop_wsize(const JSRegRopInfo *ri, int op)
+{
+    return ri[op].size[1] == 0xff ? -1 : ri[op].size[1];
+}
 static void js_regvm_rop_info_init(JSRegRopInfo *ri);
 #endif
 
@@ -32922,8 +32928,8 @@ static int regvm_record_alloc(JSRuntime *rt, JSFunctionBytecode *b,
 static int regvm_record_eligible(JSFunctionBytecode *cb);
 #if QJS_REGVM_RECORD
 /* The encoded program contains only light-safe opcodes. */
-static int regvm_code_light_safe(const uint8_t *code, int len);
-static int regvm_code_has_op(const uint8_t *code, int len, int want);
+static int regvm_code_light_safe(const JSRegRopInfo *ri, const uint8_t *code, int len);
+static int regvm_code_has_op(const JSRegRopInfo *ri, const uint8_t *code, int len, int want);
 static __attribute__((always_inline)) inline JSRegRun *
 regvm_light_prepare(REGVM_ARGS, JSObject *co, JSFunctionBytecode *cb,
                     int ret_off, JSValue *oargv,
@@ -37956,7 +37962,7 @@ static void regvm_set_frame_shape(JSFunctionBytecode *b)
 #endif
 }
 
-static void regvm_set_call_desc(JSFunctionBytecode *b)
+static void regvm_set_call_desc(const JSRegRopInfo *ri, JSFunctionBytecode *b)
 {
     b->regvm_call_ready = (b->func_kind == JS_FUNC_NORMAL && b->regvm_compiled
                            && !b->is_lazy && b->regvm_all_threaded) ? 1 : 0;
@@ -37974,9 +37980,9 @@ static void regvm_set_call_desc(JSFunctionBytecode *b)
     if (b->regvm_call_ready && b->func_kind == JS_FUNC_NORMAL
         && b->var_ref_count == 0 && !b->args_captured
         && b->regvm_ctl_count == 0
-        && regvm_code_light_safe(b->regvm_code, b->regvm_len)
+        && regvm_code_light_safe(ri, b->regvm_code, b->regvm_len)
         && !(b->arg_count != 0 &&
-             regvm_code_has_op(b->regvm_code, b->regvm_len, ROP_apply_arguments))) {
+             regvm_code_has_op(ri, b->regvm_code, b->regvm_len, ROP_apply_arguments))) {
         b->regvm_light = 1;
         b->regvm_light_fast = (b->regvm_pic != NULL
                                || b->regvm_pic_count == 0);
@@ -68171,7 +68177,7 @@ static void js_aot_scan_bytecode(JSFunctionBytecode *b, JSAotScan *s, int depth)
    the encoded bytes, the final form. `regvm_all_threaded` is never serialized,
    so the bundle read path runs the same walk. */
 #if QJS_REGVM_THREAD
-static int regvm_code_all_threaded(const uint8_t *code, int len)
+static int regvm_code_all_threaded(const JSRegRopInfo *ri, const uint8_t *code, int len)
 {
     const uint8_t *p = code, *end;
 
@@ -68186,7 +68192,7 @@ static int regvm_code_all_threaded(const uint8_t *code, int len)
         if (op >= ROP_COUNT || !regvm_is_threaded[op] ||
             regvm_rop_fmt[op] == NULL)
             return 0;
-        sz = regvm_fmt_size(regvm_rop_fmt[op], 1, (uint16_t)op);
+        sz = regvm_rop_wsize(ri, op);
         if (sz < 0)
             return 0;
         p += 1 + sz;
@@ -68208,7 +68214,7 @@ static int regvm_code_all_threaded(const uint8_t *code, int len)
  * the caller checks (regvm_code_has_op): its forwarding path reads `argc` and
  * `arg_buf` from the prefix, and its reified path has nothing to map.
  */
-static int regvm_code_has_op(const uint8_t *code, int len, int want)
+static int regvm_code_has_op(const JSRegRopInfo *ri, const uint8_t *code, int len, int want)
 {
     const uint8_t *p = code, *end = p + len;
     while (p < end) {
@@ -68217,7 +68223,7 @@ static int regvm_code_has_op(const uint8_t *code, int len, int want)
             return 1;
         if (op >= ROP_COUNT || regvm_rop_fmt[op] == NULL)
             return 1;
-        sz = regvm_fmt_size(regvm_rop_fmt[op], 1, (uint16_t)op);
+        sz = regvm_rop_wsize(ri, op);
         if (sz < 0)
             return 1;
         p += 1 + sz;
@@ -68269,7 +68275,7 @@ static bool regvm_op_light_unsafe(int op)
     }
 }
 
-static int regvm_code_light_safe(const uint8_t *code, int len)
+static int regvm_code_light_safe(const JSRegRopInfo *ri, const uint8_t *code, int len)
 {
     const uint8_t *p = code, *end = p + len;
 
@@ -68278,7 +68284,7 @@ static int regvm_code_light_safe(const uint8_t *code, int len)
         if (op >= ROP_COUNT || regvm_rop_fmt[op] == NULL ||
             regvm_op_light_unsafe(op))
             return 0;
-        sz = regvm_fmt_size(regvm_rop_fmt[op], 1, (uint16_t)op);
+        sz = regvm_rop_wsize(ri, op);
         if (sz < 0)
             return 0;
         p += 1 + sz;
@@ -82606,7 +82612,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                encoded bytes, which are the final form. Shared with the bundle
                read path. */
             fd->regvm_all_threaded =
-                regvm_code_all_threaded(fd->regvm_code, fd->regvm_len);
+                regvm_code_all_threaded(ctx->rt->regvm_rop_info, fd->regvm_code, fd->regvm_len);
 #endif
             if (er == REGVM_REFUSED) {
                 if (enc_why)
@@ -86734,7 +86740,7 @@ static void js_scan_argv_safe(JSFunctionBytecode *b);
 static void js_scan_arg_flags_raw(const uint8_t *bc, int len,
                                   bool *argv_safe, bool *args_captured);
 #if QJS_REGVM
-static void regvm_scan_arg_flags(const uint8_t *code, int len,
+static void regvm_scan_arg_flags(const JSRegRopInfo *ri, const uint8_t *code, int len,
                                  bool *argv_safe, bool *args_captured);
 #endif
 
@@ -87010,7 +87016,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
         fd->regvm_len = 0;
         {
             bool rs_argv, rs_args;
-            regvm_scan_arg_flags(b->regvm_code, b->regvm_len, &rs_argv, &rs_args);
+            regvm_scan_arg_flags(ctx->rt->regvm_rop_info, b->regvm_code, b->regvm_len, &rs_argv, &rs_args);
 #if !defined(NDEBUG)
             /* Cross-check against the stack scan, which can still run here:
                args_captured must match exactly, and the register scan may be
@@ -87115,7 +87121,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     b->realm = JS_DupContext(ctx);
 
 #if QJS_REGVM_RECORD
-    regvm_set_call_desc(b);
+    regvm_set_call_desc(ctx->rt->regvm_rop_info, b);
     if (fd->regvm_conservative || fd->regvm_baseline) {
         /* the conservative retry and the baseline tier keep the frame
            authoritative: no light frame */
@@ -90570,7 +90576,7 @@ static bool regvm_argv_safe_op(int op, const uint8_t *ops)
  *   argv_safe      a C caller's argv may be used in place; JS_CallInternal
  *                  reads it in every build, so a parameter write clears it.
  * A malformed program leaves both flags false. */
-static void regvm_scan_arg_flags(const uint8_t *code, int len,
+static void regvm_scan_arg_flags(const JSRegRopInfo *ri, const uint8_t *code, int len,
                                  bool *argv_safe, bool *args_captured)
 {
     const uint8_t *p = code, *end = p + len;
@@ -90585,7 +90591,7 @@ static void regvm_scan_arg_flags(const uint8_t *code, int len,
             *args_captured = true;
         if (!regvm_argv_safe_op(op, p + 1))
             return;
-        sz = regvm_fmt_size(regvm_rop_fmt[op], 1, (uint16_t)op);
+        sz = regvm_rop_wsize(ri, op);
         if (sz < 0)
             return;
         p += 1 + sz;
@@ -92246,9 +92252,9 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
 #if QJS_AOT
     if (b->regvm_compiled && b->regvm_code)
         b->regvm_all_threaded =
-            regvm_code_all_threaded(b->regvm_code, b->regvm_len);
+            regvm_code_all_threaded(ctx->rt->regvm_rop_info, b->regvm_code, b->regvm_len);
 #endif
-    regvm_set_call_desc(b);
+    regvm_set_call_desc(ctx->rt->regvm_rop_info, b);
 #endif
 #if QJS_AOT && !QJS_REGVM_RECORD
     js_aot_bind(b);
@@ -93117,9 +93123,9 @@ static int js_materialize_function_body(JSContext *ctx, JSFunctionBytecode *b)
 #if QJS_AOT
         if (b->regvm_compiled && b->regvm_code)
             b->regvm_all_threaded =
-                regvm_code_all_threaded(b->regvm_code, b->regvm_len);
+                regvm_code_all_threaded(ctx->rt->regvm_rop_info, b->regvm_code, b->regvm_len);
 #endif
-        regvm_set_call_desc(b);
+        regvm_set_call_desc(ctx->rt->regvm_rop_info, b);
 #endif
 #if QJS_AOT && !QJS_REGVM_RECORD
         js_aot_bind(b);
