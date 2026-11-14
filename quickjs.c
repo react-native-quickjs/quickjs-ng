@@ -25033,6 +25033,8 @@ static uint8_t *REGVM_CC regvm_t_call_slow(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_call_method_slow(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_call_record(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_call_method_record(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_call_lazy(REGVM_ARGS);
+static uint8_t *REGVM_CC regvm_t_call_method_lazy(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_construct_record(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_apply_arguments_record(REGVM_ARGS);
 static JSFunctionBytecode *js_new_target_bytecode(JSValueConst new_target);
@@ -25660,22 +25662,15 @@ static uint8_t *REGVM_CC regvm_t_call(REGVM_ARGS)
     JSValue cf = FR(c);
 
     REGVM_CAPTURE_IP();
+    /* Kept a pure classify-and-jump: the lazy materialize, and its call, live
+       in `regvm_t_call_lazy`, so no C frame lands on every call. */
     if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
         JSObject *co = JS_VALUE_GET_OBJ(cf);
         if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION)) {
             JSFunctionBytecode *cb = co->u.func.function_bytecode;
             if (likely(regvm_record_eligible(cb)))
                 __attribute__((musttail)) return regvm_t_call_record(REGVM_PASS);
-            /* A lazy function becomes record-eligible only once materialized.
-               Materializing here keeps its first call on the record path, so
-               Error.stack is the same for a bundle and for source. */
-            if (unlikely(cb->is_lazy) &&
-                js_materialize_function_body(cb->realm, cb) == 0 &&
-                regvm_record_eligible(cb))
-                __attribute__((musttail)) return regvm_t_call_record(REGVM_PASS);
-#if defined(QJS_REGVM_COUNT)
-            regvm_note_blockers(cb);
-#endif
+            __attribute__((musttail)) return regvm_t_call_lazy(REGVM_PASS);
         }
     }
     __attribute__((musttail)) return regvm_t_call_slow(REGVM_PASS);
@@ -25687,6 +25682,8 @@ static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS)
     JSValue cf = FR(c);
 
     REGVM_CAPTURE_IP();
+    /* Pure classify-and-jump; the lazy materialize is in
+       `regvm_t_call_method_lazy`. */
     if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
         JSObject *co = JS_VALUE_GET_OBJ(cf);
         if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION)) {
@@ -25694,18 +25691,53 @@ static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS)
             if (likely(regvm_record_eligible(cb)))
                 __attribute__((musttail))
                     return regvm_t_call_method_record(REGVM_PASS);
-            if (unlikely(cb->is_lazy) &&
-                js_materialize_function_body(cb->realm, cb) == 0 &&
-                regvm_record_eligible(cb))
-                __attribute__((musttail))
-                    return regvm_t_call_method_record(REGVM_PASS);
-#if defined(QJS_REGVM_COUNT)
-            regvm_note_blockers(cb);
-#endif
+            __attribute__((musttail)) return regvm_t_call_method_lazy(REGVM_PASS);
         }
     }
     __attribute__((musttail)) return regvm_t_call_method_slow(REGVM_PASS);
 }
+
+#if QJS_REGVM_RECORD
+/* The lazy-materialize half of the call classifiers, split out so the
+   classifiers stay frameless. Reached for a bytecode callee that is not yet
+   record-eligible, in practice a lazy function. Materializing here keeps its
+   first call on the record path, so Error.stack is the same for a bundle and
+   for source. */
+static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_lazy(REGVM_ARGS)
+{
+    int c = T_REG(3);
+    JSValue cf = FR(c);
+    JSObject *co = JS_VALUE_GET_OBJ(cf);
+    JSFunctionBytecode *cb = co->u.func.function_bytecode;
+
+    if (unlikely(cb->is_lazy) &&
+        js_materialize_function_body(cb->realm, cb) == 0 &&
+        regvm_record_eligible(cb))
+        __attribute__((musttail)) return regvm_t_call_record(REGVM_PASS);
+#if defined(QJS_REGVM_COUNT)
+    regvm_note_blockers(cb);
+#endif
+    __attribute__((musttail)) return regvm_t_call_slow(REGVM_PASS);
+}
+
+static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_lazy(REGVM_ARGS)
+{
+    int c = T_REG(3);
+    JSValue cf = FR(c);
+    JSObject *co = JS_VALUE_GET_OBJ(cf);
+    JSFunctionBytecode *cb = co->u.func.function_bytecode;
+
+    if (unlikely(cb->is_lazy) &&
+        js_materialize_function_body(cb->realm, cb) == 0 &&
+        regvm_record_eligible(cb))
+        __attribute__((musttail))
+            return regvm_t_call_method_record(REGVM_PASS);
+#if defined(QJS_REGVM_COUNT)
+    regvm_note_blockers(cb);
+#endif
+    __attribute__((musttail)) return regvm_t_call_method_slow(REGVM_PASS);
+}
+#endif
 
 /*
  * The record-creating halves. They allocate from the arena and fill a frame,
