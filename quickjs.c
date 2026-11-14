@@ -886,6 +886,10 @@ struct JSRuntime {
        watched object name an unwatched atom and skip the list) */
     JSAtom aot_gwatch[JS_AOT_GWATCH_MAX];
     uint64_t aot_gwatch_bloom[4];
+    /* per watched atom: 1 when a fact group (not only an int32 fold) depends on it. An atom watched only by folds is dropped from the list by the first
+       write it reports: the epoch moved, every folded literal is stale, and the next entry of a body re-confirms its folds against the live value (which
+       watches the atom again if it still matches). Otherwise a global written in a loop paid the epoch bump and the list on every store. */
+    uint8_t aot_gwatch_fact[JS_AOT_GWATCH_MAX];
 };
 
 #if QJS_REGVM_RECORD
@@ -17007,12 +17011,42 @@ static inline bool js_aot_gwatched(JSRuntime *rt, JSAtom atom)
     return false;
 }
 
+static void js_gv_cell_invalidate(JSRuntime *rt);
+
+/* The index of `atom` on the watch list, or -1. */
+static inline int js_aot_gwatch_find(JSRuntime *rt, JSAtom atom)
+{
+    uint32_t i;
+    if (likely(rt->aot_gwatch_n == 0) || !(rt->aot_gwatch_bloom[(atom >> 6) & 3] & ((uint64_t)1 << (atom & 63))))
+        return -1;
+    for (i = 0; i < rt->aot_gwatch_n; i++)
+        if (rt->aot_gwatch[i] == atom)
+            return (int)i;
+    return -1;
+}
+
+/* Drop entry `gi` (swap with the last). The bloom filter keeps the bit: it only ever over-reports. The cells filled while the atom was watched never took the
+   direct store, so they are dropped and refill. */
+static void js_aot_gwatch_drop(JSRuntime *rt, int gi)
+{
+    uint32_t last = --rt->aot_gwatch_n;
+    JSAtom a = rt->aot_gwatch[gi];
+    rt->aot_gwatch[gi] = rt->aot_gwatch[last];
+    rt->aot_gwatch_fact[gi] = rt->aot_gwatch_fact[last];
+    JS_FreeAtomRT(rt, a);
+    js_gv_cell_invalidate(rt);
+}
+
 /* A value is about to be written to the global property `atom`: a compiled body that holds
    it as a literal must leave at its next epoch test. */
 static inline void js_aot_gwrite(JSRuntime *rt, JSAtom atom)
 {
-    if (unlikely(rt->aot_gwatch_n != 0) && js_aot_gwatched(rt, atom))
+    int gi;
+    if (unlikely(rt->aot_gwatch_n != 0) && (gi = js_aot_gwatch_find(rt, atom)) >= 0) {
         AOT_EPOCH_BUMP(rt, 5);
+        if (!rt->aot_gwatch_fact[gi])
+            js_aot_gwatch_drop(rt, gi);
+    }
 }
 
 static void js_aot_obj_event(JSRuntime *rt, JSObject *p, int ev, JSAtom atom, JSValueConst val);
@@ -17021,11 +17055,14 @@ static void js_aot_obj_event(JSRuntime *rt, JSObject *p, int ev, JSAtom atom, JS
    fact that expects the property's value breaks. Only atoms on the watch list pay for the scan. */
 static __attribute__((noinline)) void js_aot_gwrite_slow(JSRuntime *rt, JSObject *p, JSAtom atom, JSValueConst v)
 {
-    if (!js_aot_gwatched(rt, atom))
+    int gi = js_aot_gwatch_find(rt, atom);
+    if (gi < 0)
         return;
     AOT_EPOCH_BUMP(rt, 5);
     if (rt->aot_facts != NULL)
         js_aot_obj_event(rt, p, JS_AOT_EV_STORE, atom, v);
+    if (!rt->aot_gwatch_fact[gi])
+        js_aot_gwatch_drop(rt, gi);
 }
 
 static inline void js_aot_gwrite_val(JSRuntime *rt, JSObject *p, JSAtom atom, JSValueConst v)
@@ -17077,7 +17114,15 @@ typedef struct JSAotFacts {
     uint32_t sweep_pending; /* a group broke since the last sweep: it may still hold values (the sweep is a walk of every group) */
     struct JSAotLayoutDep *ld;      /* the facts_valid bits that depend on a layout */
     int nld, ldcap;
+    /* The atoms any group lists as an expected property value (a bit per atom hash, never cleared): a STORE of an atom no group lists cannot break one, so
+       the event scan is skipped for it. Without this every direct store to a watched global walked every group of the runtime. */
+    uint64_t listed_bloom[4];
 } JSAotFacts;
+
+static inline void js_aot_facts_note_listed(JSAotFacts *F, JSAtom atom)
+{
+    F->listed_bloom[(atom >> 6) & 3] |= (uint64_t)1 << (atom & 63);
+}
 
 #ifdef QJS_KIT_TEST_KNOBS
 /* The vkit's negative controls: QJS_AOT_FACTS_OFF=add,store,edit,proto,construct,eval,all switches a mechanism off so its case can be
@@ -17198,6 +17243,10 @@ static void js_aot_obj_event(JSRuntime *rt, JSObject *p, int ev, JSAtom atom, JS
     JSAotFacts *F = rt->aot_facts;
     int i;
     if (F == NULL || (js_aot_facts_off_mask() & (1u << ev)))
+        return;
+    /* a store breaks a group only through an atom the group lists (the STORE case below needs k >= 0) */
+    if (ev == JS_AOT_EV_STORE && atom != JS_ATOM_NULL &&
+        !(F->listed_bloom[(atom >> 6) & 3] & ((uint64_t)1 << (atom & 63))))
         return;
     for (i = 0; i < F->n; i++) {
         JSAotFact *g = F->g[i];
@@ -17338,6 +17387,7 @@ JSAotFact *qjs_aot_fact_new(JSContext *ctx, JSValueConst obj, JSValueConst proto
         g->props[g->nprops].atom = JS_DupAtom(ctx, atoms[i]);
         g->props[g->nprops].val = js_dup(pr->u.value);
         g->nprops++;
+        js_aot_facts_note_listed(F, atoms[i]);
     }
     if (F->n == F->cap) {
         int ncap = F->cap ? F->cap * 2 : 16;
@@ -17387,6 +17437,8 @@ int qjs_aot_fact_expect(JSContext *ctx, JSAotFact *g, JSAtom atom, JSValueConst 
         g->props[g->nprops].atom = JS_DupAtom(ctx, atom);
         g->props[g->nprops].val = js_dup(val);
         g->nprops++;
+        if (g->rt->aot_facts != NULL)
+            js_aot_facts_note_listed(g->rt->aot_facts, atom);
     }
     return 0;
 }
@@ -68135,13 +68187,19 @@ int qjs_aot_global_watch(JSContext *ctx, JSValue obj, int atom)
     if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT ||
         (JS_VALUE_GET_OBJ(obj) != JS_VALUE_GET_OBJ(ctx->global_obj) && JS_VALUE_GET_OBJ(obj) != JS_VALUE_GET_OBJ(ctx->global_var_obj)))
         return 1;
-    if (!js_aot_gwatched(rt, (JSAtom)atom)) {
-        if (rt->aot_gwatch_n >= JS_AOT_GWATCH_MAX)
-            return 0;
-        rt->aot_gwatch[rt->aot_gwatch_n++] = JS_DupAtomRT(rt, (JSAtom)atom);
-        rt->aot_gwatch_bloom[((uint32_t)atom >> 6) & 3] |= (uint64_t)1 << ((uint32_t)atom & 63);
-        /* the cells filled so far may take the direct store */
-        js_gv_cell_invalidate(rt);
+    {
+        int gi = js_aot_gwatch_find(rt, (JSAtom)atom);
+        if (gi >= 0) {
+            rt->aot_gwatch_fact[gi] = 1;
+        } else {
+            if (rt->aot_gwatch_n >= JS_AOT_GWATCH_MAX)
+                return 0;
+            rt->aot_gwatch_fact[rt->aot_gwatch_n] = 1;
+            rt->aot_gwatch[rt->aot_gwatch_n++] = JS_DupAtomRT(rt, (JSAtom)atom);
+            rt->aot_gwatch_bloom[((uint32_t)atom >> 6) & 3] |= (uint64_t)1 << ((uint32_t)atom & 63);
+            /* the cells filled so far may take the direct store */
+            js_gv_cell_invalidate(rt);
+        }
     }
     return 1;
 }
@@ -68164,6 +68222,7 @@ int qjs_aot_global_fold(JSContext *ctx, int atom, int32_t v)
     if (!js_aot_gwatched(rt, (JSAtom)atom)) {
         if (rt->aot_gwatch_n >= JS_AOT_GWATCH_MAX)
             return 0;
+        rt->aot_gwatch_fact[rt->aot_gwatch_n] = 0;   /* a fold only: the first reported write drops it */
         rt->aot_gwatch[rt->aot_gwatch_n++] = JS_DupAtomRT(rt, (JSAtom)atom);
         rt->aot_gwatch_bloom[((uint32_t)atom >> 6) & 3] |= (uint64_t)1 << ((uint32_t)atom & 63);
         /* the cells filled so far may take the direct store */
