@@ -408,7 +408,9 @@ int qjs_aot_array_from(JSContext *ctx, JSValue *argv, int na, JSValue *out);
 QJS_AOT_STUB JSValue qjs_aot_throw_here(JSContext *ctx, JSRegRun *f, uint32_t pc);
 /* `put_global`: the engine's global store of a borrowed value (it duplicates).
    0, or -1 on an exception. */
-int qjs_aot_put_global(JSContext *ctx, int atom, JSValue v, int init);
+/* `b` is the storing function's bytecode: its strictness decides what an undeclared or
+   read-only target does, because a frameless body has no frame the engine could ask. */
+int qjs_aot_put_global(JSContext *ctx, void *b, int atom, JSValue v, int init);
 /* `load_const` of the constant pool (kind 0) or an atom (kind 1): 0 with an OWNED *out,
    -1 on an exception. */
 int qjs_aot_load_const(JSContext *ctx, JSRegRun *f, int kind, uint32_t idx, JSValue *out);
