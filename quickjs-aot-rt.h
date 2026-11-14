@@ -10,8 +10,14 @@
 /* The register-frame handle. Opaque here; defined in quickjs.c. */
 typedef struct JSRegRun JSRegRun;
 
+/* QJS_DRC changes the ownership rule for a register store, so it is part of
+   the ABI: a unit built with a different -DQJS_DRC is refused at bind. */
+#ifndef QJS_DRC
+#define QJS_DRC 1
+#endif
+
 #ifndef QJS_AOT_ABI
-#define QJS_AOT_ABI 1u
+#define QJS_AOT_ABI (3u | ((uint32_t)QJS_DRC << 8))
 #endif
 
 /* Sentinels returned by qjs_aot_step; they mirror REGVM_COLD_RET and
@@ -42,5 +48,94 @@ uint8_t *qjs_aot_code(JSRegRun *f);
 JSValue qjs_aot_ret(JSRegRun *f);
 JSValue qjs_aot_unwind(JSContext *ctx, JSRegRun *f, JSValue *fr,
                        uint32_t pc, uint32_t *resume_pc);
+
+/* --- AOT fast-path helpers ------------------------------------------------
+ *
+ * A template calls the interpreter handler's fast-path predicate with
+ * constant operands; a miss falls through to qjs_aot_step at the same pc.
+ * qjs_aot_num_fast / qjs_aot_unary_num_fast return an immediate and
+ * qjs_aot_own_read_hit a borrowed value, so all three store with AOT_SET_B.
+ */
+
+/* The register file holds JSValues at byte offsets; operands are byte offsets. */
+#define AOT_REG(fr, off) (*(JSValue *)((uint8_t *)(fr) + (off)))
+
+/* Re-read a 32-bit little-endian operand (an atom) from the live bytecode. */
+static inline uint32_t qjs_aot_ld_u32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+#if QJS_DRC
+/* Registers do not own in DRC: a store is a plain assignment. */
+#define AOT_SET_B(ctx, fr, off, v) (AOT_REG(fr, off) = (v))
+#else
+/* Registers own: free the old value and duplicate the new one. */
+void qjs_aot_set_reg_b(JSContext *ctx, JSValue *fr, int off, JSValue v);
+#define AOT_SET_B(ctx, fr, off, v) qjs_aot_set_reg_b(ctx, fr, off, v)
+#endif
+
+/* Mirror SET_REG_P: the store takes over an owned value (adopt in DRC, free the
+   old and move in the owning build). Used where the handler uses SET_REG_P. */
+void qjs_aot_set_reg_p(JSContext *ctx, JSValue *fr, int off, JSValue v);
+
+/* Cache the variable buffer once at function entry: AOT_VAR(vb, slot). */
+JSValue *qjs_aot_var_buf(JSRegRun *f);
+
+/* The frame's PIC table, opaque to the unit and fixed for the frame. */
+const void *qjs_aot_pic(JSRegRun *f);
+
+/* Mirror regvm_num_fast / regvm_unary_num_fast. Return 1 on a hit. */
+int qjs_aot_num_fast(int sub, JSValue a, JSValue b, JSValue *out);
+int qjs_aot_unary_num_fast(int sub, JSValue a, JSValue *out);
+
+/* Mirror regvm_own_read_hit: 1 on a PIC hit with a borrowed *out. `pic` is the
+   value qjs_aot_pic returned for this frame. */
+int qjs_aot_own_read_hit(JSRegRun *f, const void *pic, JSValue recv, int site,
+                         JSValue *out);
+
+/* Mirror the int/float fast path of REGVM_CMP_BRANCH. Return 1 when the
+   comparison is decided (*take), 0 when it needs the generic slow path. */
+int qjs_aot_branch_cmp(int sub, JSValue a, JSValue b, int *take);
+
+/* Mirror js_regvm_binary (the general binary op, exception-capable): 0 on
+   success with an owned *out, -1 on exception. */
+int qjs_aot_binary(JSContext *ctx, int sub, JSValue a, JSValue b, JSValue *out);
+
+/* The frame's argument window: AOT_ARG(ab, slot). */
+JSValue *qjs_aot_arg_buf(JSRegRun *f);
+
+/* Mirror put_local: set_value(ctx, &vb[slot], js_dup(v)). */
+void qjs_aot_put_local(JSContext *ctx, JSValue *vb, int slot, JSValue v);
+
+/* Mirror the get_global cell-cache fast path then JS_GetGlobalVar: 0 on
+   success with an owned *out, -1 on exception. */
+int qjs_aot_get_global(JSContext *ctx, int atom, int throwing, JSValue *out);
+
+/* Mirror put_field's REG_PIC_OWN_W direct-slot fast path (borrowed v): 1 when
+   the store happened, 0 when the caller must take the slow path. */
+int qjs_aot_put_field_own(JSContext *ctx, JSRegRun *f, JSValue recv, int site, JSValue v);
+
+/* Mirror get_element's plain-array fast path (non-hole, non-lazy): 1 with an
+   owned *out when handled, 0 otherwise. */
+int qjs_aot_get_element(JSValue recv, JSValue k, JSValue *out);
+
+/* Mirror get_var_ref: a borrowed read of the var-ref cell. */
+JSValue qjs_aot_get_var_ref(JSRegRun *f, int slot);
+
+/* Mirror load_this: 0 = borrowed *out (store with AOT_SET_B), 1 = owned *out
+   (store with AOT_SET_P), -1 = exception. */
+int qjs_aot_load_this(JSContext *ctx, JSRegRun *f, JSValue *out);
+
+/* Mirror move_xfer: move d<-s and clear s, honouring the DRC ownership model. */
+void qjs_aot_move_xfer(JSContext *ctx, JSValue *fr, int d, int s);
+
+/* Mirror js_regvm_unary (exception-capable): 0 with an owned *out, -1 on
+   exception. */
+int qjs_aot_unary(JSContext *ctx, int sub, JSValue a, JSValue *out);
+
+/* Mirror regvm_to_bool: 0/1, or -1 on exception. */
+int qjs_aot_to_bool(JSContext *ctx, JSValue v);
 
 #endif /* QUICKJS_AOT_RT_H */

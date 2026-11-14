@@ -54,4 +54,20 @@ void js_aot_gen_free(JSRuntime *rt, JSAotGenFunc *arr);
  */
 int js_aot_gen_insn_size(const uint8_t *code, int len, int off, int *p_op);
 
+/* One decoded register instruction for the template registry. `arg[i].kind`
+   is the format character, `val` the raw operand and `off` its byte offset in
+   the instruction (so a remapped atom can be re-read from live code). A
+   register's `val` is its byte offset in the register file; a branch target's
+   is relative to the END of the instruction. */
+typedef struct JSAotGenInsn {
+    int op;                 /* the ROP_* opcode */
+    int size;               /* total size in bytes, opcode included */
+    int nargs;              /* operands (<= 8 in the current ISA) */
+    struct { char kind; int64_t val; int off; } arg[8];
+} JSAotGenInsn;
+
+/* Decode one instruction into *out. Returns 0, or -1 under the conditions
+   js_aot_gen_insn_size refuses. */
+int js_aot_gen_decode_insn(const uint8_t *code, int len, int off, JSAotGenInsn *out);
+
 #endif /* QUICKJS_AOT_GEN_H */

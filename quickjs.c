@@ -1218,7 +1218,7 @@ struct JSMegaEntry {
 /* AOT ABI version, shared by the profiler digest and the AOT runtime. The
    engine refuses a generated unit built against another version. */
 #ifndef QJS_AOT_ABI
-#define QJS_AOT_ABI 1u
+#define QJS_AOT_ABI (3u | ((uint32_t)QJS_DRC << 8))
 #endif
 
 #if QJS_AOT_PROFILE
@@ -26823,6 +26823,11 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
            window slot
          * a call does not write is read as an argument.
          */
+#ifdef AOT_MUT_FILL_DROP_ALL
+        /* Gate mutant: no `undefined` fill; a never-written register reads as
+           integer 0. */
+        memset(lay->regs, 0, (size_t)nregs * sizeof(JSValue));
+#else
         if (likely(nregs <= REGVM_UNDEF_TMPL_N)) {
             memcpy(lay->regs, regvm_undef_tmpl, (size_t)nregs * sizeof(JSValue));
         } else if (!cb->regvm_fill) {
@@ -26835,6 +26840,7 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
             for (k = 0; k < nf; k++)
                 lay->regs[cb->regvm_fill[k]] = JS_UNDEFINED;
         }
+#endif
     }
 
     rt->current_stack_frame = sf;
@@ -27084,8 +27090,27 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                force a reload of `b->regvm_reg_count` on every slot. */
             int ninit = b->regvm_reg_count + REGVM_HS;
 
-            for (i = 0; i < ninit; i++)
-                regs[i] = JS_UNDEFINED;
+#ifdef AOT_MUT_FILL_DROP_ALL
+            /* Gate mutant: no fill at all, so the pin and release walks see
+               stale values. */
+            (void)ninit;
+#else
+            /* Fill only the registers the definite-assignment analysis named
+               (`b->regvm_fill`, which always includes scratch, window and
+               handshake). A NULL list (a blob function) fills every register.
+               The rest is zeroed first. regvm_record_fill uses the same list.
+               */
+            if (likely(b->regvm_fill != NULL)) {
+                int nf = b->regvm_fill_count;
+
+                memset(regs, 0, (size_t)ninit * sizeof(JSValue));
+                for (i = 0; i < nf; i++)
+                    regs[b->regvm_fill[i]] = JS_UNDEFINED;
+            } else {
+                for (i = 0; i < ninit; i++)
+                    regs[i] = JS_UNDEFINED;
+            }
+#endif
             rpc = b->regvm_code;
             regvm_nctl = 0;
             regvm_resume_marker = NULL;
@@ -27636,6 +27661,12 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                            integer 0) then set the registers whose value can be \
                            observed before it is written to `undefined`; a NULL \
                            list (a blob) fills everything with `undefined`. */ \
+#ifdef AOT_MUT_FILL_DROP_ALL \
+                        /* Gate mutant: no `undefined` fill, so a never-written \
+                           register reads as integer 0. */ \
+                        memset(regs, 0, (size_t)(_cb->regvm_reg_count + REGVM_HS) \
+                                         * sizeof(JSValue)); \
+#else \
                         if (!_cb->regvm_fill) { \
                             for (_k = 0; _k < _cb->regvm_reg_count + REGVM_HS; _k++) \
                                 regs[_k] = JS_UNDEFINED; \
@@ -27645,6 +27676,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                             for (_k = 0; _k < _cb->regvm_fill_count; _k++) \
                                 regs[_cb->regvm_fill[_k]] = JS_UNDEFINED; \
                         } \
+#endif
                         rt->current_stack_frame = sf; \
                         REGVM_T_RUN_REBIND(); \
                         REGVM_NEXT(); \
@@ -55593,6 +55625,204 @@ uint8_t *qjs_aot_step(uint8_t *ip, JSValue *fr, JSRegRun *f, JSContext *ctx)
     return regvm_step(ip, fr, f, ctx);
 }
 
+/* --- AOT fast-path helpers ------------------------------------------------
+ *
+ * Each wraps the predicate the interpreter handler's fast path uses, so a
+ * template and the handler cannot drift.
+ */
+JSValue *qjs_aot_var_buf(JSRegRun *f)
+{
+    return f->var_buf;
+}
+
+const void *qjs_aot_pic(JSRegRun *f)
+{
+    return f->pic;
+}
+
+__attribute__((always_inline)) int qjs_aot_num_fast(int sub, JSValue a, JSValue b, JSValue *out)
+{
+    return regvm_num_fast(sub, a, b, out);
+}
+
+__attribute__((always_inline)) int qjs_aot_unary_num_fast(int sub, JSValue a, JSValue *out)
+{
+    return regvm_unary_num_fast(sub, a, out);
+}
+
+__attribute__((always_inline)) int qjs_aot_own_read_hit(JSRegRun *f, const void *pic, JSValue recv, int site,
+                         JSValue *out)
+{
+    return regvm_own_read_hit((JSRegPIC *)pic, f->b->regvm_pic_holder, recv,
+                              site, out);
+}
+
+__attribute__((always_inline)) int qjs_aot_branch_cmp(int sub, JSValue a, JSValue b, int *take)
+{
+    int r;
+
+    if (likely(JS_VALUE_IS_BOTH_INT(a, b)) &&
+        (r = regvm_int_cmp(sub & ~REG_CMP_INVERT,
+                           JS_VALUE_GET_INT(a), JS_VALUE_GET_INT(b))) >= 0) {
+        *take = r ^ ((sub & REG_CMP_INVERT) != 0);
+        return 1;
+    }
+    if (likely(JS_VALUE_GET_TAG(a) == JS_TAG_FLOAT64 &&
+               JS_VALUE_GET_TAG(b) == JS_TAG_FLOAT64) &&
+        (r = regvm_double_cmp(sub & ~REG_CMP_INVERT,
+                              JS_VALUE_GET_FLOAT64(a),
+                              JS_VALUE_GET_FLOAT64(b))) >= 0) {
+        *take = r ^ ((sub & REG_CMP_INVERT) != 0);
+        return 1;
+    }
+    return 0;
+}
+
+#if !QJS_DRC
+__attribute__((always_inline)) void qjs_aot_set_reg_b(JSContext *ctx, JSValue *fr, int off, JSValue v)
+{
+    JSValue *slot = (JSValue *)((uint8_t *)fr + off);
+    JSValue old = *slot;
+
+    if (REGVM_HAS_COUNT(old))
+        JS_FreeValue(ctx, old);
+    *slot = js_dup(v);
+}
+#endif
+
+__attribute__((always_inline)) void qjs_aot_set_reg_p(JSContext *ctx, JSValue *fr, int off, JSValue v)
+{
+    JSValue *slot = (JSValue *)((uint8_t *)fr + off);
+#if QJS_DRC
+    *slot = v;
+    REG_ADOPT(ctx->rt, v);
+#else
+    {
+        JSValue old = *slot;
+
+        if (REGVM_HAS_COUNT(old))
+            JS_FreeValue(ctx, old);
+        *slot = v;
+    }
+#endif
+}
+
+__attribute__((always_inline)) int qjs_aot_binary(JSContext *ctx, int sub, JSValue a, JSValue b, JSValue *out)
+{
+    return js_regvm_binary(ctx, sub, a, b, out);
+}
+
+JSValue *qjs_aot_arg_buf(JSRegRun *f)
+{
+    return f->arg_buf;
+}
+
+void qjs_aot_put_local(JSContext *ctx, JSValue *vb, int slot, JSValue v)
+{
+    set_value(ctx, &vb[slot], js_dup(v));
+}
+
+int qjs_aot_get_global(JSContext *ctx, int atom, int throwing, JSValue *out)
+{
+    if (likely(js_gv_cell_probe(ctx, (JSAtom)atom, out)))
+        return 0;
+    *out = JS_GetGlobalVar(ctx, (JSAtom)atom, throwing);
+    if (JS_IsException(*out))
+        return -1;
+    return 0;
+}
+
+__attribute__((always_inline)) int qjs_aot_put_field_own(JSContext *ctx, JSRegRun *f, JSValue recv, int site, JSValue v)
+{
+    if (JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT) {
+        JSObject *p = JS_VALUE_GET_OBJ(recv);
+        JSRegPIC *e = &f->pic[site];
+
+        if (likely(e->shape == p->shape) && e->kind == REG_PIC_OWN_W) {
+            JSValue *slot = (JSValue *)((char *)p->prop + e->slot_off);
+            JSValue old = *slot;
+
+            *slot = js_dup(v);
+            JS_FreeValue(ctx, old);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+__attribute__((always_inline)) int qjs_aot_get_element(JSValue recv, JSValue k, JSValue *out)
+{
+    if (likely(JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT &&
+               JS_VALUE_GET_TAG(k) == JS_TAG_INT)) {
+        JSObject *p = JS_VALUE_GET_OBJ(recv);
+        uint32_t idx = JS_VALUE_GET_INT(k);
+
+        if (likely(p->class_id == JS_CLASS_ARRAY && idx < p->u.array.count &&
+                   !js_array_slot_is_hole(p->u.array.u.values[idx]) &&
+                   !js_lazy_marker_is(p->u.array.u.values[idx]))) {
+            *out = js_dup(p->u.array.u.values[idx]);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+__attribute__((always_inline)) JSValue qjs_aot_get_var_ref(JSRegRun *f, int slot)
+{
+    return *f->var_refs[slot]->pvalue;
+}
+
+__attribute__((always_inline)) int qjs_aot_load_this(JSContext *ctx, JSRegRun *f, JSValue *out)
+{
+    JSValue this_obj = f->this_obj;
+
+    if (!f->b->is_strict_mode) {
+        int tag = JS_VALUE_GET_TAG(this_obj);
+
+        if (tag == JS_TAG_NULL || tag == JS_TAG_UNDEFINED) {
+            *out = ctx->global_obj;
+            return 0;
+        }
+        if (tag == JS_TAG_OBJECT) {
+            *out = this_obj;
+            return 0;
+        }
+        *out = JS_ToObject(ctx, this_obj);
+        if (JS_IsException(*out))
+            return -1;
+        return 1;
+    }
+    *out = this_obj;
+    return 0;
+}
+
+__attribute__((always_inline)) void qjs_aot_move_xfer(JSContext *ctx, JSValue *fr, int d, int s)
+{
+    JSValue *dst, *src;
+
+    if (d == s)
+        return;
+    dst = (JSValue *)((uint8_t *)fr + d);
+    src = (JSValue *)((uint8_t *)fr + s);
+#if QJS_DRC
+    *dst = *src;
+    *src = JS_UNDEFINED;
+#else
+    set_value(ctx, dst, *src);
+    *src = JS_UNDEFINED;
+#endif
+}
+
+__attribute__((always_inline)) int qjs_aot_unary(JSContext *ctx, int sub, JSValue a, JSValue *out)
+{
+    return js_regvm_unary(ctx, sub, a, out);
+}
+
+__attribute__((always_inline)) int qjs_aot_to_bool(JSContext *ctx, JSValue v)
+{
+    return regvm_to_bool(ctx, v);
+}
+
 uint8_t *qjs_aot_code(JSRegRun *f)
 {
     return f->b->regvm_code;
@@ -55762,6 +55992,63 @@ int js_aot_gen_insn_size(const uint8_t *code, int len, int off, int *p_op)
     if (p_op)
         *p_op = op;
     return 1 + sz;
+}
+
+/* Decode one instruction's operands for the AOT template registry, with the
+   interpreter's `regvm_fmt_size`/`regvm_rop_narrow` widths. */
+int js_aot_gen_decode_insn(const uint8_t *code, int len, int off, JSAotGenInsn *out)
+{
+    int op, sz, narrow;
+    const char *fmt;
+    const uint8_t *p;
+
+    if (off < 0 || off >= len)
+        return -1;
+    op = code[off];
+    if (op <= 0 || op >= ROP_COUNT)
+        return -1;
+    fmt = regvm_rop_fmt[op];
+    if (!fmt)
+        return -1;
+    sz = regvm_fmt_size(fmt, 1 /* wide register operands */, (uint16_t)op);
+    if (sz < 0 || off + 1 + sz > len)
+        return -1;
+    narrow = regvm_rop_narrow((uint16_t)op);
+
+    out->op = op;
+    out->size = 1 + sz;
+    out->nargs = 0;
+    p = code + off + 1;
+    for (; *fmt; fmt++) {
+        int64_t v;
+        int aoff = (int)(p - code);
+        switch (*fmt) {
+        case 'r':
+            if (narrow) { v = *p; p += 1; }
+            else { v = regvm_ld_u16(p); p += 2; }
+            break;
+        case 'i': v = (int8_t)*p; p += 1; break;
+        case 'I': v = (int32_t)regvm_ld_u32(p); p += 4; break;
+        case 'b': v = *p; p += 1; break;
+        case 'u': v = regvm_ld_u16(p); p += 2; break;
+        case 's': v = regvm_ld_u16(p); p += 2; break;
+        case 'c': v = regvm_ld_u32(p); p += 4; break;
+        case 'a': v = regvm_ld_u32(p); p += 4; break;
+        case 't':
+            if (narrow) { v = (int8_t)*p; p += 1; }
+            else { v = (int32_t)regvm_ld_u32(p); p += 4; }
+            break;
+        default:
+            return -1;
+        }
+        if (out->nargs < 8) {
+            out->arg[out->nargs].kind = *fmt;
+            out->arg[out->nargs].val = v;
+            out->arg[out->nargs].off = aoff;
+        }
+        out->nargs++;
+    }
+    return 0;
 }
 #endif /* QJS_AOT_GEN */
 
