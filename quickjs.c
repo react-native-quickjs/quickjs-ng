@@ -32,6 +32,10 @@
 #include <string.h>
 #include <assert.h>
 #include <float.h>
+#if defined(__SSE2__)
+/* Before the malloc/free poison: gcc's copy includes mm_malloc.h. */
+#include <emmintrin.h>
+#endif
 
 #if QJS_AOT_PROFILE && !defined(_WIN32)
 #include <dlfcn.h> /* dladdr */
@@ -37223,6 +37227,22 @@ static void js_regvm_thread_check_sizes(void);
 #endif
 #endif /* QJS_REGVM_THREAD */
 
+/* Fill the registers no analysis named. Such a register is only ever released,
+   never read as a value, so any valid uncounted word will do -- but it must be
+   one: all-bits-zero is the integer 0 only in the 16-byte encoding, and in the
+   8-byte one it is a double's bits pattern. */
+static inline void regvm_fill_unwritten(JSValue *regs, int n)
+{
+#if QJS_NAN_BOXING64
+    int k;
+
+    for (k = 0; k < n; k++)
+        regs[k] = JS_MKVAL(JS_TAG_INT, 0);
+#else
+    memset(regs, 0, (size_t)n * sizeof(JSValue));
+#endif
+}
+
 #if QJS_REGVM_RECORD
 /*
  * --- nested register frames
@@ -37741,22 +37761,6 @@ static void regvm_set_call_desc(JSFunctionBytecode *b)
  */
 /* always_inline: both callers are already framed, and a twelve-argument call
    would pass some arguments on the stack. */
-/* Fill the registers no analysis named. Such a register is only ever released,
-   never read as a value, so any valid uncounted word will do -- but it must be
-   one: all-bits-zero is the integer 0 only in the 16-byte encoding, and in the
-   8-byte one it is a double's bits pattern. */
-static inline void regvm_fill_unwritten(JSValue *regs, int n)
-{
-#if QJS_NAN_BOXING64
-    int k;
-
-    for (k = 0; k < n; k++)
-        regs[k] = JS_MKVAL(JS_TAG_INT, 0);
-#else
-    memset(regs, 0, (size_t)n * sizeof(JSValue));
-#endif
-}
-
 /* A static block of `undefined` words. Every register must hold a valid,
    uncounted word before the frame runs; filling the frame from this template
    is one memcpy. */
@@ -50797,10 +50801,6 @@ static int json_parse_error(JSParseState *s, const uint8_t *curp, const char *ms
     return js_parse_error(s, "%s in JSON at position %d (line %d column %d)",
                           msg, position, line, (int)(p - line_start) + 1);
 }
-
-#if defined(__SSE2__)
-#include <emmintrin.h>
-#endif
 
 /* The first byte in [q, end) that ends a run a JSON string copies as it is: a quote, a backslash, a control character, or (unless
    latin1) a byte >= 0x80; `end` when there is none. Sixteen bytes at a time where SSE2 is there, never reading past `end`. */
@@ -66511,6 +66511,10 @@ static int regvm_homes_mode(void)
 #if QJS_AOT && !QJS_REGVM
 #error "QJS_AOT needs QJS_REGVM"
 #endif
+/* Compiled code is entered against the threaded chain's activation record. */
+#if QJS_AOT && !QJS_REGVM_THREAD
+#error "QJS_AOT needs QJS_REGVM_THREAD"
+#endif
 /* The parser emits a debugger trap per statement when a debugger is attached
    at parse time, and a trap changes the register bytecode and its digest, so a
    unit built with the interface on binds against a different program than the
@@ -73630,7 +73634,6 @@ __attribute__((always_inline)) void qjs_aot_set_reg_b(JSContext *ctx, JSValue *f
 #endif
 
 #if QJS_DRC && defined(__SSE2__) && !defined(JS_NAN_BOXING) && !QJS_NAN_BOXING64
-#include <emmintrin.h>
 static inline void JSValue_store16(JSValue *d, JSValue v)
 {
     __m128i x;
@@ -102882,9 +102885,6 @@ static inline bool js_regexp_atom_starts_at(JSString *str, int start,
     return true;
 }
 
-#if defined(__SSE2__)
-#include <emmintrin.h>
-#endif
 /* Index of the first unit equal to c in s[0..n), or -1, eight units at a time where SSE2 is there. */
 static inline int js_regexp_find_u16(const uint16_t *s, unsigned c, int n)
 {

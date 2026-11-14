@@ -347,9 +347,12 @@ static uint8_t *REGVM_CC regvm_s_ROP_apply_arguments(uint8_t *ip, JSValue *fr, J
                 JSObject *pa = js_args_apply_is_builtin(sp[-2]);
                 /* A light frame has no JSStackFrame and no `argv`: the window
                    is always borrowed, as in the threaded handler. */
+#if QJS_REGVM_THREAD
                 if (unlikely(rf->flags & REGVM_FLAG_LIGHT) && pa == NULL) {
                     ret_val = regvm_light_apply_arguments(ctx, rf, sp, idx);
-                } else if (likely(pa != NULL &&
+                } else
+#endif
+                if (likely(pa != NULL &&
                            ((rf->flags & REGVM_FLAG_LIGHT) ||
                             rf->arg_buf == (JSValue *)rf->argv ||
                             rf->argc <= b->arg_count))) {
@@ -3801,6 +3804,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_local_rmw_imm(uint8_t *ip, JSValue *fr, JSR
                This macro expands once per fused form, so anything larger
                multiplies the interpreter's size and spill traffic; the rest
                goes out of line. */
+#undef REGVM_CMP_BRANCH /* the threaded handlers' own form */
 #define REGVM_CMP_BRANCH(a_, b_) do { \
                   const uint8_t *i_start = rpc - 1; \
                   JSValue _a = (a_), _b = (b_); int take, _r = -1; \
