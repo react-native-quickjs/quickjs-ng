@@ -34594,10 +34594,8 @@ static uint8_t *REGVM_CC regvm_t_branch_cmp_loc_reg(REGVM_ARGS)
                !((r = regvm_int_cmp(sub & ~REG_CMP_INVERT,
                                     JS_VALUE_GET_INT(a),
                                     JS_VALUE_GET_INT(b))) < 0))) {
-        if (unlikely(r ^ ((sub & REG_CMP_INVERT) != 0))) {
-            REGVM_DRC_BACKEDGE(ctx, off);
-            T_NEXT(T_SZ_BURT + off);
-        }
+        if (unlikely(r ^ ((sub & REG_CMP_INVERT) != 0)))
+            T_NEXT(T_SZ_BURT + off); /* T_NEXT runs the back-edge poll on the target it continues at */
         T_NEXT(T_SZ_BURT);
     }
     __attribute__((musttail)) return regvm_t_branch_cmp_loc_reg_slow(REGVM_PASS);
