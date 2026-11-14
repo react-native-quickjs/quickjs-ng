@@ -30361,6 +30361,10 @@ static uint8_t *REGVM_CC regvm_t_apply_arguments(REGVM_ARGS)
     if (likely(pa != NULL &&
                ((f->flags & REGVM_FLAG_LIGHT) ||
                 f->arg_buf == (JSValue *)f->argv || f->argc <= f->b->arg_count))) {
+        /* The call this site forwards to, recorded like any other call site's:
+           the target is the value the site calls, not the `apply` function. */
+        AOT_PROF_CALL(ctx, f->b, (uint32_t)(ip - f->b->regvm_code) + 7, sp[-3],
+                      f->argc);
         if (unlikely(check_function(pa->u.cfunc.realm, sp[-3])))
             T_FAIL();
 #if QJS_REGVM_RECORD
@@ -36153,6 +36157,11 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 if (likely(pa != NULL &&
                            (arg_buf == (JSValue *)argv ||
                             argc <= b->arg_count))) {
+                    /* The call this site forwards to, recorded like any other
+                       call site's: the target is the value the site calls, not
+                       the `apply` function. */
+                    AOT_PROF_CALL(ctx, b, (uint32_t)(rpc - b->regvm_code), sp[-3],
+                                  argc);
                     if (unlikely(check_function(pa->u.cfunc.realm, sp[-3])))
                         goto exception;
                     ret_val = JS_Call(ctx, sp[-3], sp[-1], argc, vc(arg_buf));
