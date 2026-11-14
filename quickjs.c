@@ -79615,9 +79615,16 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
            generator or async suspension, and a function with a handler or
            finally has no static slot state at the throwing point. A function
            with an `arguments` binding keeps the frame too: the object is built
-           from the slots and writes to them behind the SSA's back. */
+           from the slots and writes to them behind the SSA's back. That is
+           the parameter slots; a function with no formal parameter has none to
+           alias, and the `arguments` slot itself stays out of the map below. A function whose only
+           variable is the `arguments` binding and the `this` copy (the forwarding wrapper `function(){ this.f.apply(this, arguments) }`) has nothing to promote and keeps its frame. */
+        int real_local = 0;
+        for (i = 0; i < fd->var_count; i++)
+            if (fd->vars[i].var_name != JS_ATOM_this && fd->vars[i].var_name != JS_ATOM_arguments)
+                real_local = 1;
         if (!fd->has_eval_call && fd->func_kind == JS_FUNC_NORMAL &&
-            fd->arguments_var_idx < 0) {
+            (fd->arguments_var_idx < 0 || (fd->arg_count == 0 && real_local))) {
             int allow = 1;
 
             for (i = 0; i < fd->var_count; i++)
