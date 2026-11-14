@@ -585,6 +585,13 @@ typedef enum JSRegOpcode {
        slow half that runs the two operations in order. */
     ROP_inc_branch_lt, ROP_inc_branch_lt_s,
 
+    /* The baseline tier's full-width stack access. Its operand stack can be
+       deeper than a 16-bit register operand can name, so deep values are spilt
+       to slots at the top of the register file. slot_get reads slot (u) into
+       register (r); slot_put writes (r) back to (u). Both behave as ROP_move.
+       */
+    ROP_slot_get, ROP_slot_put,
+
     ROP_COUNT
 } JSRegOpcode;
 
@@ -628,7 +635,7 @@ enum { REG_CONST_CPOOL = 0, REG_CONST_ATOM };
 /* The register bytecode's format version, checked per function record before
    any instruction is parsed. Bump it whenever an opcode is added, removed or
    renumbered, or an operand's width or meaning changes. */
-#define REGVM_FORMAT_VERSION 18
+#define REGVM_FORMAT_VERSION 19
 
 /* ROP_get_field and ROP_put_field use this site index when the source
    instruction has no inline cache. */

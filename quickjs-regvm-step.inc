@@ -2185,7 +2185,16 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_arg(uint8_t *ip, JSValue *fr, JSRegRun 
     int argc = rf->argc;
     (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
 
-                { int d = RD_REG(); int slot = RD_U16(); SET_REG_B(d,rf->arg_buf[slot]); REGVM_NEXT(); }
+                { int d = RD_REG(); int slot = RD_U16(); SET_REG_B(d,rf->arg_buf[slot]); REGVM_NEXT(); }            L_ROP_put_arg_xfer:
+                { int slot = RD_U16(); int s = RD_REG();
+#if QJS_DRC
+                  regvm_put_arg(ctx, rf->arg_buf, rf->arg_owned, slot, regs[s]);
+                  regs[s] = JS_UNDEFINED;
+#else
+                  set_value(ctx, &rf->arg_buf[slot], regs[s]);
+                  regs[s] = JS_UNDEFINED;
+#endif
+                  REGVM_NEXT(); }
  exception:
     rf->ret = JS_EXCEPTION;
     return NULL;
@@ -2549,6 +2558,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_local_field(uint8_t *ip, JSValue *fr, J
     int argc = rf->argc;
     (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
  {
+                const uint8_t *i_start = rpc - 1;
                 int d = RD_REG();
                 int slot = RD_U16();
                 JSAtom atom = RD_U32();
@@ -2591,6 +2601,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_local_field_0(uint8_t *ip, JSValue *fr,
     int argc = rf->argc;
     (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
  {
+                const uint8_t *i_start = rpc - 1;
                 int d = RD_REG();
                 int slot = op - ROP_get_local_field_0;   /* the slot is the opcode */
                 JSAtom atom = RD_U32();
@@ -2746,6 +2757,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_var_ref(uint8_t *ip, JSValue *fr, JSReg
 
                 { int d = RD_REG(); int slot = RD_U16();
                   SET_REG_B(d,*rf->var_refs[slot]->pvalue); REGVM_NEXT(); }
+            /* The baseline tier's full-width stack slot. It indexes the
+               register file, not `rf->var_buf`, and borrows or stores exactly
+               as ROP_move does. */
  exception:
     rf->ret = JS_EXCEPTION;
     return NULL;
@@ -4409,7 +4423,8 @@ static uint8_t *REGVM_CC regvm_s_ROP_put_field(uint8_t *ip, JSValue *fr, JSRegRu
                 /* JS_PROP_THROW_STRICT: a write to a read-only property is a
                    no-op in sloppy code and a TypeError in strict code. */
                 {
-                    if (JS_VALUE_GET_TAG(regs[r]) == JS_TAG_OBJECT) {
+                    if (site != REG_IC_NONE &&
+                        JS_VALUE_GET_TAG(regs[r]) == JS_TAG_OBJECT) {
                         JSObject *p = JS_VALUE_GET_OBJ(regs[r]);
                         JSRegPIC *e = &pic[site];
 
@@ -4996,6 +5011,46 @@ static uint8_t *REGVM_CC regvm_s_ROP_shr(uint8_t *ip, JSValue *fr, JSRegRun *rf,
     int argc = rf->argc;
     (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
  { REGVM_BIN_OP(REG_BIN_SHR); }
+ exception:
+    rf->ret = JS_EXCEPTION;
+    return NULL;
+}
+
+static uint8_t *REGVM_CC regvm_s_ROP_slot_get(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+{
+    JSFunctionBytecode *b = rf->b;
+    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
+    JSRegPIC *pic = rf->pic;
+    uint8_t *rpc = ip;
+    int op = *rpc++;
+    JSValue ret_val = JS_UNDEFINED;
+    JSValue *regs = fr;
+    JSValue *arg_buf = rf->arg_buf;
+    int argc = rf->argc;
+    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+
+                { int d = RD_REG(); int slot = RD_U16();
+                  SET_REG_B(d,regs[slot]); REGVM_NEXT(); }
+ exception:
+    rf->ret = JS_EXCEPTION;
+    return NULL;
+}
+
+static uint8_t *REGVM_CC regvm_s_ROP_slot_put(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+{
+    JSFunctionBytecode *b = rf->b;
+    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
+    JSRegPIC *pic = rf->pic;
+    uint8_t *rpc = ip;
+    int op = *rpc++;
+    JSValue ret_val = JS_UNDEFINED;
+    JSValue *regs = fr;
+    JSValue *arg_buf = rf->arg_buf;
+    int argc = rf->argc;
+    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+
+                { int slot = RD_U16(); int s = RD_REG();
+                  SET_REG_B(slot,regs[s]); REGVM_NEXT(); }
  exception:
     rf->ret = JS_EXCEPTION;
     return NULL;
@@ -6357,6 +6412,8 @@ static const regvm_handler regvm_step_table[ROP_COUNT] = {
     [ROP_debug] = regvm_s_ROP_debug,
     [ROP_inc_branch_lt] = regvm_s_ROP_inc_branch_lt,
     [ROP_inc_branch_lt_s] = regvm_s_ROP_inc_branch_lt_s,
+    [ROP_slot_get] = regvm_s_ROP_slot_get,
+    [ROP_slot_put] = regvm_s_ROP_slot_put,
 };
 
 
@@ -6591,6 +6648,8 @@ static const uint8_t regvm_step_covered[ROP_COUNT] = {
     [ROP_debug] = 1,
     [ROP_inc_branch_lt] = 1,
     [ROP_inc_branch_lt_s] = 1,
+    [ROP_slot_get] = 1,
+    [ROP_slot_put] = 1,
 };
 
 
