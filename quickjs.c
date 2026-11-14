@@ -24849,6 +24849,51 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_record(RE
         return regvm_t_dispatch(f->b->regvm_code, f->fr, f, cb->realm);
 }
 
+/* Call the f_f/f_f_f floating-point C builtins (the Math table) directly in
+   the slow call handlers, skipping js_call_c_function's frame setup. They
+   never recurse or use the stack frame; cfunc.realm == ctx keeps the error
+   realm right. Returns 1 when it produced `*pret`. */
+static inline __attribute__((always_inline)) int
+regvm_cfunc_fp_fast(JSContext *ctx, JSValueConst cf, int na,
+                    JSValueConst *argv, JSValue *pret)
+{
+    JSObject *p;
+    JSCFunctionEnum cproto;
+
+    if (JS_VALUE_GET_TAG(cf) != JS_TAG_OBJECT)
+        return 0;
+    p = JS_VALUE_GET_OBJ(cf);
+    if (p->class_id != JS_CLASS_C_FUNCTION || p->u.cfunc.realm != ctx)
+        return 0;
+    cproto = p->u.cfunc.cproto;
+    if (cproto == JS_CFUNC_f_f && na == 1) {
+        double d1;
+        if (likely(!JS_ToFloat64(ctx, &d1, argv[0]))) {
+            if (unlikely(js_poll_interrupts(ctx)))
+                *pret = JS_EXCEPTION;
+            else
+                *pret = js_number(p->u.cfunc.c_function.f_f(d1));
+        } else {
+            *pret = JS_EXCEPTION;
+        }
+        return 1;
+    }
+    if (cproto == JS_CFUNC_f_f_f && na == 2) {
+        double d1, d2;
+        if (likely(!JS_ToFloat64(ctx, &d1, argv[0]) &&
+                   !JS_ToFloat64(ctx, &d2, argv[1]))) {
+            if (unlikely(js_poll_interrupts(ctx)))
+                *pret = JS_EXCEPTION;
+            else
+                *pret = js_number(p->u.cfunc.c_function.f_f_f(d1, d2));
+        } else {
+            *pret = JS_EXCEPTION;
+        }
+        return 1;
+    }
+    return 0;
+}
+
 /* the unthreaded halves: exactly what the monolith's L_ROP_call did */
 static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_slow(REGVM_ARGS)
 {
@@ -24856,7 +24901,8 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_slow(REGVM_ARGS)
     JSValue *oargv = FRP(ab);
     JSValue rv;
 
-    if (!js_call_c_function_fast(ctx, FR(c), JS_UNDEFINED, na, vc(oargv), 0, &rv))
+    if (!regvm_cfunc_fp_fast(ctx, FR(c), na, vc(oargv), &rv) &&
+        !js_call_c_function_fast(ctx, FR(c), JS_UNDEFINED, na, vc(oargv), 0, &rv))
         rv = JS_CallInternal(ctx, FR(c), JS_UNDEFINED, JS_UNDEFINED, na,
                              vc(oargv), 0);
     if (JS_IsException(rv))
@@ -24871,7 +24917,8 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_slow(REGV
     JSValue *oargv = FRP(ab);
     JSValue rv;
 
-    if (!js_call_c_function_fast(ctx, FR(c), FR(r), na, vc(oargv), 0, &rv))
+    if (!regvm_cfunc_fp_fast(ctx, FR(c), na, vc(oargv), &rv) &&
+        !js_call_c_function_fast(ctx, FR(c), FR(r), na, vc(oargv), 0, &rv))
         rv = JS_CallInternal(ctx, FR(c), FR(r), JS_UNDEFINED, na, vc(oargv), 0);
     if (JS_IsException(rv))
         T_FAIL();
