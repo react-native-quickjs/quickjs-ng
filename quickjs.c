@@ -58298,7 +58298,6 @@ static int regvm_ctl_bound(JSContext *ctx, const JSRegIR *ir, const uint8_t *bc,
     return rc;
 }
 
-
 /* Move origins that are not a stack-VM opcode. */
 #define REGVM_ORIG_LOWER 0xFE   /* lowering, opcode not recorded */
 #define REGVM_ORIG_PHI   0xFD   /* an edge's parallel copy */
@@ -69266,7 +69265,8 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                 rc = 0;
                 goto done;
             }
-            REGVM_VERIFY_DEAD_END(enc_why ? enc_why : "the encoder refused");
+            /* Refused twice: `*pdeferred = 1` hands the function to the
+               baseline tier. The dead-end check belongs to the baseline. */
             regvm_report_refusal(ctx, fd, enc_why ? enc_why : "?");
             *pdeferred = 1;
             deferred = 1;
@@ -70353,10 +70353,10 @@ static __exception int js_regvm_build_baseline(JSContext *ctx, JSFunctionDef *fd
         if (rc)
             goto done;
         if (refused) {
-            /*
-             * The baseline is the last tier; a refusal here is a modelling gap
-             * the caller must surface, not a shape to hand on.
-             */
+            /* The baseline is the last tier: a refusal here is a modelling gap
+               the caller must surface, and the only point where the dead-end
+               check may fire under QJS_REGVM_VERIFY. */
+            REGVM_VERIFY_DEAD_END(why ? why : "the baseline refused");
             if (regvm_report_deferred_on())
                 fprintf(stderr, "regvm: BASELINE refused: %s\n",
                         why ? why : "?");
