@@ -360,6 +360,12 @@ QJS_AOT_STUB int qjs_aot_put_field_slow(JSContext *ctx, JSRegRun *f, uint8_t *ip
                                         JSValue recv, int atom, int site,
                                         JSValue v);
 
+/* The cached add-transition store of a compiled named store, before the frame
+   is published. 1 when the store landed, 0 when the site has no transition for
+   the receiver's shape, -1 on exception. The value is borrowed. */
+QJS_AOT_STUB int qjs_aot_put_add(JSContext *ctx, JSRegRun *f, JSValue recv,
+                                 JSValue v, int site);
+
 /* The `this` object of `new C(...)` for a plain constructor: allocated the way the
    interpreter's light construct does (the prototype from `C.prototype`, the profiled
    inline slot capacity), so the caller can run the constructor's compiled body with it
