@@ -2223,6 +2223,9 @@ static void js_aot_bind(JSFunctionBytecode *b);
    count; `js_aot_bind` calls it after the unit publishes a wider count. */
 static void regvm_set_frame_shape(JSFunctionBytecode *b);
 void js_aot_stats_dump(JSRuntime *rt);
+#ifdef QJS_AOT_ACCUMSTATS
+static void js_accum_stats_dump(void);
+#endif
 static void aot_run_free(JSRuntime *rt);
 extern uint64_t js_aot_bound_count;
 extern uint64_t js_aot_enter_count;
@@ -5054,8 +5057,12 @@ void JS_FreeRuntime(JSRuntime *rt)
         js_aot_prof_dump(rt);
 #endif
 #if QJS_AOT
-    if (getenv("QJS_AOT_STATS"))
+    if (getenv("QJS_AOT_STATS")) {
         js_aot_stats_dump(rt);
+#ifdef QJS_AOT_ACCUMSTATS
+        js_accum_stats_dump();
+#endif
+    }
 #endif
 #if QJS_FNSAMPLE && !defined(_WIN32)
     /* Stop the timer and write the table before any function is freed: the
@@ -29507,6 +29514,61 @@ static inline __attribute__((always_inline)) __exception int js_regvm_binary(JSC
     return -1;
 }
 
+/* A build with -DQJS_AOT_ACCUMSTATS=1 records, for every in-place string append that compiled code attempts (the call sites of
+   qjs_aot_binary_rr, qjs_aot_binary_cpool and qjs_aot_append_const), what became of it, keyed by the address the call returns to,
+   and prints the totals and the busiest failing sites with QJS_AOT_STATS. Free otherwise. */
+#ifdef QJS_AOT_ACCUMSTATS
+enum { AC_INPLACE, AC_GROW, AC_DNEQA, AC_LEFT_ROPE, AC_LEFT_NOTSTR, AC_RIGHT_NOTSTR, AC_KIND, AC_ATOM,
+       AC_OWNED, AC_WIDTH, AC_EMPTY, AC_TOOLONG, AC_ALIAS_REG, AC_ALIAS_ARG, AC_N };
+static const char *const js_accum_name[AC_N] = {
+    "in-place", "regrown", "dest!=left", "left-rope", "left-not-string", "right-not-string", "left-slice/kind", "left-atom",
+    "counted-owner", "width", "right-empty", "too-long", "alias-register", "alias-arg" };
+static int js_accum_why;
+typedef struct { void *site; uint64_t n[AC_N]; } JSAccumSite;
+static JSAccumSite js_accum_tab[256];
+static uint64_t js_accum_tot[AC_N];
+#define ACC_WHY(c_) (js_accum_why = (c_))
+static void js_accum_note(void *site)
+{
+    uint32_t h = (uint32_t)(((uintptr_t)site >> 3) * 2654435761u) & 255, k;
+    int why = js_accum_why;
+    for (k = 0; k < 256; k++) {
+        JSAccumSite *t = &js_accum_tab[(h + k) & 255];
+        if (t->site == NULL) t->site = site;
+        if (t->site == site) { t->n[why]++; js_accum_tot[why]++; return; }
+    }
+}
+static void js_accum_stats_dump(void)
+{
+    int i, j, shown;
+    uint64_t all = 0;
+    for (i = 0; i < AC_N; i++) all += js_accum_tot[i];
+    if (!all) return;
+    fprintf(stderr, "aot accum: %llu attempts\n", (unsigned long long)all);
+    for (i = 0; i < AC_N; i++)
+        if (js_accum_tot[i]) fprintf(stderr, "  %-18s %llu\n", js_accum_name[i], (unsigned long long)js_accum_tot[i]);
+    for (shown = 0; shown < 16; shown++) {
+        int best = -1; uint64_t bn = 0;
+        for (i = 0; i < 256; i++) {
+            uint64_t fail = 0;
+            if (!js_accum_tab[i].site) continue;
+            for (j = 2; j < AC_N; j++) fail += js_accum_tab[i].n[j];
+            if (fail > bn) { bn = fail; best = i; }
+        }
+        if (best < 0) break;
+        fprintf(stderr, "  site %p failed %llu:", js_accum_tab[best].site, (unsigned long long)bn);
+        for (j = 0; j < AC_N; j++)
+            if (js_accum_tab[best].n[j]) fprintf(stderr, " %s=%llu", js_accum_name[j], (unsigned long long)js_accum_tab[best].n[j]);
+        fprintf(stderr, "\n");
+        for (j = 2; j < AC_N; j++) js_accum_tab[best].n[j] = 0;
+    }
+}
+#define ACC_NOTE() js_accum_note(__builtin_return_address(0))
+#else
+#define ACC_WHY(c_) ((void)0)
+#define ACC_NOTE() ((void)0)
+#endif
+
 /*
  * The in-place string accumulator: `s += x`, where the add's destination is
  * also its left operand. Appends in place when the register provably holds
@@ -29533,24 +29595,40 @@ static int regvm_accum_append_u(JSContext *ctx, JSFunctionBytecode *b,
     size_t need;
     void *p1ptr;
 
-    if (d != a)
+    ACC_WHY(AC_INPLACE);
+    if (d != a) {
+        ACC_WHY(AC_DNEQA);
         return 0;
+    }
     if (JS_VALUE_GET_TAG(fr[a]) != JS_TAG_STRING ||
-        JS_VALUE_GET_TAG(op2) != JS_TAG_STRING)
+        JS_VALUE_GET_TAG(op2) != JS_TAG_STRING) {
+        ACC_WHY(JS_VALUE_GET_TAG(fr[a]) == JS_TAG_STRING_ROPE ? AC_LEFT_ROPE :
+                JS_VALUE_GET_TAG(fr[a]) != JS_TAG_STRING ? AC_LEFT_NOTSTR : AC_RIGHT_NOTSTR);
         return 0;
+    }
     p1 = JS_VALUE_GET_STRING(fr[a]);
     p2 = JS_VALUE_GET_STRING(op2);
-    if (p1->kind != JS_STRING_KIND_NORMAL || p1->atom_type != 0)
+    if (p1->kind != JS_STRING_KIND_NORMAL || p1->atom_type != 0) {
+        ACC_WHY(p1->atom_type != 0 ? AC_ATOM : AC_KIND);
         return 0;
+    }
     /* No counted owner, and parked: a register-only value. */
-    if (JS_REF_COUNT(p1) != 0 || !JS_GC_IN_ZCT(p1))
+    if (JS_REF_COUNT(p1) != 0 || !JS_GC_IN_ZCT(p1)) {
+        ACC_WHY(AC_OWNED);
         return 0;
-    if (p1->is_wide_char != p2->is_wide_char)
+    }
+    if (p1->is_wide_char != p2->is_wide_char) {
+        ACC_WHY(AC_WIDTH);
         return 0;
-    if (p2->len == 0)
+    }
+    if (p2->len == 0) {
+        ACC_WHY(AC_EMPTY);
         return 0;
-    if ((uint64_t)p1->len + p2->len > JS_STRING_LEN_MAX)
+    }
+    if ((uint64_t)p1->len + p2->len > JS_STRING_LEN_MAX) {
+        ACC_WHY(AC_TOOLONG);
         return 0;
+    }
     p1ptr = p1;
     nregs = b->regvm_reg_count;
     if (!unique) {
@@ -29558,15 +29636,19 @@ static int regvm_accum_append_u(JSContext *ctx, JSFunctionBytecode *b,
             if (i == (uint32_t)a)
                 continue;
             if (JS_VALUE_GET_TAG(fr[i]) == JS_TAG_STRING &&
-                JS_VALUE_GET_PTR(fr[i]) == p1ptr)
+                JS_VALUE_GET_PTR(fr[i]) == p1ptr) {
+                ACC_WHY(AC_ALIAS_REG);
                 return 0;
+            }
         }
     }
     if (arg_buf != NULL) {
         for (i = 0; i < (uint32_t)argc; i++) {
             if (JS_VALUE_GET_TAG(arg_buf[i]) == JS_TAG_STRING &&
-                JS_VALUE_GET_PTR(arg_buf[i]) == p1ptr)
+                JS_VALUE_GET_PTR(arg_buf[i]) == p1ptr) {
+                ACC_WHY(AC_ALIAS_ARG);
                 return 0;
+            }
         }
     }
     nlen = p1->len + p2->len;
@@ -29599,6 +29681,7 @@ static int regvm_accum_append_u(JSContext *ctx, JSFunctionBytecode *b,
         np = js_alloc_string(ctx, cap, p1->is_wide_char);
         if (unlikely(!np))
             return -1;
+        ACC_WHY(AC_GROW);
         if (p1->is_wide_char) {
             memcpy(str16(np), str16(p1), (size_t)p1->len << 1);
             memcpy(str16(np) + p1->len, str16(p2), (size_t)p2->len << 1);
@@ -72491,6 +72574,7 @@ QJS_AOT_STUB int qjs_aot_binary_cpool(JSContext *ctx, JSRegRun *f, int sub,
                as the interpreter's handler does. */
             int ar = regvm_accum_append(ctx, f->b, f->fr, f->arg_buf, f->argc,
                                         d, ra, cst);
+            ACC_NOTE();
             if (ar > 0)
                 return 2;
             if (ar < 0)
@@ -72506,6 +72590,7 @@ QJS_AOT_STUB int qjs_aot_binary_cpool(JSContext *ctx, JSRegRun *f, int sub,
     if (sub == REG_BIN_ADD) {
         int ar = regvm_accum_append(ctx, f->b, f->fr, f->arg_buf, f->argc,
                                     d, ra, cst);
+        ACC_NOTE();
         if (ar > 0) {
             JS_FreeValue(ctx, cst);
             return 2;
@@ -72534,13 +72619,17 @@ QJS_AOT_STUB int qjs_aot_append_const(JSContext *ctx, JSRegRun *f, int kind, uin
     JSValue cst;
     int r;
 
-    if (kind == REG_CONST_CPOOL)
-        return regvm_accum_append_u(ctx, f->b, f->fr, f->arg_buf, f->argc, ra, ra,
-                                    f->b->cpool[idx], unique);
+    if (kind == REG_CONST_CPOOL) {
+        r = regvm_accum_append_u(ctx, f->b, f->fr, f->arg_buf, f->argc, ra, ra,
+                                 f->b->cpool[idx], unique);
+        ACC_NOTE();
+        return r;
+    }
     cst = JS_AtomToValue(ctx, (JSAtom)idx);
     if (JS_IsException(cst))
         return -1;
     r = regvm_accum_append_u(ctx, f->b, f->fr, f->arg_buf, f->argc, ra, ra, cst, unique);
+    ACC_NOTE();
     JS_FreeValue(ctx, cst);
     return r;
 }
@@ -72556,6 +72645,7 @@ QJS_AOT_STUB int qjs_aot_binary_rr(JSContext *ctx, JSRegRun *f, int sub, JSValue
     if (sub == REG_BIN_ADD) {
         int ar = regvm_accum_append(ctx, f->b, f->fr, f->arg_buf, f->argc, d, ra, b);
 
+        ACC_NOTE();
         if (ar > 0)
             return 2;
         if (ar < 0)
