@@ -11510,8 +11510,8 @@ static bool js_get_fast_array_element(JSContext *ctx, JSObject *p,
     }
 }
 
-static JSValue JS_GetPropertyValue(JSContext *ctx, JSValueConst this_obj,
-                                   JSValue prop)
+static JSValue JS_GetPropertyValueConst(JSContext *ctx, JSValueConst this_obj,
+                                        JSValueConst prop)
 {
     JSAtom atom;
     JSValue ret;
@@ -11532,7 +11532,6 @@ static JSValue JS_GetPropertyValue(JSContext *ctx, JSValueConst this_obj,
         // so we must ensure to not invoke JS anything that's observable
         // from JS code
         atom = JS_ValueToAtomInternal(ctx, prop, JS_TO_STRING_NO_SIDE_EFFECTS);
-        JS_FreeValue(ctx, prop);
         if (unlikely(atom == JS_ATOM_NULL))
             return JS_EXCEPTION;
         if (tag == JS_TAG_NULL) {
@@ -11544,11 +11543,18 @@ static JSValue JS_GetPropertyValue(JSContext *ctx, JSValueConst this_obj,
         return JS_EXCEPTION;
     }
     atom = JS_ValueToAtom(ctx, prop);
-    JS_FreeValue(ctx, prop);
     if (unlikely(atom == JS_ATOM_NULL))
         return JS_EXCEPTION;
     ret = JS_GetProperty(ctx, this_obj, atom);
     JS_FreeAtom(ctx, atom);
+    return ret;
+}
+
+static JSValue JS_GetPropertyValue(JSContext *ctx, JSValueConst this_obj,
+                                   JSValue prop)
+{
+    JSValue ret = JS_GetPropertyValueConst(ctx, this_obj, prop);
+    JS_FreeValue(ctx, prop);
     return ret;
 }
 
@@ -21301,7 +21307,6 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_get_arg2): *sp++ = js_dup(arg_buf[2]); BREAK;
         CASE(OP_get_arg3): *sp++ = js_dup(arg_buf[3]); BREAK;
         CASE(OP_put_arg0): set_value(ctx, &arg_buf[0], *--sp); BREAK;
-        CASE(OP_put_arg1): set_value(ctx, &arg_buf[1], *--sp); BREAK;
         CASE(OP_put_arg2): set_value(ctx, &arg_buf[2], *--sp); BREAK;
         CASE(OP_put_arg3): set_value(ctx, &arg_buf[3], *--sp); BREAK;
         CASE(OP_set_arg0): set_value(ctx, &arg_buf[0], js_dup(sp[-1])); BREAK;
@@ -22670,6 +22675,39 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 sp--;
                 if (unlikely(JS_IsException(val)))
                     goto exception;
+            }
+            BREAK;
+
+        CASE(OP_get_loc8_array_el):
+            {
+                JSValue val;
+                int idx = *pc++;
+
+                if (likely(JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_OBJECT &&
+                           JS_VALUE_GET_TAG(var_buf[idx]) == JS_TAG_INT &&
+                           JS_VALUE_GET_OBJ(sp[-1])->class_id == JS_CLASS_ARRAY &&
+                           (uint32_t)JS_VALUE_GET_INT(var_buf[idx]) <
+                               JS_VALUE_GET_OBJ(sp[-1])->u.array.count &&
+                           !js_array_slot_is_hole(
+                               JS_VALUE_GET_OBJ(sp[-1])->u.array.u.values[
+                                   JS_VALUE_GET_INT(var_buf[idx])]))) {
+                    if (js_lazy_marker_is(JS_VALUE_GET_OBJ(sp[-1])->u.array.u.values[
+                                              JS_VALUE_GET_INT(var_buf[idx])]))
+                        val = js_lazy_materialize_slot(ctx,
+                                  &JS_VALUE_GET_OBJ(sp[-1])->u.array.u.values[
+                                       JS_VALUE_GET_INT(var_buf[idx])],
+                                  JS_VALUE_GET_OBJ(sp[-1]));
+                    else
+                        val = js_dup(JS_VALUE_GET_OBJ(sp[-1])->u.array.u.values[
+                                         JS_VALUE_GET_INT(var_buf[idx])]);
+                } else {
+                    sf->cur_pc = pc;
+                    val = JS_GetPropertyValueConst(ctx, sp[-1], var_buf[idx]);
+                    if (unlikely(JS_IsException(val)))
+                        goto exception;
+                }
+                JS_FreeValue(ctx, sp[-1]);
+                sp[-1] = val;
             }
             BREAK;
 
@@ -39040,8 +39078,11 @@ static void put_short_code(DynBuf *bc_out, int op, int idx)
             dbuf_putc(bc_out, OP_get_arg0 + idx);
             return;
         case OP_put_arg:
-            dbuf_putc(bc_out, OP_put_arg0 + idx);
-            return;
+            if (idx == 0) {
+                dbuf_putc(bc_out, OP_put_arg0);
+                return;
+            }
+            break;
         case OP_set_arg:
             dbuf_putc(bc_out, OP_set_arg0 + idx);
             return;
@@ -40047,6 +40088,15 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     break;
                 }
 #endif
+                if (code_match(&cc, pos_next, OP_get_array_el, -1)) {
+                    if (cc.line_num >= 0) line_num = cc.line_num;
+                    if (cc.col_num >= 0) col_num = cc.col_num;
+                    add_pc2line_info(s, bc_out.size, line_num, col_num);
+                    dbuf_putc(&bc_out, OP_get_loc8_array_el);
+                    dbuf_putc(&bc_out, idx);
+                    pos_next = cc.pos;
+                    break;
+                }
                 add_pc2line_info(s, bc_out.size, line_num, col_num);
                 put_short_code(&bc_out, op, idx);
             }
@@ -43799,7 +43849,7 @@ static bool js_argv_safe_opcode(const uint8_t *bc, int pos, int op)
     switch (op) {
     case OP_put_arg:  case OP_set_arg:
     case OP_put_arg0: case OP_set_arg0:
-    case OP_put_arg1: case OP_set_arg1:
+    case OP_set_arg1:
     case OP_put_arg2: case OP_set_arg2:
     case OP_put_arg3: case OP_set_arg3:
     case OP_make_arg_ref:
