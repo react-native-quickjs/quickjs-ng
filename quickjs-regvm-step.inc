@@ -5776,7 +5776,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_to_propkey(uint8_t *ip, JSValue *fr, JSRegR
                 if (op == ROP_to_propkey2) {
                     int chk = RD_REG();
                     if (unlikely(JS_IsUndefined(regs[chk]) || JS_IsNull(regs[chk]))) {
-                        JS_ThrowTypeError(rf->caller_ctx, "value has no property");
+                        JS_ThrowTypeError(ctx, "value has no property");
                         goto exception;
                     }
                 }
