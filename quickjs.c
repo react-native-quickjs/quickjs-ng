@@ -34868,6 +34868,10 @@ static uint8_t *REGVM_CC regvm_t_set_name(REGVM_ARGS)
 static inline __attribute__((always_inline)) int
 regvm_get_elem_typed(JSObject *p, uint32_t idx, JSValue *out)
 {
+    /* the class first: only an array or a typed array has u.array, and a plain object's allocation can end before it (its inline properties
+       start at u) */
+    if ((unsigned)(p->class_id - JS_CLASS_UINT8C_ARRAY) > (unsigned)(JS_CLASS_FLOAT64_ARRAY - JS_CLASS_UINT8C_ARRAY))
+        return 0;
     if (unlikely(idx >= p->u.array.count))
         return 0;
     switch (p->class_id) {
@@ -34918,6 +34922,9 @@ regvm_put_elem_fast(JSContext *ctx, JSValue recv, JSValue k, JSValue v)
         return 1;
     }
     if (JS_VALUE_GET_TAG(v) != JS_TAG_INT)
+        return 0;
+    /* as in regvm_get_elem_typed: u.array is read only once the class says the object has it */
+    if ((unsigned)(p->class_id - JS_CLASS_UINT8C_ARRAY) > (unsigned)(JS_CLASS_FLOAT64_ARRAY - JS_CLASS_UINT8C_ARRAY))
         return 0;
     if (unlikely(idx >= (uint32_t)p->u.array.count))
         return 0;
