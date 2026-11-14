@@ -170,6 +170,9 @@ typedef struct JSAotGenLayout {
     uint32_t off_regpic_misses, reg_pic_add_w, off_rt_ic_epoch;
     uint32_t off_object_flags16, object_extensible_mask, object_noadd_mask;
     uint32_t object_inline_cap_mask, object_inline_cap_shift;
+    /* A rope whose linearised form is memoised holds the flat string on the left and the
+       empty string on the right: where those two values sit. */
+    uint32_t off_rope_left, off_rope_right;
 } JSAotGenLayout;
 
 /* Fold every field after `hash` (the hash field itself is excluded). Shared by
