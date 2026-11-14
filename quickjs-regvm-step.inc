@@ -2434,7 +2434,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_field(uint8_t *ip, JSValue *fr, JSRegRu
                 /* Only where the encoder emitted a site. */
                 js_regvm_getfield_site[site == REG_IC_NONE ? 0 : 1]++;
 #endif
-                if (regvm_own_read_hit(pic, b->regvm_pic_holder, regs[r], site, &val)) {
+                if (regvm_own_read_hit(b, pic, b->regvm_pic_holder, regs[r], site, &val)) {
                     SET_REG_B(d, val);
                     REGVM_NEXT();
                 }
@@ -2474,7 +2474,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_field2(uint8_t *ip, JSValue *fr, JSRegR
                 JSAtom atom = RD_U32();
                 int site = RD_U16();
                 JSValue val;
-                if (regvm_own_read_hit(pic, b->regvm_pic_holder, regs[r], site, &val)) {
+                if (regvm_own_read_hit(b, pic, b->regvm_pic_holder, regs[r], site, &val)) {
                     SET_REG_B(d, val);
                     REGVM_NEXT();
                 }
@@ -2528,7 +2528,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_this_field(uint8_t *ip, JSValue *fr, JS
                 } else {
                     SET_REG_B(r, rf->this_obj);
                 }
-                if (regvm_own_read_hit(pic, b->regvm_pic_holder, regs[r], site, &val)) {
+                if (regvm_own_read_hit(b, pic, b->regvm_pic_holder, regs[r], site, &val)) {
                     SET_REG_B(d, val);
                     REGVM_NEXT();
                 }
@@ -2575,7 +2575,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_field_chain(uint8_t *ip, JSValue *fr, J
                 int own1 = 1, own2 = 1;
                 (void)r2;
                 if (site1 != REG_IC_NONE &&
-                    regvm_own_read_hit(pic, b->regvm_pic_holder, regs[r1], site1, &v1)) {
+                    regvm_own_read_hit(b, pic, b->regvm_pic_holder, regs[r1], site1, &v1)) {
                     own1 = 0;
                 } else if (site1 == REG_IC_NONE) {
                     REGVM_CAPTURE_IP_MONO(rpc - 1);
@@ -2595,7 +2595,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_field_chain(uint8_t *ip, JSValue *fr, J
                 (void)own1;
 #endif
                 if (site2 != REG_IC_NONE &&
-                    regvm_own_read_hit(pic, b->regvm_pic_holder, regs[d1], site2, &v2)) {
+                    regvm_own_read_hit(b, pic, b->regvm_pic_holder, regs[d1], site2, &v2)) {
                     own2 = 0;
                 } else if (site2 == REG_IC_NONE) {
                     v2 = JS_GetProperty(ctx, regs[d1], atom2);
@@ -2739,7 +2739,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_local_field(uint8_t *ip, JSValue *fr, J
                 JSValue recv = (op == ROP_get_local_field) ? rf->var_buf[slot]
                                                           : rf->arg_buf[slot];
                 JSValue val;
-                if (regvm_own_read_hit(pic, b->regvm_pic_holder, recv, site, &val)) {
+                if (regvm_own_read_hit(b, pic, b->regvm_pic_holder, recv, site, &val)) {
                     SET_REG_B(d, val);
                     REGVM_NEXT();
                 }
@@ -2781,7 +2781,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_get_local_field_0(uint8_t *ip, JSValue *fr,
                 int site = RD_U16();
                 JSValue recv = rf->var_buf[slot];
                 JSValue val;
-                if (regvm_own_read_hit(pic, b->regvm_pic_holder, recv, site, &val)) {
+                if (regvm_own_read_hit(b, pic, b->regvm_pic_holder, recv, site, &val)) {
                     SET_REG_B(d, val);
                     REGVM_NEXT();
                 }
