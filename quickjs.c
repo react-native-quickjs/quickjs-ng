@@ -15599,7 +15599,10 @@ static inline bool js_arr_packed_num_int(JSValueConst v, int32_t *i)
     }
     if (JS_TAG_IS_FLOAT64(tag)) {
         double d = JS_VALUE_GET_FLOAT64(v);
-        int32_t k = (int32_t)d;
+        int32_t k;
+        if (!(d >= -2147483648.0 && d <= 2147483647.0))
+            return false;
+        k = (int32_t)d;
         if ((double)k == d && !(k == 0 && signbit(d))) {
             *i = k;
             return true;
