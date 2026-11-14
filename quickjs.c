@@ -12633,7 +12633,19 @@ static void ss_scan_coro_frames(JSRuntime *rt, uintptr_t lo, uintptr_t hi)
     }
 }
 #endif
-static __attribute__((noinline)) void ss_scan(JSRuntime *rt)
+/* The scan reads every word of the native stack between its own frame and the stack top, including the redzones AddressSanitizer puts around
+   locals: the reads are the point of a conservative scan, so the function is not instrumented. */
+#if defined(__SANITIZE_ADDRESS__)
+#define SS_NO_ASAN __attribute__((no_sanitize_address))
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define SS_NO_ASAN __attribute__((no_sanitize_address))
+#endif
+#endif
+#ifndef SS_NO_ASAN
+#define SS_NO_ASAN
+#endif
+static __attribute__((noinline)) SS_NO_ASAN void ss_scan(JSRuntime *rt)
 {
     uintptr_t lo, hi = rt->stack_top, *w;
     uint32_t i, k;
