@@ -345,8 +345,13 @@ static uint8_t *REGVM_CC regvm_s_ROP_apply_arguments(uint8_t *ip, JSValue *fr, J
                 int idx = RD_U16();
                 JSValue *sp = &regs[w + 3];
                 JSObject *pa = js_args_apply_is_builtin(sp[-2]);
-                if (likely(pa != NULL &&
-                           (rf->arg_buf == (JSValue *)rf->argv ||
+                /* A light frame has no JSStackFrame and no `argv`: the window
+                   is always borrowed, as in the threaded handler. */
+                if (unlikely(rf->flags & REGVM_FLAG_LIGHT) && pa == NULL) {
+                    ret_val = regvm_light_apply_arguments(ctx, rf, sp, idx);
+                } else if (likely(pa != NULL &&
+                           ((rf->flags & REGVM_FLAG_LIGHT) ||
+                            rf->arg_buf == (JSValue *)rf->argv ||
                             rf->argc <= b->arg_count))) {
                     if (unlikely(check_function(pa->u.cfunc.realm, sp[-3])))
                         goto exception;

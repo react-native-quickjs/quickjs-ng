@@ -71,6 +71,26 @@ typedef struct JSAotGenLayout {
     /* The unary sub-operations the inline unary path names, from
        JSRegUnaryOp. */
     uint32_t reg_un_neg, reg_un_inc;
+    /* The frame and bytecode fields the prologue reads: a compiled entry
+       otherwise pays five cross-unit accessor calls. Only offsets are shared:
+       JSRegRun's size differs between the QJS_AOT and QJS_AOT_GEN builds (the
+       deopt pc is AOT-only), and the engine owns every allocation. */
+    uint32_t off_regrun_b, off_regrun_pic, off_regrun_var_buf;
+    uint32_t off_regrun_arg_buf, off_regrun_func, off_regrun_this_obj;
+    uint32_t off_regrun_flags, off_regrun_sf, off_regrun_caller;
+    uint32_t off_fnbc_regvm_code, off_fnbc_regvm_pic_holder;
+    uint32_t off_fnbc_var_count, off_fnbc_arg_count;
+    uint32_t off_fnbc_regvm_reg_count, off_fnbc_var_ref_count;
+    /* The runtime fields an inline global-read hit tests. */
+    uint32_t off_rt_gv_cell_gen;
+    /* The context's back-edge counter, decremented inline by a compiled loop. */
+    uint32_t off_ctx_interrupt_counter;
+    /* The context's runtime, for the inline global-read hit's generation. */
+    uint32_t off_ctx_rt;
+    /* What a direct call to a compiled leaf checks on its callee: the function
+       object's bytecode, that bytecode's compiled entry, and its caches. */
+    uint32_t off_object_func_bytecode, class_bytecode_function;
+    uint32_t off_fnbc_aot_fn, off_fnbc_regvm_pic;
 } JSAotGenLayout;
 
 /* Fold every field after `hash` (the hash field itself is excluded). Shared by
@@ -158,6 +178,9 @@ extern const uint32_t qjs_aot_deopt_site_func[];
 QJS_AOT_STUB uint8_t *qjs_aot_step(uint8_t *ip, JSValue *fr, JSRegRun *f, JSContext *ctx);
 uint8_t *qjs_aot_code(JSRegRun *f);
 JSValue qjs_aot_ret(JSRegRun *f);
+/* A compiled `return`: moves the value out of its register, with its own
+   reference under DRC, and clears the slot. */
+QJS_AOT_STUB JSValue qjs_aot_return(JSValue *fr, int off);
 QJS_AOT_STUB JSValue qjs_aot_unwind(JSContext *ctx, JSRegRun *f, JSValue *fr,
                        uint32_t pc, uint32_t *resume_pc);
 
@@ -239,6 +262,12 @@ QJS_AOT_STUB int qjs_aot_cmp_take(JSContext *ctx, int sub, JSValue a, JSValue b)
 /* Mirror js_regvm_binary (the general binary op, exception-capable): 0 on
    success with an owned *out, -1 on exception. */
 int qjs_aot_binary(JSContext *ctx, int sub, JSValue a, JSValue b, JSValue *out);
+/* `a <sub> const` for the forms whose right operand is not a register: a
+   constant-pool entry (`kind` REG_CONST_CPOOL) or an atom. 0 with an owned
+   *out, -1 on exception. */
+QJS_AOT_STUB int qjs_aot_binary_cpool(JSContext *ctx, JSRegRun *f, int sub,
+                                      uint32_t idx, int kind, JSValue a,
+                                      JSValue *out);
 
 /* The frame's argument window: AOT_ARG(ab, slot). */
 JSValue *qjs_aot_arg_buf(JSRegRun *f);
@@ -249,6 +278,9 @@ QJS_AOT_STUB void qjs_aot_put_local(JSContext *ctx, JSValue *vb, int slot, JSVal
 /* Mirror the get_global handler: its per-instruction site cache, then the cell
    probe, then JS_GetGlobalVar. 0 = borrowed *out (the site hit; store with
    AOT_SET_B), 1 = owned *out (store with AOT_SET_P), -1 = exception. */
+/* The global-slot generation an inline global-read hit compares against. */
+uint32_t qjs_aot_gv_gen(JSContext *ctx);
+
 QJS_AOT_STUB int qjs_aot_get_global_site(JSContext *ctx, JSRegRun *f, int site,
                                          int atom, int throwing, JSValue *out);
 
@@ -343,6 +375,25 @@ QJS_AOT_STUB int qjs_aot_call_c(JSContext *ctx, int site, int cproto, int na, JS
    engine, -1 on exception. Only the no-copy frame case is handled. */
 QJS_AOT_STUB int qjs_aot_call_b(JSContext *ctx, int na, JSValue callee, JSValue this_obj,
                    JSValue *argv, JSValue *out);
+
+/* A compiled-to-compiled call. The callee runs on a light frame, so a deopt or
+   an uncaught throw inside it is finished by the interpreter on that same
+   frame. 1 with an owned *out, 0 when the callee is not enterable this way,
+   -1 on exception. */
+int qjs_aot_call_light(JSContext *ctx, JSRegRun *caller_f, int na,
+                        JSValue callee, JSValue this_obj, JSValue *argv,
+                        JSValue *out);
+
+/* A compiled call to a compiled leaf: same contract, but the callee's frame is
+   the caller's stack buffer, so no arena traffic. `frame_bytes` must be at
+   least the callee's light-frame size. */
+int qjs_aot_call_leaf(JSContext *ctx, JSRegRun *caller_f, int na,
+                      JSValue callee, JSValue this_obj, JSValue *argv,
+                      JSValue *out, void *frame, size_t frame_bytes);
+
+/* The frame's `this` for a compiled field read. 1 with an owned *out (a boxed
+   primitive), 0 when the value is borrowed, -1 on exception. */
+QJS_AOT_STUB int qjs_aot_this(JSContext *ctx, JSRegRun *f, JSValue *out);
 
 /* Folded prototype read: 1 with an owned *out while the PIC site still
    resolves to the same prototype slot and the epoch is unchanged. */

@@ -39,6 +39,22 @@ typedef struct JSAotGenFunc {
     int eligible;              /* AOT_GEN_ELIGIBLE or an AOT_GEN_REF_* reason */
     int stack_len;             /* stack bytecode length when refused, else 0 */
     const uint8_t *code;       /* the register program; owned by the runtime */
+    /* The numeric constant-pool entries, so the generator can fold a
+       `binary_cpool` on one into a C literal instead of an out-of-line call.
+       `cpool_numeric[i]` is 0 when entry i is not a foldable number, and
+       otherwise the entry's tag -- JS_TAG_INT or JS_TAG_FLOAT64 -- so the fold
+       can emit an int literal for an int and a double for a double. A bool
+       would lose that distinction and make `i + 100000` an int-plus-float,
+       which misses both inline paths and yields a float where the interpreter
+       yields an int. */
+    int cpool_count;
+    const double *cpool_num;
+    const uint8_t *cpool_numeric;
+    /* The light-frame size a direct call needs, when this function is one a
+       compiled caller may enter on the C stack (`light_ok`), i.e. it is light
+       eligible. */
+    int light_ok;
+    int light_need;
     char name[128];
     char file[256];
 } JSAotGenFunc;
@@ -47,7 +63,9 @@ typedef struct JSAotGenFunc {
    and a malloc'd array in *pout (release with js_aot_gen_free); zero with
    *pout NULL on allocation failure. */
 int js_aot_gen_collect(JSRuntime *rt, JSAotGenFunc **pout);
-void js_aot_gen_free(JSRuntime *rt, JSAotGenFunc *arr);
+/* Release the array returned by js_aot_gen_collect; `n` is the count it
+   returned. */
+void js_aot_gen_free(JSRuntime *rt, JSAotGenFunc *arr, int n);
 
 /*
  * Decode one instruction: returns its size in bytes (opcode included) and the
