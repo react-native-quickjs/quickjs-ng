@@ -24598,7 +24598,24 @@ typedef struct JSRegArenaChunk {
     size_t saved_top;           /* this chunk's top while a later chunk is current */
 } JSRegArenaChunk;
 
+#ifdef QJS_REGVM_KNOBS
+/* Shift the frame arena by REGVM_SKEW bytes (rounded down to 16)
+   so a measurement can pick an alias-free layout. `getenv` is read once; without
+   QJS_REGVM_KNOBS the offset folds to zero and the macro is unchanged. */
+static size_t regvm_skew(void)
+{
+    static long v = -1;
+    if (v < 0) {
+        const char *e = getenv("REGVM_SKEW");
+        v = e ? atol(e) & ~15L : 0;
+    }
+    return (size_t)v;
+}
+#define REGVM_CHUNK_HDR \
+    (((sizeof(JSRegArenaChunk) + 15) & ~(size_t)15) + regvm_skew())
+#else
 #define REGVM_CHUNK_HDR ((sizeof(JSRegArenaChunk) + 15) & ~(size_t)15)
+#endif
 
 static inline uint8_t *regvm_chunk_data(JSRegArenaChunk *c)
 {
