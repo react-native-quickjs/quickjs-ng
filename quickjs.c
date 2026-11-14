@@ -281,6 +281,15 @@ const char* JS_GetVersion(void) {
 #undef STRINFIGY_
 #undef STRINGIFY
 
+/* The version byte of a JS_WriteObject artifact: JS_ReadObject rejects any
+   other value. Each VM build has its own value, since the two builds write
+   different function bodies; bump the value of the build whose format changes. */
+#if QJS_REGVM
+#define BC_VERSION (0x80 + 20) /* register bytecode */
+#else
+#define BC_VERSION 28 /* stack bytecode */
+#endif
+
 static inline JSValueConst *vc(JSValue *vals)
 {
     return (JSValueConst *)vals;
@@ -1819,6 +1828,7 @@ struct JSPutAddEntry {
 #if QJS_AOT || QJS_AOT_GEN || QJS_AOT_PROFILE
 #include "quickjs-aot-rt.h"
 void js_aot_gen_layout(JSAotGenLayout *out);
+unsigned js_aot_gen_bc_version(void);
 #endif
 
 #if QJS_AOT_PROFILE
@@ -68308,6 +68318,13 @@ static void aot_hash_bytes(uint64_t *h0, uint64_t *h1, const void *p, size_t n)
     *h1 = b;
 }
 
+/* The BC_VERSION this engine build writes into its profile header: the
+   generator refuses a profile written by another bytecode version. */
+unsigned js_aot_gen_bc_version(void)
+{
+    return BC_VERSION;
+}
+
 /* The layout facts the generated unit is compiled against, filled from the
    engine's own structs. Shared by the generator (which writes them into
    quickjs-aot-layout.h and exports the hash) and the runtime (which re-derives
@@ -70507,8 +70524,8 @@ void js_aot_prof_dump(JSRuntime *rt)
         if (!f)
             f = stderr;
     }
-    fprintf(f, "qjsprof 1 abi=%u fmt=%u drc=%u thr=%u rec=%u callres=1 sitekinds=1 gwrites=1 vmode=%u\n",
-            QJS_AOT_ABI, REGVM_FORMAT_VERSION, QJS_DRC,
+    fprintf(f, "qjsprof 1 abi=%u bc=%u drc=%u thr=%u rec=%u callres=1 sitekinds=1 gwrites=1 vmode=%u\n",
+            QJS_AOT_ABI, (unsigned)BC_VERSION, QJS_DRC,
             QJS_REGVM_THREAD, QJS_REGVM_RECORD, QJS_NAN_BOXING64);
     re_st_prof_dump(f);
     {
@@ -88340,8 +88357,6 @@ typedef enum BCTagEnum {
     BC_TAG_REGVM_FUNCTION_BYTECODE,
 } BCTagEnum;
 
-#define BC_VERSION 28
-
 typedef struct BCWriterState {
     JSContext *ctx;
     DynBuf dbuf;
@@ -89310,7 +89325,6 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
     /* Bit 0 is the flag; the other bits carry the compiler's variable area plus one (0: not recorded, the reader derives it). */
     bc_put_u8(s, !b->regvm_compiled ? 0 : b->var_count <= 126 ? (uint8_t)(1 | ((b->regvm_var_count + 1) << 1)) : 1);
     if (b->regvm_compiled) {
-        bc_put_u8(s, REGVM_FORMAT_VERSION);
         bc_put_leb128(s, b->regvm_reg_count);
         bc_put_leb128(s, b->regvm_ctl_count);
         bc_put_leb128(s, b->regvm_pic_count);
@@ -91730,15 +91744,6 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
         }
         if (compiled) {
             int reg_count, ctl_count, pic_count, regvm_len;
-            uint8_t version;
-            if (bc_get_u8(s, &version))
-                goto fail;
-            if (version != REGVM_FORMAT_VERSION) {
-                JS_ThrowSyntaxError(ctx,
-                    "register bytecode format version %u, expected %u",
-                    version, REGVM_FORMAT_VERSION);
-                goto fail;
-            }
             if (bc_get_leb128_int(s, &reg_count) ||
                 bc_get_leb128_int(s, &ctl_count) ||
                 bc_get_leb128_int(s, &pic_count) ||

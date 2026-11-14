@@ -122,4 +122,7 @@ int js_aot_gen_decode_insn(const uint8_t *code, int len, int off, JSAotGenInsn *
    js_aot_gen_layout and writes it plus the hash into quickjs-aot-layout.h. */
 void js_aot_gen_layout(JSAotGenLayout *out);
 
+/* The engine build's BC_VERSION, which the profile header carries as `bc=`. */
+unsigned js_aot_gen_bc_version(void);
+
 #endif /* QUICKJS_AOT_GEN_H */
