@@ -328,6 +328,14 @@ QJS_AOT_STUB int qjs_aot_put_field_slow(JSContext *ctx, JSRegRun *f, uint8_t *ip
                                         JSValue recv, int atom, int site,
                                         JSValue v);
 
+/* The `this` object of `new C(...)` for a plain constructor: allocated the way the
+   interpreter's light construct does (the prototype from `C.prototype`, the profiled
+   inline slot capacity), so the caller can run the constructor's compiled body with it
+   and apply the result rule. 1 with an owned object in *out; 0 when C is not a plain
+   non-derived light bytecode constructor (the caller takes the generic path); -1 on an
+   exception. Runs no JavaScript. */
+int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out);
+
 /* Mirror the int/float fast path of REGVM_CMP_BRANCH. Return 1 when the
    comparison is decided (*take), 0 when it needs the generic slow path. */
 int qjs_aot_branch_cmp(int sub, JSValue a, JSValue b, int *take);
