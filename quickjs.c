@@ -22160,14 +22160,20 @@ static int regvm_put_field_ic(JSContext *ctx, JSFunctionBytecode *b, JSValue rec
 #endif
 }
 
+/* The tag assumption the hit path relies on: every negative tag is a pointer,
+   every tag from zero up is an immediate, and the only uncounted negative tag
+   is the lazy-JSON marker handled below. */
+_Static_assert(JS_TAG_FIRST < 0 && JS_TAG_INT == 0,
+               "regvm read hit assumes negative tags are pointers and tags >= 0 are immediates");
+
 /*
- * The register read hit. One shape compare and one kind test, then the slot.
+ * The register read hit: one shape compare and one kind test, then the slot.
  *
- * The cached shape is a counted reference, so an equal shape pointer means the
- * cached layout is immutable and `slot` still names the requested atom. A hit
- * returns a new reference. The prototype form reads the receiver shape's own
- * prototype, which the receiver shape keeps alive, and checks the cached holder
- * shape. A lazy slot is left to the slow path, which materializes it.
+ * The cached shape is a counted reference, so an equal pointer means `slot`
+ * still names the atom. The prototype form reads the receiver shape's own
+ * prototype (kept alive by the shape) and checks the cached holder shape. A
+ * slot value then takes one test, `tag < 0`: a pointer is counted, except the
+ * lazy-JSON marker, which goes to the slow path.
  */
 static inline __attribute__((always_inline)) int regvm_own_read_hit(
     JSRegPIC *pic, JSValue recv, int site, JSValue *out)
@@ -22190,9 +22196,12 @@ static inline __attribute__((always_inline)) int regvm_own_read_hit(
             return 0;
         v = holder->prop[e->slot].u.value;
     }
-    if (unlikely(js_lazy_marker_is(v)))
-        return 0;
-    *out = js_dup(v);
+    if (unlikely(JS_VALUE_GET_TAG(v) < 0)) {
+        if (unlikely(JS_VALUE_GET_TAG(v) == JS_TAG_LAZY_JSON))
+            return 0;                   /* the slow path materializes it */
+        JS_REF_COUNT(JS_VALUE_GET_PTR(v))++;
+    }
+    *out = v;
     return 1;
 }
 
