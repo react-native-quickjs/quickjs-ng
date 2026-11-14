@@ -765,6 +765,9 @@ struct JSRuntime {
     /* Bumped whenever a shape is freed or edited in place: an address-keyed cache validates against it. Kept here, with the
        other epochs a compiled unit reads by offset, where its offset does not depend on the build's optional fields. */
     uint32_t shape_free_epoch;
+    /* Moved only when an OBSERVED shape (JSShape.aot_observed) is freed or edited in place. A unit reads it at the offset right after
+       shape_free_epoch (a static assertion below keeps them adjacent). */
+    uint32_t shape_obs_epoch;
     /* Atoms of global-object properties a compiled body holds as literals. A write to one moves
        `aot_pic_epoch`; the cells of such a property never take the direct store. */
     JSAtom aot_gwatch[JS_AOT_GWATCH_MAX];
@@ -2424,9 +2427,10 @@ struct JSShape {
        the index the dumped table gives it. Only in a build that can profile. */
     uint8_t aot_prof_seen;
     uint16_t aot_prof_id;
-#ifdef QJS_AOT_BUMPSTATS
-    uint8_t aot_observed;   /* measurement only: some PIC cell has held this shape */
-#endif
+    /* Some compiled-code table keyed by this shape's address holds it without a reference (a switch arm's slot table, a learned method
+       table): freeing or editing it in place moves shape_obs_epoch, which those tables validate instead of shape_free_epoch, so the
+       churn of unobserved shapes costs them nothing. Also set when a PIC cell holds the shape (the counters). */
+    uint8_t aot_observed;
     uint32_t hash; /* current hash value */
     uint32_t prop_hash_mask;
     int prop_size; /* allocated properties */
@@ -8332,6 +8336,7 @@ static inline JSShape *js_new_shape_nohash(JSContext *ctx, JSObject *proto,
     sh->is_hashed = false;
     sh->parent = NULL;
     sh->layout_id = 0;
+    sh->aot_observed = 0;
     return sh;
 }
 
@@ -8445,6 +8450,8 @@ static void js_free_shape0(JSRuntime *rt, JSShape *sh)
 
     assert(JS_REF_COUNT(sh) == 0);
     rt->shape_free_epoch++;
+    if (sh->aot_observed)
+        rt->shape_obs_epoch++;
 #ifdef QJS_AOT_BUMPSTATS
     js_aot_shape_stat[0]++;
     if (sh->aot_observed) js_aot_shape_stat[1]++;
@@ -9157,6 +9164,7 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
            shape_free_epoch too, or a stub cache entry keyed on this address
            could alias the next shape allocated here. */
         ctx->rt->shape_free_epoch++;
+        ctx->rt->shape_obs_epoch++;
     } else {
         /* only resize the properties */
         list_del(&sh->header.link);
@@ -9171,6 +9179,7 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
         list_add_tail(&sh->header.link, &ctx->rt->gc_obj_list);
         /* js_realloc may have moved the shape allocation. */
         ctx->rt->shape_free_epoch++;
+        ctx->rt->shape_obs_epoch++;
     }
     *psh = sh;
     sh->prop_size = new_size;
@@ -9249,6 +9258,7 @@ static int compact_properties(JSContext *ctx, JSObject *p)
     js_free(ctx, get_alloc_from_shape(old_sh));
     /* see resize_properties above */
     ctx->rt->shape_free_epoch++;
+    ctx->rt->shape_obs_epoch++;
 
     /* reduce the size of the object properties */
     new_prop = js_prop_grow(ctx, p, sizeof(new_prop[0]) * new_size);
@@ -14830,8 +14840,11 @@ static JSProperty *add_property(JSContext *ctx,
     assert(JS_REF_COUNT(p->shape) == 1);
     /* A hashed shape that no other object or cache references and for which no transition exists is extended in place: the
        same address now names a shape with one more property. See js_shape_prepare_update. */
-    if (p->shape->is_hashed)
+    if (p->shape->is_hashed) {
         ctx->rt->shape_free_epoch++;
+        if (p->shape->aot_observed)
+            ctx->rt->shape_obs_epoch++;
+    }
     if (add_shape_property(ctx, &p->shape, p, prop, prop_flags))
         return NULL;
     return &p->prop[p->shape->prop_count - 1];
@@ -16845,6 +16858,8 @@ static int js_shape_prepare_update(JSContext *ctx, JSObject *p,
                address (the global stub cache, the compiled code's statics) validates with shape_free_epoch, so this move
                retires what they recorded about it. */
             ctx->rt->shape_free_epoch++;
+            if (sh->aot_observed)
+                ctx->rt->shape_obs_epoch++;
             js_shape_hash_unlink(ctx->rt, sh);
             sh->is_hashed = false;
         }
@@ -25996,10 +26011,8 @@ static void regvm_pic_install(JSRuntime *rt, JSRegPIC *e, JSShape **pholder,
     e->misses = misses;
     e->shape = js_dup_shape(rsh);
     *pholder = hsh ? js_dup_shape(hsh) : NULL;
-#ifdef QJS_AOT_BUMPSTATS
     rsh->aot_observed = 1;
     if (hsh) hsh->aot_observed = 1;
-#endif
     /* The property slot's own offset in the property array, not the value's
        size: JSProperty is at least 8 bytes in every encoding. */
     e->slot_off = slot * (uint32_t)sizeof(JSProperty);
@@ -63097,6 +63110,7 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->off_rt_ic_epoch = (uint32_t)offsetof(JSRuntime, ic_watchpoint_epoch);
     out->off_rt_lazy_json = (uint32_t)offsetof(JSRuntime, lazy_json_seen);
     out->off_rt_shape_free_epoch = (uint32_t)offsetof(JSRuntime, shape_free_epoch);
+    _Static_assert(offsetof(JSRuntime, shape_obs_epoch) == offsetof(JSRuntime, shape_free_epoch) + sizeof(uint32_t), "units read shape_obs_epoch right after shape_free_epoch");
     out->off_fnbc_regvm_len = (uint32_t)offsetof(JSFunctionBytecode, regvm_len);
     {
         /* The object's flag bits and its inline slot capacity share one 16-bit word:
@@ -65268,6 +65282,7 @@ QJS_AOT_STUB int qjs_aot_shape_slot(const void *shape, uint32_t atom, uint32_t *
 
     if (sh == NULL)
         return 0;
+    sh->aot_observed = 1;
     h = (uintptr_t)atom & sh->prop_hash_mask;
     h = prop_hash_end(sh)[-h - 1];
     prop = get_shape_prop(sh);
@@ -65299,6 +65314,7 @@ QJS_AOT_STUB int qjs_aot_shape_method(const void *shape, uint32_t atom, JSValue 
 
     if (sh == NULL)
         return 0;
+    sh->aot_observed = 1;
     h = (uintptr_t)atom & sh->prop_hash_mask;
     h = prop_hash_end(sh)[-h - 1];
     prop = get_shape_prop(sh);
