@@ -69,6 +69,33 @@ typedef struct JSRegIR JSRegIR;
 typedef struct JSRegRCC JSRegRCC;
 #endif
 
+/*
+ * The register VM's default executor is the threaded dispatch plus the record
+ * call path. They need Clang's `musttail` and `preserve_none` and computed-goto
+ * dispatch; STEPCHECK, the AOT runtime and the AOT profiler are defined against
+ * the monolith, so on those, and on other compilers, the default is 0. Pass
+ * `-DQJS_REGVM_THREAD=0` for the monolith, `-DQJS_REGVM_RECORD=0` for the
+ * threaded dispatch without the record call path.
+ *
+ * Defaulted at the top because both the frame arena and the interpreter read
+ * them, and a `#ifndef` default only affects code after it.
+ */
+#ifndef QJS_REGVM_THREAD
+#if QJS_REGVM && defined(__clang__) && \
+    !QJS_REGVM_STEPCHECK && !QJS_REGVM_ASM && !QJS_AOT && !QJS_AOT_PROFILE
+#define QJS_REGVM_THREAD 1
+#else
+#define QJS_REGVM_THREAD 0
+#endif
+#endif
+#ifndef QJS_REGVM_RECORD
+#if QJS_REGVM_THREAD && !QJS_REGVM_INLOOP_CALL
+#define QJS_REGVM_RECORD 1
+#else
+#define QJS_REGVM_RECORD 0
+#endif
+#endif
+
 /* Deferred reference counting. QJS_DRC enables the machinery (ZCT, reconcile,
    register-root scanning); QJS_DRC_VALIDATE adds the debug root validator. */
 #ifndef QJS_DRC
@@ -23982,8 +24009,6 @@ _Static_assert(JS_TAG_FIRST < 0 && JS_TAG_INT == 0,
  *    signatures, which is why every function here takes REGVM_ARGS.
  *  - Cold halves out of line: the engine's slow routines are reached only
  *    through noinline `*_slow` functions, so a handler has no prologue.
- *
- * Off by default: the default build compiles none of this.
  */
 #if QJS_REGVM_THREAD && QJS_REGVM_ASM
 #error "QJS_REGVM_THREAD and QJS_REGVM_ASM are two designs for the same loop"
@@ -28239,7 +28264,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
             goto *regvm_dispatch[op]; \
         } while (0)
 #else
-#ifdef QJS_REGVM_THREAD
+#if QJS_REGVM_THREAD
 /*
  * Run the threaded chain from here. It returns the address of an opcode with
  * no threaded handler, which this loop executes, or NULL when a handler threw.
@@ -54507,21 +54532,9 @@ static int regvm_homes_mode(void)
     return mode ? atoi(mode) : 5;
 }
 
-/*
- * The encoder's read-back pass re-decodes every instruction it just emitted and
- * compares every operand against the IR, then rebuilds the branch-target set.
- * That is most of the encoder's cost, and it is worth paying only while the
- * encoder is being changed: it is a check on the compiler, not on the program.
- * It runs in a debug build, or when `QJS_REGVM_VERIFY` is asked for, and a knob
- * build can still turn it off at run time.
- */
-/*
- * The threaded interpreter. Off by default: with it off the build is
- * unchanged, and the two dispatches can be compared from one source.
- */
-#ifndef QJS_REGVM_THREAD
-#define QJS_REGVM_THREAD 0
-#endif
+/* The encoder's read-back pass re-decodes every emitted instruction against
+   the IR and rebuilds the branch-target set. It checks the compiler, not the
+   program, so it runs in a debug build or with `QJS_REGVM_VERIFY`. */
 
 /* Step self-check: the monolith's dispatch is replaced by one `regvm_step`
    call per instruction, so every step helper runs under test262. A test
@@ -54537,17 +54550,6 @@ static int regvm_homes_mode(void)
 #define QJS_REGVM_INLOOP_CALL 0
 #endif
 
-/*
- * The second design for the same problem, and the one the first should have
- * been: the frame record *is* the interpreter's state, so `call` and `return`
- * are ordinary threaded handlers and nothing is copied in or out.
- *
- * Needs the threaded chain, because the record is what the chain's handlers
- * read and there is no other executor for a nested frame.
- */
-#ifndef QJS_REGVM_RECORD
-#define QJS_REGVM_RECORD 0
-#endif
 #if QJS_REGVM_RECORD && !QJS_REGVM
 #error "QJS_REGVM_RECORD needs QJS_REGVM"
 #endif
