@@ -61311,8 +61311,15 @@ static int regvm_lower_insn(JSContext *ctx, JSRegIR *ir, const uint8_t *bc,
     }
     case OP_array_from: {
         int argc = get_u16(bc + pos + 1), defs[256], a;
-        if (argc > 255)
-            return regvm_too_many_args(ctx, argc);
+        if (argc > 255) {
+            /* More than one byte of arguments: the array a spread call stages
+               its leading fixed arguments in (`f(1,...,1, ...rest)`), built
+               with the big-call path's chunking. `argc` is bounded by the
+               parser's 65,534 limit. */
+            if (regvm_build_arg_array(ctx, ir, pos, pop, argc, dst))
+                return -1;
+            return 0;
+        }
         regvm_stage_args(ir, pop, argc, 0, argc, home_of, n_values, below, defs);
         for (a = 0; a < argc; a++) {
             if (defs[a] >= 0) {
