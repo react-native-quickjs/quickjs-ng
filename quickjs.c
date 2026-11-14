@@ -48966,12 +48966,74 @@ static JSValue js_get_this(JSContext *ctx, JSValueConst this_val)
     return js_dup(this_val);
 }
 
+/* Is ArraySpeciesCreate(obj, len) provably equal to a plain Array(len), with
+ * none of the protocol's property reads observable? Re-derived on every call,
+ * so there is no cached state to invalidate:
+ *
+ *  1. `obj` is an ordinary Array whose prototype is this realm's
+ *     Array.prototype, with no own 'constructor'.
+ *  2. Array.prototype.constructor is still a data property holding this
+ *     realm's Array. A value check: it is writable and configurable.
+ *  3. Array[@@species] is still the original accessor (getter js_get_this).
+ *     A value check: JS_DefineProperty replaces a getter without a shape
+ *     change.
+ *
+ * Given all three the protocol is js_array_constructor(ctx, Array, 1, &len),
+ * and Array.prototype is non-writable and non-configurable, so new_target can
+ * be JS_UNDEFINED. The cross-realm step cannot fire: (2) pins the realm to ctx.
+ */
+static bool js_array_species_is_default(JSContext *ctx, JSValueConst obj)
+{
+    JSObject *p, *ac, *proto, *getter;
+    JSShapeProperty *prs;
+    JSProperty *pr;
+
+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+        return false;
+    p = JS_VALUE_GET_OBJ(obj);
+    if (p->class_id != JS_CLASS_ARRAY)
+        return false;
+    if (JS_VALUE_GET_TAG(ctx->array_ctor) != JS_TAG_OBJECT ||
+        JS_VALUE_GET_TAG(ctx->class_proto[JS_CLASS_ARRAY]) != JS_TAG_OBJECT)
+        return false;  /* the Array intrinsic is not installed in this realm */
+    ac = JS_VALUE_GET_OBJ(ctx->array_ctor);
+    proto = JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]);
+
+    /* (1) */
+    if (p->shape->proto != proto)
+        return false;
+    if (find_own_property(&pr, p, JS_ATOM_constructor) != NULL)
+        return false;
+    /* (2) */
+    prs = find_own_property(&pr, proto, JS_ATOM_constructor);
+    if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+        return false;
+    if (JS_VALUE_GET_TAG(pr->u.value) != JS_TAG_OBJECT ||
+        JS_VALUE_GET_OBJ(pr->u.value) != ac)
+        return false;
+    /* (3) */
+    prs = find_own_property(&pr, ac, JS_ATOM_Symbol_species);
+    if (!prs || (prs->flags & JS_PROP_TMASK) != JS_PROP_GETSET)
+        return false;
+    getter = pr->u.getset.getter;
+    if (!getter || getter->class_id != JS_CLASS_C_FUNCTION ||
+        getter->u.cfunc.cproto != JS_CFUNC_getter ||
+        getter->u.cfunc.c_function.getter != js_get_this)
+        return false;
+    return true;
+}
+
 static JSValue JS_ArraySpeciesCreate(JSContext *ctx, JSValueConst obj,
                                      JSValueConst len_val)
 {
     JSValue ctor, ret, species;
     int res;
     JSContext *realm;
+
+    /* Skip the whole protocol -- two property Gets, a native accessor call and
+       a full construct -- when it provably ends at plain Array(len). */
+    if (js_array_species_is_default(ctx, obj))
+        return js_array_constructor(ctx, JS_UNDEFINED, 1, &len_val);
 
     res = js_is_array(ctx, obj);
     if (res < 0)
