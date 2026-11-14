@@ -30,6 +30,9 @@
 
 #include "cutils.h"
 #include "libregexp.h"
+#ifndef JS_RE_PREFILTER
+#define JS_RE_PREFILTER 1
+#endif
 #include "libunicode.h"
 
 /* ASCII identifier tables, used by lre_js_is_ident_first/next in libregexp.h
@@ -565,6 +568,22 @@ static bool re_first_set_scan(const uint8_t *code, size_t bc_buf_len,
         else
             *phas_wide = 1;
         return true;
+#if JS_RE_PREFILTER
+    case REOP_space:
+        /* W2: \s has its own opcode, so it fell through to `default: return
+           false` and every \s-led pattern got NO prefilter at all.  The executor tests lre_is_space(), which
+           for c < 256 is exactly lre_is_space_byte(); the non-ASCII members
+           (U+1680, U+2000..U+200A, U+2028/9, U+202F, U+205F, U+3000, U+FEFF)
+           are covered by has_wide. */
+        {
+            int b;
+            for (b = 0; b < 256; b++)
+                if (lre_is_space_byte((uint8_t)b))
+                    bitmap[b >> 3] |= 1 << (b & 7);
+        }
+        *phas_wide = 1;
+        return true;
+#endif /* JS_RE_PREFILTER -- REOP_space first set */
     case REOP_range_i:
         *phas_fold = 1;
         /* fallthrough */
