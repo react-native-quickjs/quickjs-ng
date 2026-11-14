@@ -62,6 +62,10 @@ typedef struct JSAotGenLayout {
              off_shape_hash_table;
     uint32_t off_property_u_value;
     uint32_t off_shape_property_flags_atom;
+    /* The contracted layouts: the id in a JSShape, the runtime's shape array and
+       count, and the bit word that records a broken contract. */
+    uint32_t off_shape_layout_id;
+    uint32_t off_rt_layout_broken, off_rt_layout_shape, off_rt_layout_count;
     uint32_t off_string_len_bits, off_string_strv;
     uint32_t off_jsvalue_tag, off_jsvalue_u;
     /* The register-PIC entry the compiled named read tests inline, and the
@@ -304,6 +308,17 @@ extern const uint32_t qjs_aot_count;
 extern const uint32_t qjs_aot_abi;
 extern const uint32_t qjs_aot_cell_count;
 extern const uint32_t qjs_aot_site_count;
+
+/* The unit's teardown, called once at the start of JS_FreeRuntime: it drops the
+   counted references its site and layout caches hold and forgets the runtime that
+   owned them. A build with no unit defines nothing here; the engine's reference
+   is weak. */
+void qjs_aot_release(JSRuntime *rt);
+
+/* A contracted layout's shape, from the unit's side. */
+QJS_AOT_STUB void *qjs_aot_layout_dup(void *sh);
+QJS_AOT_STUB void qjs_aot_layout_free(JSRuntime *rt, void *sh);
+QJS_AOT_STUB uint32_t qjs_aot_shape_layout(const void *sh);
 extern const uint32_t qjs_aot_deopt_site_func[];
 
 /* ABI entry points implemented by the engine. */
