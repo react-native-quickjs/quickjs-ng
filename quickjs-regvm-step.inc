@@ -2844,7 +2844,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_iter_next(uint8_t *ip, JSValue *fr, JSRegRu
 
                 { int w = RD_REG();
                   if (regvm_for_of_next(ctx, &regs[w + 2], -2)) {
-                      regvm_ctl_iter_forget(ctx, rf->ctl, &rf->nctl);
+                      regvm_ctl_iter_forget(ctx, rf->ctl, rf->nctl);
                       goto exception;
                   }
                   /* The helper clears the iterator slot when the step reported
@@ -2853,7 +2853,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_iter_next(uint8_t *ip, JSValue *fr, JSRegRu
                      too: an iterator whose own step threw must not have
                      `return` called. */
                   if (JS_IsUndefined(regs[w]))
-                      regvm_ctl_iter_forget(ctx, rf->ctl, &rf->nctl);
+                      regvm_ctl_iter_forget(ctx, rf->ctl, rf->nctl);
                   REGVM_NEXT(); }
  exception:
     rf->ret = JS_EXCEPTION;
@@ -2931,7 +2931,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_iter_value_done(uint8_t *ip, JSValue *fr, J
                          trailing async close skips return() (AsyncIteratorClose
                          does not run on normal completion). */
                       SET_REG_P(w, JS_UNDEFINED);
-                      regvm_ctl_iter_forget(ctx, rf->ctl, &rf->nctl);
+                      regvm_ctl_iter_forget(ctx, rf->ctl, rf->nctl);
                   }
                   JS_FreeValue(ctx, tmp[0]);
                   REGVM_NEXT(); }
