@@ -102040,6 +102040,40 @@ static bool js_regexp_req_start(const JSReReq *e, JSString *str, int *pstart)
     return true;
 }
 
+#define JS_REGEXP_NOT_BOUNDED 1000
+
+/* A pattern whose match must start within a few units before an occurrence of
+   its required literal (outside Unicode mode, where positions are code
+   units): the matcher is entered anchored at those few starts for each
+   occurrence in turn, in increasing order, so the subject between occurrences
+   is not scanned. Returns JS_REGEXP_NOT_BOUNDED when the pattern is not of
+   that kind. */
+static int js_regexp_match_bounded(JSContext *ctx, uint8_t **capture,
+                                   const JSRegExpExecData *d, const JSReReq *e,
+                                   JSString *str, int start_index)
+{
+    int next = start_index, from = start_index, at, s, rc;
+
+    if (!e || !e->r.len || e->r.prefix_max < 0 || e->r.prefix_max > 8 ||
+        (d->re_flags & (LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)))
+        return JS_REGEXP_NOT_BOUNDED;
+    for (;;) {
+        at = js_regexp_find_literal(e, str, from);
+        if (at < 0)
+            return 0;
+        s = at - e->r.prefix_max;
+        if (s < next)
+            s = next;
+        for (; s <= at; s++) {
+            rc = lre_exec_at(capture, d->bytecode, e->r.entry, str8(str), s,
+                             str->len, str->is_wide_char, ctx);
+            if (rc != 0)
+                return rc;
+        }
+        next = from = at + 1;
+    }
+}
+
 /* The scanning matcher, entered after what the analysis proves: a pattern
    that starts with ^ can only match at index 0 and needs no scan; one with a
    required literal cannot match a subject that lacks it, and cannot start
@@ -102070,6 +102104,11 @@ static int js_regexp_match_generic(JSContext *ctx, uint8_t **capture,
         return lre_exec_at(capture, d->bytecode, e->r.entry, str8(str), 0,
                            str->len, str->is_wide_char, ctx);
     }
+    {
+        int rc = js_regexp_match_bounded(ctx, capture, d, e, str, start_index);
+        if (rc != JS_REGEXP_NOT_BOUNDED)
+            return rc;
+    }
     if (!js_regexp_req_start(e, str, &start_index))
         return 0;
     return lre_exec(capture, d->bytecode, str8(str), start_index,
@@ -102090,8 +102129,14 @@ js_regexp_match_raw(JSContext *ctx, uint8_t **capture, const JSRegExpExecData *d
         return js_regexp_match_prefix(ctx, capture, d->bytecode, d->metadata,
                                       str, start_index);
     case JS_REGEXP_MATCH_FIRST_SET:
-        if (!js_regexp_req_start(js_regexp_req(ctx, re), str, &start_index))
-            return 0;
+        {
+            const JSReReq *e = js_regexp_req(ctx, re);
+            int rc = js_regexp_match_bounded(ctx, capture, d, e, str, start_index);
+            if (rc != JS_REGEXP_NOT_BOUNDED)
+                return rc;
+            if (!js_regexp_req_start(e, str, &start_index))
+                return 0;
+        }
         return js_regexp_match_first_set(ctx, capture, d->bytecode,
                                          d->metadata, str, start_index);
     case JS_REGEXP_MATCH_GENERIC:
@@ -102664,21 +102709,6 @@ done:
     return res;
 }
 
-/* Preallocate a freshly created JS_CLASS_ARRAY result object's fast-array
-   storage as BOXED for 'n' elements, so the exec capture loop can store each
-   match/capture directly (values[i] = owned JSValue; bump count) instead of
-   paying the generic JS_DefinePropertyValueUint32 -> add_fast_array_element ->
-   incremental expand chain per capture. Returns the value buffer or NULL (OOM).
-   The array's `length` prop is set by the caller (via regexp_result_shape). */
-static JSValue *js_regexp_result_prealloc(JSContext *ctx, JSValue obj, int n)
-{
-    JSObject *p = JS_VALUE_GET_OBJ(obj);
-    /* obj is empty (count/size 0) and generic */
-    if (expand_fast_array(ctx, p, n) < 0)
-        return NULL;
-    return JS_ARR_VALS(p);
-}
-
 static JSValue js_regexp_exec_body(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv);
 
@@ -102811,17 +102841,14 @@ static JSValue js_regexp_exec_body(JSContext *ctx, JSValueConst this_val,
         props[2].u.value = str_val;                 // input
         props[3].u.value = js_dup(groups);          // groups
         str_val = JS_UNDEFINED;
-        obj = JS_NewObjectFromShape(ctx, js_dup_shape(ctx->regexp_result_shape),
-                                    JS_CLASS_ARRAY, props);
+        /* The elements live in the object's own block; each capture is stored
+           directly below (see result_values), skipping the per-capture
+           generic define + incremental growth. */
+        obj = JS_NewObjectFromShapeCapExtra(ctx, js_dup_shape(ctx->regexp_result_shape),
+                                            JS_CLASS_ARRAY, props, 0, capture_count);
         if (JS_IsException(obj))
             goto fail;
-        /* Preallocate the fast-array element storage once and store each
-           capture directly below (see result_values), skipping the per-capture
-           generic define + incremental growth. */
-        JSValue *result_values = js_regexp_result_prealloc(ctx, obj,
-                                                           capture_count);
-        if (!result_values)
-            goto fail;
+        JSValue *result_values = JS_ARR_VALS(JS_VALUE_GET_OBJ(obj));
         prop_flags = JS_PROP_C_W_E | JS_PROP_THROW;
         for(i = 0; i < capture_count; i++) {
             uint8_t **match = &capture[2 * i];
