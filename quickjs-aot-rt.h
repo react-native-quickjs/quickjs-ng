@@ -138,4 +138,23 @@ int qjs_aot_unary(JSContext *ctx, int sub, JSValue a, JSValue *out);
 /* Mirror regvm_to_bool: 0/1, or -1 on exception. */
 int qjs_aot_to_bool(JSContext *ctx, JSValue v);
 
+/* --- AOT typed-region helpers ----------------------------------------------
+ *
+ * A region carries a value as (double, isint) and boxes only at an exit or a
+ * deopt. qjs_aot_fitsi is the shared int-fit rule.
+ */
+int qjs_aot_fitsi(double d);
+JSValue qjs_aot_box_num(double d, int isint);
+int qjs_aot_to_num(JSValue v, double *out, int *isint);
+int qjs_aot_dense(JSValue v, JSValue **data, uint32_t *len);
+int qjs_aot_elem_num(JSValue *data, uint32_t i, double *out, int *isint);
+
+/* hoisted field guard + own-data-property read */
+int qjs_aot_field_guard(const void *pic, JSValue recv, int site, int *slot_off);
+JSValue qjs_aot_field_read(JSValue recv, int slot_off);
+
+/* array length and captured-variable cell accessors */
+int qjs_aot_get_length_num(JSValue v, double *out, int *isint);
+JSValue *qjs_aot_var_ref_ptr(JSRegRun *f, int slot);
+
 #endif /* QUICKJS_AOT_RT_H */
