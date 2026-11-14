@@ -930,6 +930,10 @@ struct JSRuntime {
        write it reports: the epoch moved, every folded literal is stale, and the next entry of a body re-confirms its folds against the live value (which
        watches the atom again if it still matches). Otherwise a global written in a loop paid the epoch bump and the list on every store. */
     uint8_t aot_gwatch_fact[JS_AOT_GWATCH_MAX];
+    /* Young collections (js_gc_young): the number run since the last full one, the heap size after the last full one, and a request for a full one. */
+    uint8_t gc_young_streak;
+    bool gc_need_full;
+    size_t gc_full_after;
 };
 
 #if QJS_REGVM_RECORD
@@ -2573,6 +2577,7 @@ struct JSObject {
     uint16_t class_id; /* see JS_CLASS_x */
     uint8_t values_inline : 1;
     uint8_t has_weak_ref : 1; /* the runtime's weak table holds this object's weak references */
+    uint8_t gc_old : 1; /* survived a collection: the young cycle collector does not look at it */
     uint8_t arr_kind; /* JS_CLASS_ARRAY only: JS_ARR_KIND_* (see QJS_PACKED_ARRAYS); always 0 unless the flag is on */
     /* byte offsets: 16/24 */
     JSShape *shape; /* prototype and property names + flag */
@@ -2930,6 +2935,7 @@ static JSValue js_compile_regexp(JSContext *ctx, JSValueConst pattern,
 static JSValue js_regexp_constructor_internal(JSContext *ctx, JSValueConst ctor,
                                               JSValue pattern, JSValue bc);
 static void gc_decref(JSRuntime *rt);
+static void js_gc_auto(JSRuntime *rt);
 static int JS_NewClass1(JSRuntime *rt, JSClassID class_id,
                         const JSClassDef *class_def, JSAtom name);
 static JSValue js_array_push(JSContext *ctx, JSValueConst this_val,
@@ -3378,7 +3384,7 @@ static __attribute__((noinline)) void js_trigger_gc_slow(JSRuntime *rt, size_t s
                 }
             }
 #endif
-            JS_RunGC(rt);
+            js_gc_auto(rt);
             rt->gc_pending = false;
             js_gc_rearm_pace(rt, before, rt->malloc_state.malloc_size);
         }
@@ -4265,6 +4271,9 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
 
     init_list_head(&rt->context_list);
     init_list_head(&rt->gc_obj_list);
+    rt->gc_young_streak = 0;
+    rt->gc_need_full = false;
+    rt->gc_full_after = 0;
     init_list_head(&rt->gc_notrace_list);
     rt->gc_notrace_ok = 1;
     init_list_head(&rt->gc_zero_ref_count_list);
@@ -10256,6 +10265,7 @@ static inline __attribute__((always_inline)) JSValue js_new_plain_object(JSConte
     p->values_inline = 0;
     p->arr_kind = JS_ARR_KIND_GENERIC;
     p->has_weak_ref = 0;
+    p->gc_old = 0;
     p->shape = sh;
     p->prop = (JSProperty *)((uint8_t *)p + offsetof(JSObject, u));
     JS_REF_COUNT(p) = 1;
@@ -10321,6 +10331,7 @@ static JSValue JS_NewObjectFromShapeCapExtra(JSContext *ctx, JSShape *sh,
     p->gv_watched = 0;
     p->is_prototype = 0;
     p->has_weak_ref = 0;
+    p->gc_old = 0;
     if (class_id != JS_CLASS_OBJECT)
         p->u.opaque = NULL;
     p->shape = sh;
@@ -12906,6 +12917,8 @@ static void gc_scan(JSRuntime *rt)
         p = list_entry(el, JSGCObjectHeader, link);
         assert(JS_REF_COUNT(p) > 0);
         JS_GC_MARK(p) = 0; /* reset the mark for the next GC call */
+        if (JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_JS_OBJECT)
+            ((JSObject *)p)->gc_old = 1;
         if (!mark_children_fast(rt, p, gc_scan_incref_child))
             mark_children(rt, p, gc_scan_incref_child);
     }
@@ -12969,6 +12982,129 @@ static void gc_free_cycles(JSRuntime *rt)
     init_list_head(&rt->gc_zero_ref_count_list);
 }
 
+
+/* ---- young collection ------------------------------------------------------
+   A trial deletion over the objects created since the previous collection instead of the whole heap. It is the same algorithm as gc_decref / gc_scan /
+   gc_free_cycles run on a subset S of the plain heap objects: only edges between members of S are removed from the counts, so every reference from outside S
+   (older objects, shapes, closure cells, registers, the native stack) keeps its member alive and everything reachable from it. Garbage that is a whole
+   cycle of young objects is freed; a cycle with an older member waits for a full collection, which the policy in js_gc_auto runs when the heap has grown.
+   S is the tail of gc_obj_list up to the first run of objects flagged gc_old (survivors of an earlier collection); objects of other kinds are never members.
+   While S is processed, `mark` is 1 exactly for the members not yet found to be reachable from outside. */
+static JSObject **gc_y_set; static size_t gc_y_cap;
+static JSObject **gc_y_stk; static size_t gc_y_stk_cap;
+#define GC_YOUNG_OLD_RUN 256
+
+static inline bool gc_young_member(JSGCObjectHeader *p)
+{
+    return JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_JS_OBJECT && JS_GC_MARK(p);
+}
+
+static void gc_young_decref_child(JSRuntime *rt, JSGCObjectHeader *p)
+{
+    if (gc_young_member(p))
+        JS_REF_COUNT(p)--;
+}
+
+static void gc_young_incref_child(JSRuntime *rt, JSGCObjectHeader *p)
+{
+    if (gc_young_member(p))
+        JS_REF_COUNT(p)++;
+}
+
+static size_t gc_young_n, gc_young_sp;
+
+static void gc_young_reach_child(JSRuntime *rt, JSGCObjectHeader *p)
+{
+    if (gc_young_member(p)) {
+        JSObject *o = (JSObject *)p;
+        JS_GC_MARK(p) = 0;
+        o->gc_old = 1;
+        if (gc_young_sp >= gc_y_stk_cap) {
+            gc_y_stk_cap = gc_y_stk_cap ? gc_y_stk_cap * 2 : 1024;
+            gc_y_stk = __builtin_realloc(gc_y_stk, gc_y_stk_cap * sizeof(JSObject *));
+            if (!gc_y_stk)
+                abort();
+        }
+        gc_y_stk[gc_young_sp++] = o;
+    }
+}
+
+static inline void gc_young_children(JSRuntime *rt, JSGCObjectHeader *p, JS_MarkFunc *f)
+{
+    if (!mark_children_fast(rt, p, f))
+        mark_children(rt, p, f);
+}
+
+static void gc_young(JSRuntime *rt)
+{
+    struct list_head *el;
+    size_t i, run = 0;
+
+    init_list_head(&rt->tmp_obj_list);
+    gc_young_n = 0;
+    for (el = rt->gc_obj_list.prev; el != &rt->gc_obj_list; el = el->prev) {
+        JSGCObjectHeader *p = list_entry(el, JSGCObjectHeader, link);
+        JSObject *o;
+
+        if (JS_GC_TYPE(p) != JS_GC_OBJ_TYPE_JS_OBJECT)
+            continue;
+        o = (JSObject *)p;
+        if (o->gc_old) {
+            if (++run >= GC_YOUNG_OLD_RUN)
+                break;
+            continue;
+        }
+        run = 0;
+        assert(JS_GC_MARK(p) == 0);
+        if (gc_young_n >= gc_y_cap) {
+            gc_y_cap = gc_y_cap ? gc_y_cap * 2 : 4096;
+            gc_y_set = __builtin_realloc(gc_y_set, gc_y_cap * sizeof(JSObject *));
+            if (!gc_y_set)
+                abort();
+        }
+        gc_y_set[gc_young_n++] = o;
+    }
+    for (i = 0; i < gc_young_n; i++)
+        JS_GC_MARK(&gc_y_set[i]->header) = 1;
+    /* remove the edges inside S from the counts */
+    for (i = 0; i < gc_young_n; i++)
+        gc_young_children(rt, &gc_y_set[i]->header, gc_young_decref_child);
+    /* the members still counted are held from outside; collect them as the roots of the search before the counts are restored */
+    gc_young_sp = 0;
+    for (i = 0; i < gc_young_n; i++) {
+        JSObject *o = gc_y_set[i];
+        if (JS_REF_COUNT(o) > 0) {
+            if (gc_young_sp >= gc_y_stk_cap) {
+                gc_y_stk_cap = gc_y_stk_cap ? gc_y_stk_cap * 2 : 1024;
+                gc_y_stk = __builtin_realloc(gc_y_stk, gc_y_stk_cap * sizeof(JSObject *));
+                if (!gc_y_stk)
+                    abort();
+            }
+            gc_y_stk[gc_young_sp++] = o;
+        }
+    }
+    for (i = 0; i < gc_young_n; i++)
+        gc_young_children(rt, &gc_y_set[i]->header, gc_young_incref_child);
+    for (i = 0; i < gc_young_sp; i++) {
+        JS_GC_MARK(&gc_y_stk[i]->header) = 0;
+        gc_y_stk[i]->gc_old = 1;
+    }
+    while (gc_young_sp) {
+        JSObject *o = gc_y_stk[--gc_young_sp];
+        gc_young_children(rt, &o->header, gc_young_reach_child);
+    }
+    /* what is left marked is reachable only from itself */
+    for (i = 0; i < gc_young_n; i++) {
+        JSObject *o = gc_y_set[i];
+        if (JS_GC_MARK(&o->header)) {
+            list_del(&o->header.link);
+            list_add_tail(&o->header.link, &rt->tmp_obj_list);
+        }
+    }
+}
+
+static int js_gc_young_on = -1;
+
 void JS_SetGCDeferred(JSRuntime *rt, bool deferred, size_t limit)
 {
     rt->gc_deferred = deferred;
@@ -12997,7 +13133,7 @@ void JS_RunPendingGC(JSRuntime *rt)
     assert(rt->current_stack_frame == NULL
            && regvm_light_head(rt->regvm_cur) == NULL);
     rt->gc_pending = false;
-    JS_RunGC(rt);
+    js_gc_auto(rt);
     rt->malloc_gc_threshold = rt->malloc_state.malloc_size +
         (rt->malloc_state.malloc_size >> 1);
 }
@@ -13007,7 +13143,7 @@ size_t JS_GetMallocSize(JSRuntime *rt)
     return rt->malloc_state.malloc_size;
 }
 
-void JS_RunGC(JSRuntime *rt)
+static void js_run_gc(JSRuntime *rt, bool young)
 {
 #if QJS_REGVM && QJS_DRC_VALIDATE
     js_drc_validate_roots(rt);
@@ -13019,16 +13155,25 @@ void JS_RunGC(JSRuntime *rt)
     js_drc_pin(rt);
     js_drc_reconcile_locked(rt);
 #endif
-    /* decrement the reference of the children of each object. mark =
-       1 after this pass. */
-    gc_decref(rt);
+    if (young) {
+        gc_young(rt);
+    } else {
+        /* decrement the reference of the children of each object. mark =
+           1 after this pass. */
+        gc_decref(rt);
 
-    /* keep the GC objects with a non zero refcount and their childs */
-    gc_scan(rt);
+        /* keep the GC objects with a non zero refcount and their childs */
+        gc_scan(rt);
+    }
 
     /* free the GC objects in a cycle */
     gc_free_cycles(rt);
     js_arena_trim(rt);
+    if (!young) {
+        rt->gc_young_streak = 0;
+        rt->gc_need_full = false;
+        rt->gc_full_after = rt->malloc_state.malloc_size;
+    }
 #if QJS_DRC
     js_drc_unpin(rt);
     rt->zct_limit = (rt->zct_len + rt->zct_nobj) * 2;
@@ -13039,6 +13184,31 @@ void JS_RunGC(JSRuntime *rt)
 #endif
     js_drc_rearm_malloc_mark(rt);
 #endif
+}
+
+void JS_RunGC(JSRuntime *rt)
+{
+    js_run_gc(rt, false);
+}
+
+/* The collection an allocation threshold or a pending request asks for: a young one while the heap has not grown past what the last full one left,
+   a full one at least every 8 collections and whenever a young one leaves the heap more than half larger than the last full one did (older
+   garbage cycles are then the likely cause). QJS_NOYOUNGGC=1 always runs the full one. */
+static void js_gc_auto(JSRuntime *rt)
+{
+    bool young;
+
+    if (js_gc_young_on < 0)
+        js_gc_young_on = getenv("QJS_NOYOUNGGC") == NULL;
+    young = js_gc_young_on && !rt->gc_need_full && rt->gc_young_streak < 7 && rt->gc_full_after != 0;
+    if (!young) {
+        js_run_gc(rt, false);
+        return;
+    }
+    rt->gc_young_streak++;
+    js_run_gc(rt, true);
+    if (rt->malloc_state.malloc_size > rt->gc_full_after + (rt->gc_full_after >> 1))
+        rt->gc_need_full = true;
 }
 
 /* Return false if not an object or if the object has already been
@@ -69398,6 +69568,7 @@ QJS_AOT_STUB JSValue qjs_aot_new_from_shape_cap(JSContext *ctx, void *shape, uin
     p->gv_watched = 0;
     p->is_prototype = 0;
     p->has_weak_ref = 0;
+    p->gc_old = 0;
     p->shape = js_dup_shape(sh);
     pr = (JSProperty *)((uint8_t *)p + offsetof(JSObject, u));
     p->prop = pr;
@@ -69703,6 +69874,7 @@ static JSObject *js_aot_moved_alloc(JSContext *ctx, JSObject *src)
     h->gv_watched = 0;
     h->is_prototype = 0;
     h->has_weak_ref = 0;
+    h->gc_old = 0;
     pr = (JSProperty *)((uint8_t *)h + offsetof(JSObject, u));
     h->prop = pr;
     for (i = n; i < cap; i++)
