@@ -85251,7 +85251,11 @@ regvm_wire_decode(BCReaderState *s, JSFunctionBytecode *b,
                         goto fail_ins;
                     }
                 } else if (fmt[m] == 's') {
-                    if (sv < 0 || (uint32_t)sv >= b->regvm_pic_count) {
+                    /* The baseline tier names REG_IC_NONE for every property
+                       site and has no site table (pic_count 0); it is the only
+                       writer of that value. */
+                    if (!(sv == (int32_t)REG_IC_NONE && b->regvm_pic_count == 0) &&
+                        (sv < 0 || (uint32_t)sv >= b->regvm_pic_count)) {
                         JS_ThrowSyntaxError(ctx, "register PIC site out of range");
                         goto fail_ins;
                     }
@@ -85789,7 +85793,8 @@ static int regvm_validate_code(JSContext *ctx, const JSFunctionBytecode *b)
                     goto done;
                 }
             } else if (fmt[m] == 's') {
-                if (v < 0 || (uint32_t)v >= b->regvm_pic_count) {
+                if (!(v == (int32_t)REG_IC_NONE && b->regvm_pic_count == 0) &&
+                    (v < 0 || (uint32_t)v >= b->regvm_pic_count)) {
                     JS_ThrowSyntaxError(ctx, "register PIC site out of range");
                     goto done;
                 }
