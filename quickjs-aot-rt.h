@@ -117,6 +117,10 @@ typedef struct JSAotGenLayout {
        the class id of an ordinary array. Read inline so a compiled `a[i]` is
        a class check, a bounds check and a load. */
     uint32_t off_object_array_count, off_object_array_values, class_array;
+    /* The classes of the typed arrays whose elements a body reads and writes in place. */
+    uint32_t class_uint8c_array, class_int8_array, class_uint8_array, class_int16_array;
+    uint32_t class_uint16_array, class_int32_array, class_uint32_array;
+    uint32_t class_float32_array, class_float64_array;
     /* The per-site polymorphic property cache: where the bytecode's allocation
        is, the stride between sites, and the ways per site. */
     uint32_t off_fnbc_aot_poly, off_fnbc_aot_poly_sites, aot_poly_ways;
@@ -383,6 +387,8 @@ int qjs_aot_load_const(JSContext *ctx, JSRegRun *f, int kind, uint32_t idx, JSVa
 int qjs_aot_object_fill(JSContext *ctx, JSRegRun *f, JSValue obj, JSValue *vals, int n, int ti);
 int qjs_aot_object_fill_b(JSContext *ctx, struct JSFunctionBytecode *b, JSValue obj, JSValue *vals,
                           int n, int ti);
+/* Stores a number into an in-range element of a typed array; 0 when the case is not that. */
+int qjs_aot_typed_put(JSValue recv, uint32_t idx, JSValue v);
 /* `f.apply(this, arguments)`: with the builtin `apply` and this frame's arguments not
    reified, calls the callee with the frame's own arguments. 1 with an owned *out when
    it did; 0 when the case needs the handler (not the builtin, or the arguments
