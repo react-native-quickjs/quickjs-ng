@@ -95,6 +95,9 @@ typedef struct JSAotGenLayout {
        the class id of an ordinary array. Read inline so a compiled `a[i]` is
        a class check, a bounds check and a load. */
     uint32_t off_object_array_count, off_object_array_values, class_array;
+    /* The per-site polymorphic property cache: where the bytecode's allocation
+       is, the stride between sites, and the ways per site. */
+    uint32_t off_fnbc_aot_poly, off_fnbc_aot_poly_sites, aot_poly_ways;
 } JSAotGenLayout;
 
 /* Fold every field after `hash` (the hash field itself is excluded). Shared by
@@ -222,6 +225,13 @@ void qjs_aot_set_reg_b(JSContext *ctx, JSValue *fr, int off, JSValue v);
 /* Mirror SET_REG_P: the store takes over an owned value (adopt in DRC, free the
    old and move in the owning build). Used where the handler uses SET_REG_P. */
 void qjs_aot_set_reg_p(JSContext *ctx, JSValue *fr, int off, JSValue v);
+
+/* Fill one site's polymorphic property cache from an object the compiled body
+   just checked. Returns 1 with the slot offset, or 0 when the property is not
+   own data (or not writable, for a write) and the body must exit. Runs no
+   JavaScript, so a caller needs no safepoint first. */
+int qjs_aot_poly_fill(JSContext *ctx, JSRegRun *f, int site, JSValue obj,
+                      JSAtom atom, int write, uint32_t *off);
 
 /* Cache the variable buffer once at function entry: AOT_VAR(vb, slot). */
 JSValue *qjs_aot_var_buf(JSRegRun *f);
