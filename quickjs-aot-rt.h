@@ -417,6 +417,20 @@ void qjs_aot_construct_done(JSObject *ctor, JSValue inst);
    non-derived light bytecode constructor (the caller takes the generic path); -1 on an
    exception. Runs no JavaScript. */
 int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out);
+/* What `qjs_aot_ctor_replayable` remembers between calls (zero-initialised, one per use). */
+typedef struct JSAotCtorCache {
+    const void *shape, *proto;
+    const void *final_shape; /* the shape of the constructed object, all fields added */
+    uint32_t slot, pic_epoch;
+} JSAotCtorCache;
+
+/* 1 when `new C(...)` now is described by the engine's own add-transition cells: a fresh
+   `this` has the shape the cell of `sites[0]` starts from, each cell of `sites[k]` leads to the
+   shape the next starts from, and no prototype interceptor appeared since they were filled.
+   A constructor that only stores its parameters into those fields in that order then makes an
+   object that is its arguments. Reads only; `cc` makes a repeated positive answer a few loads. */
+int qjs_aot_ctor_replayable(JSContext *ctx, JSObject *ctor, const uint16_t *sites, int n,
+                            JSAotCtorCache *cc);
 
 /* The allocating ops a compiled body runs without stepping the handler. Each does
    what the interpreter's handler does and returns 0 with an OWNED *out, or -1 on an
