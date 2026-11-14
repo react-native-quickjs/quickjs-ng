@@ -552,6 +552,10 @@ typedef enum JSRegOpcode {
     ROP_strict_eq, ROP_strict_neq, ROP_instanceof, ROP_in,
     ROP_neg, ROP_inc, ROP_dec, ROP_not, ROP_to_numeric,
 
+    /* Compact register forms: the same operations with every register operand
+       one byte wide, used when every physical register fits. */
+    ROP_load_i8_s, ROP_move_s,
+
     ROP_COUNT
 } JSRegOpcode;
 
@@ -595,7 +599,7 @@ enum { REG_CONST_CPOOL = 0, REG_CONST_ATOM };
 /* The register bytecode's format version, checked per function record before
    any instruction is parsed. Bump it whenever an opcode is added, removed or
    renumbered, or an operand's width or meaning changes. */
-#define REGVM_FORMAT_VERSION 10
+#define REGVM_FORMAT_VERSION 11
 
 /* ROP_get_field and ROP_put_field use this site index when the source
    instruction has no inline cache. */
