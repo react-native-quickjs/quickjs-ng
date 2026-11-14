@@ -117,6 +117,15 @@ static inline uint64_t js_cycles(void)
 typedef struct JSRegPIC JSRegPIC;
 typedef struct JSRegIR JSRegIR;
 typedef struct JSRegRCC JSRegRCC;
+/* An opcode's operand facts, derived from its format string (regvm_rop_fmt) by
+   js_regvm_rop_info_init when the runtime is created, so the compiler's
+   per-instruction loops read a table instead of walking the string. */
+typedef struct JSRegRopInfo {
+    uint8_t size[2]; /* operand bytes without the opcode, narrow then wide register form; 0xff: no format */
+    uint8_t rmask;   /* bit k: operand k is a register ('r') */
+    uint8_t narrow;  /* regvm_rop_narrow */
+} JSRegRopInfo;
+static void js_regvm_rop_info_init(JSRegRopInfo *ri);
 #endif
 
 /*
@@ -989,6 +998,9 @@ struct JSRuntime {
     /* Set by JS_FreeRuntime for its final collection: this runtime scans no native stack (every word on it is stale). A field of the runtime, not a
        process-wide variable: two threads tearing down their runtimes at once must not see each other's flag. */
     bool ss_final;
+#if QJS_REGVM
+    JSRegRopInfo regvm_rop_info[ROP_COUNT];
+#endif
 };
 
 #if QJS_REGVM_RECORD
@@ -4478,6 +4490,9 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
 
     init_list_head(&rt->context_list);
     init_list_head(&rt->gc_obj_list);
+#if QJS_REGVM
+    js_regvm_rop_info_init(rt->regvm_rop_info);
+#endif
     rt->gc_young_streak = 0;
     rt->gc_need_full = false;
     rt->gc_full_after = 0;
@@ -67365,6 +67380,7 @@ typedef struct JSRegIR {
     int aw_n;          /* number of values the index covers (0 = disabled) */
     int aw_scanned;    /* instructions already folded into the index */
     int aw_last_win;   /* last instruction naming the call window, or -1 */
+    const JSRegRopInfo *ri; /* the runtime's per-opcode operand facts */
 } JSRegIR;
 
 /* Net control-stack effect of one register instruction. Counting per stack
@@ -68008,6 +68024,25 @@ static int regvm_fmt_size(const char *fmt, int wide, uint16_t rop)
         }
     }
     return n;
+}
+
+static void js_regvm_rop_info_init(JSRegRopInfo *ri)
+{
+    int op, k;
+
+    for (op = 0; op < ROP_COUNT; op++) {
+        const char *fmt = regvm_rop_fmt[op];
+        int n0 = fmt ? regvm_fmt_size(fmt, 0, (uint16_t)op) : -1;
+        int n1 = fmt ? regvm_fmt_size(fmt, 1, (uint16_t)op) : -1;
+
+        ri[op].size[0] = n0 < 0 ? 0xff : (uint8_t)n0;
+        ri[op].size[1] = n1 < 0 ? 0xff : (uint8_t)n1;
+        ri[op].rmask = 0;
+        ri[op].narrow = (uint8_t)regvm_rop_narrow((uint16_t)op);
+        for (k = 0; fmt && fmt[k] && k < 8; k++)
+            if (fmt[k] == 'r')
+                ri[op].rmask |= (uint8_t)(1u << k);
+    }
 }
 
 #if QJS_REGVM
@@ -76201,11 +76236,11 @@ static void regvm_unmap_atoms(uint8_t *code, int len, int wide, int n,
 /* Does any instruction reference the reserved scratch register? */
 static int regvm_uses_scratch(const JSRegIR *ir)
 {
-    int i, k;
+    int i;
     for (i = 0; i < ir->n_insns; i++) {
-        const char *fmt = regvm_rop_fmt[ir->insns[i].rop];
-        for (k = 0; fmt && fmt[k]; k++)
-            if (fmt[k] == 'r' && ir->insns[i].ops[k] == REGVM_TEMP)
+        unsigned m = ir->ri[ir->insns[i].rop].rmask;
+        for (; m; m &= m - 1)
+            if (ir->insns[i].ops[ctz32(m)] == REGVM_TEMP)
                 return 1;
     }
     return 0;
@@ -78024,9 +78059,8 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
 
         code_len = 0;
         for (i = 0; i < ir->n_insns; i++) {
-            const char *fmt = regvm_rop_fmt[ir->insns[i].rop];
-            int sz = regvm_fmt_size(fmt, wide, ir->insns[i].rop);
-            if (sz < 0) {
+            int sz = ir->ri[ir->insns[i].rop].size[wide != 0];
+            if (sz == 0xff) {
                 JS_ThrowInternalError(ctx, "regvm: opcode %d has no format", ir->insns[i].rop);
                 goto done;
             }
@@ -78038,9 +78072,9 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
             const char *fmt = regvm_rop_fmt[in->rop];
             int sz;
 
-            if (!regvm_rop_narrow(in->rop))
+            if (!ir->ri[in->rop].narrow)
                 continue;
-            sz = regvm_fmt_size(fmt, wide, in->rop);
+            sz = ir->ri[in->rop].size[wide != 0];
             for (k = 0; fmt[k]; k++) {
                 int ti, off;
 
@@ -78096,7 +78130,7 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
     for (i = 0; i < ir->n_insns; i++) {
         JSRegInsn *in = &ir->insns[i];
         const char *fmt = regvm_rop_fmt[in->rop];
-        int nar = regvm_rop_narrow(in->rop);
+        int nar = ir->ri[in->rop].narrow;
 
         p = insn_pc[i];
         code[p++] = (uint8_t)in->rop;
@@ -78141,7 +78175,7 @@ static int regvm_encode_and_verify(JSContext *ctx, JSRegIR *ir, int wide,
                     rc = REGVM_REFUSED;
                     goto done;
                 }
-                off = insn_pc[ti] - (insn_pc[i] + 1 + regvm_fmt_size(fmt, wide, in->rop));
+                off = insn_pc[ti] - (insn_pc[i] + 1 + ir->ri[in->rop].size[wide != 0]);
                 if (nar)
                     code[p++] = (uint8_t)(int8_t)off;
                 else {
@@ -81364,6 +81398,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
     (void)reuse;
 
     ir.insns = NULL;
+    ir.ri = ctx->rt->regvm_rop_info;
     ir.n_insns = 0;
     ir.fuse_hint = 0;
     ir.cap = 0;
