@@ -75382,6 +75382,9 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
         !weak ||
         !init_set || !undef_set || !uni)
         goto done;
+    /* Both sets start empty: only registers proved to need a fill are marked. */
+    memset(init_set, REG_INIT_UNINIT, nreg);
+    memset(undef_set, REG_INIT_UNINIT, nreg);
 
     /* Block membership by source pc: the fusion passes append branch islands
        and stubs at the end of the IR with their block's `src_pc`, so the stream
@@ -76622,6 +76625,9 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
 
         if (bdef && bval && bpos && bcnt && touched && ins_lo && ins_hi && lreg) {
             int bb = 0;
+            /* The per-slot definition counters start at zero; only the touched
+               entries are reset after each block. */
+            memset(bcnt, 0, (size_t)(fd->var_count + 1) * sizeof(int));
             /* Bucket the instructions by block and record each block's
                contiguous range, so the per-block scans below touch each
                instruction once. */
