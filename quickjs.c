@@ -13783,16 +13783,17 @@ static JSAutoInitFunc *const js_autoinit_func_table[] = {
 };
 
 /* warning: 'prs' is reallocated after it */
-static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
-                               JSProperty *pr, JSShapeProperty *prs)
+static int js_autoinit_one(JSContext *ctx, JSObject *p, JSProperty *pr, JSShapeProperty *prs)
 {
     JSValue val;
     JSContext *realm;
     JSAutoInitFunc *func;
+    JSAtom prop;
 
     if (js_shape_prepare_update(ctx, p, &prs))
         return -1;
 
+    prop = prs->atom;
     realm = js_autoinit_get_realm(pr);
     func = js_autoinit_func_table[js_autoinit_get_id(pr)];
     /* 'func' shall not modify the object properties 'pr' */
@@ -13805,6 +13806,46 @@ static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
     js_aot_content_store(ctx->rt, p, (uint32_t)(pr - p->prop), val);
     pr->u.value = val;
     return 0;
+}
+
+/* A plain builtin namespace object (Math, JSON, Reflect, Atomics, ...) carries
+   one lazy function property per member. Each materialisation edits the shape
+   (a clone while a cache holds it), so a cache filled between two of them is
+   stale by the next: Math's shape changed three times in rayTrace's first call.
+   The first touch of any lazy member settles all of them, in definition order,
+   so the shape is final before any cache can name it. The values and their
+   order equal the eager definition. */
+static int js_builtin_settle_off = -1;
+
+static int JS_AutoInitProperty(JSContext *ctx, JSObject *p, JSAtom prop,
+                               JSProperty *pr, JSShapeProperty *prs)
+{
+    (void)prop;
+    if (js_autoinit_get_id(pr) == JS_AUTOINIT_ID_PROP &&
+        p->class_id == JS_CLASS_OBJECT && !p->is_exotic &&
+        p != JS_VALUE_GET_OBJ(ctx->global_obj) &&
+        p != JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_OBJECT])) {
+#ifdef QJS_KIT_TEST_KNOBS
+        if (js_builtin_settle_off < 0)
+            js_builtin_settle_off = getenv("QJS_NO_BUILTIN_SETTLE") != NULL;
+#else
+        js_builtin_settle_off = 0;
+#endif
+        if (!js_builtin_settle_off) {
+            uint32_t i, n = p->shape->prop_count;
+            for (i = 0; i < n; i++) {
+                JSShapeProperty *q = &get_shape_prop(p->shape)[i];
+                JSProperty *qr = &p->prop[i];
+                if ((q->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT &&
+                    js_autoinit_get_id(qr) == JS_AUTOINIT_ID_PROP) {
+                    if (js_autoinit_one(ctx, p, qr, q))
+                        return -1;
+                }
+            }
+            return 0;
+        }
+    }
+    return js_autoinit_one(ctx, p, pr, prs);
 }
 
 static int js_lazy_marker_is(JSValueConst v);
