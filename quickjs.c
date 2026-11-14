@@ -102002,7 +102002,8 @@ static int js_regexp_find_literal(const JSReReq *e, JSString *str, int from)
                 if (!p)
                     return -1;
             }
-            if (js_regexp_lit_at(e, str, (int)(p - s) - r))
+            if (e->r.ci ? js_regexp_lit_at(e, str, (int)(p - s) - r)
+                        : memcmp(p - r, e->lit8, m) == 0)
                 return (int)(p - s) - r;
             p++;
         }
@@ -102174,7 +102175,7 @@ js_regexp_exec_prepare(JSContext *ctx, JSRegExp *re, uint8_t **capture_stack,
     int alloc_count = lre_get_alloc_count(bytecode);
     uint8_t **capture = capture_stack;
 
-    if (alloc_count > (int)countof(capture_stack)) {
+    if (alloc_count > JS_REGEXP_CAPTURE_STACK_SIZE) {
         capture = js_malloc(ctx, sizeof(capture[0]) * alloc_count);
         if (!capture)
             return false;
