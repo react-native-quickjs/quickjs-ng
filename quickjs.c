@@ -67189,6 +67189,65 @@ QJS_AOT_STUB int qjs_aot_stack_migrate_child(JSContext *ctx, JSValue obj, JSValu
     return js_stack_migrate2(ctx, obj, JS_UNDEFINED, child, hobj, &ha, hchild);
 }
 
+/* Move a stack object that its owner lent to the running function, and the stack object one of its fields holds (if any), to the heap. The owner's frame outlives this call and tests
+   its lent blocks when the call returns, so each emptied block is left as a forward block: biased count (the release below does not change it), shape NULL (qjs_aot_stack_release drops
+   it), and the first slot (inside the block: the property array holds at least the shape's fields) a counted reference to the heap object, which the owner takes over. References to the heap
+   object after the call: the forward word holds one, *hobj holds one for the caller (who drops it once its own holders have taken theirs), and nothing else; to the heap child likewise. 1; or 0
+   with nothing moved and no forward word written, on an out-of-memory or when a second, different stack object is found in the fields (the owner's analysis makes none; the block is left
+   a valid lent block). */
+QJS_AOT_STUB int qjs_aot_stack_migrate_lent(JSContext *ctx, JSValue obj, JSValue *hobj, JSValue *hchild)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(obj), *c = NULL;
+    JSValue child = JS_UNDEFINED, ha;
+    int i, n = p->shape->prop_count;
+    assert(JS_REF_COUNT(p) >= JS_STACK_BIAS / 2 && n > 0);
+    for (i = 0; i < n; i++) {
+        JSValue v = p->prop[i].u.value;
+        if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && JS_REF_COUNT(JS_VALUE_GET_OBJ(v)) >= JS_STACK_BIAS / 2) {
+            if (c != NULL && c != JS_VALUE_GET_OBJ(v))
+                return 0;
+            c = JS_VALUE_GET_OBJ(v);
+            child = v;
+        }
+    }
+    if (!js_stack_migrate2(ctx, obj, JS_UNDEFINED, child, hobj, &ha, hchild))
+        return 0;
+    p->prop[0].u.value = JS_DupValue(ctx, *hobj);
+    if (c != NULL)
+        c->prop[0].u.value = JS_DupValue(ctx, *hchild);
+    return 1;
+}
+
+/* The callee's side of a lent argument: when *slot holds a live stack block (the owner lent it), move it to the heap (qjs_aot_stack_migrate_lent) and put the heap object in *slot, which holds no
+   reference of its own (the forward word keeps the object alive until the owner takes it); anything else is left alone. 1, or 0 with nothing moved on an out-of-memory. */
+QJS_AOT_STUB int qjs_aot_stack_unlend(JSContext *ctx, JSValue *slot)
+{
+    JSValue v = *slot, ho, hc;
+    JSObject *p;
+    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
+        return 1;
+    p = JS_VALUE_GET_OBJ(v);
+    if (JS_REF_COUNT(p) < JS_STACK_BIAS / 2 || p->shape == NULL)
+        return 1;
+    if (!qjs_aot_stack_migrate_lent(ctx, v, &ho, &hc))
+        return 0;
+    JS_FreeValue(ctx, hc);
+    JS_FreeValue(ctx, ho);
+    *slot = p->prop[0].u.value;
+    return 1;
+}
+
+/* The heap object a lent stack block was moved to (the forward word qjs_aot_stack_migrate_lent leaves), or `v` itself when it is not such a block. The reference stays with the block. */
+QJS_AOT_STUB JSValue qjs_aot_stack_forward(JSValue v)
+{
+    if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT) {
+        JSObject *p = JS_VALUE_GET_OBJ(v);
+        if (JS_REF_COUNT(p) >= JS_STACK_BIAS / 2 && p->shape == NULL)
+            return p->prop[0].u.value;
+    }
+    return v;
+}
+
 /* `a + b` where one side is a string and the other a string or a primitive whose string form runs no code (a number, a boolean,
    null, undefined). 1 with an owned *out, 0 for any other operands (nothing done), -1 with an exception pending. */
 QJS_AOT_STUB int qjs_aot_add_str(JSContext *ctx, JSValue a, JSValue b, JSValue *out)
