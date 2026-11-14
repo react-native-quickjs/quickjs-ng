@@ -349,6 +349,13 @@ int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out);
 int qjs_aot_object_template(JSContext *ctx, JSRegRun *f, int index, JSValue *out);
 int qjs_aot_special_object(JSContext *ctx, JSRegRun *f, int kind, JSValue *out);
 int qjs_aot_array_from(JSContext *ctx, JSValue *argv, int na, JSValue *out);
+/* `put_global`: the engine's global store of a borrowed value (it duplicates).
+   0, or -1 on an exception. */
+int qjs_aot_put_global(JSContext *ctx, int atom, JSValue v, int init);
+/* `load_const` of the constant pool (kind 0) or an atom (kind 1): 0 with an OWNED *out,
+   -1 on an exception. */
+int qjs_aot_load_const(JSContext *ctx, JSRegRun *f, int kind, uint32_t idx, JSValue *out);
+
 /* Fills an object literal's properties from `n` registers (`object_fill`): the
    template's shape when the object still has it, else property definitions. The
    registers are left undefined, as the handler leaves them. 0, or -1 on an exception. */
