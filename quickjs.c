@@ -65100,6 +65100,13 @@ static void js_aot_prof_free(JSRuntime *rt, JSFunctionBytecode *b)
             if (pf->pcs[pi].rshape != NULL)
                 js_free_shape(rt, pf->pcs[pi].rshape);
     }
+    if (pf->sites != NULL) {
+        int si, sj;
+        for (si = 0; si < pf->nsites; si++)
+            for (sj = 0; sj < pf->sites[si].nshapes; sj++)
+                if (pf->sites[si].shapes[sj] != NULL)
+                    js_free_shape(rt, pf->sites[si].shapes[sj]);
+    }
     js_free_rt(rt, pf->pcs);
     js_free_rt(rt, pf->cov);
     js_free_rt(rt, pf->br_taken);
