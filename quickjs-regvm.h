@@ -616,7 +616,7 @@ enum { REG_CONST_CPOOL = 0, REG_CONST_ATOM };
 /* The register bytecode's format version, checked per function record before
    any instruction is parsed. Bump it whenever an opcode is added, removed or
    renumbered, or an operand's width or meaning changes. */
-#define REGVM_FORMAT_VERSION 15
+#define REGVM_FORMAT_VERSION 16
 
 /* ROP_get_field and ROP_put_field use this site index when the source
    instruction has no inline cache. */
