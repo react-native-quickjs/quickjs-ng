@@ -65511,6 +65511,75 @@ static int aot_proto_ctor_digest(JSRuntime *rt, JSObject *po, uint8_t dg[16])
     return found;
 }
 
+/* A STABLE key of a prototype object, identical across processes (the profile is written by one process and read by the generator, another, so a
+   pointer is useless): FNV-1a 64 over the prototype's identity-by-construction -- its own properties in shape order (name, attribute flags, and for
+   a data property the digest of a bytecode function it holds or a one-letter kind of any other value, never the value itself, which a program may
+   change), then the key of its own prototype, to a depth of 3. A class prototype is thus keyed by its methods' digests and names; a prototype
+   replaced by a literal (`C.prototype = {...}`) by the literal's property names and function digests; Object.prototype and Array.prototype by the
+   engine's own fixed property list. Two prototypes of one class made from the same code get one key (they are one class). No JS runs: only own
+   plain data properties are looked at. Printed as `pk=<16 hex>`; the reader compares keys, nothing else. */
+static uint64_t aot_pk_mix(uint64_t h, const void *p, size_t n)
+{
+    const unsigned char *b = p;
+    while (n--) { h ^= *b++; h *= 0x100000001b3ULL; }
+    return h;
+}
+
+static uint64_t aot_proto_key(JSContext *ctx, JSObject *po, int depth)
+{
+    uint64_t h = 0xcbf29ce484222325ULL;
+    JSShape *sh;
+    uint32_t k;
+
+    if (po == NULL)
+        return 0;
+    sh = po->shape;
+    for (k = 0; k < (uint32_t)sh->prop_count; k++) {
+        JSShapeProperty *pr = &get_shape_prop(sh)[k];
+        unsigned char fl;
+        char kind = 'o';
+        if (pr->atom == JS_ATOM_NULL)
+            continue;
+        if (ctx != NULL) {
+            const char *nm = JS_AtomToCString(ctx, pr->atom);
+            if (nm != NULL) {
+                h = aot_pk_mix(h, nm, strlen(nm));
+                JS_FreeCString(ctx, nm);
+            }
+        }
+        fl = (unsigned char)(pr->flags & (JS_PROP_WRITABLE | JS_PROP_ENUMERABLE | JS_PROP_CONFIGURABLE | JS_PROP_TMASK));
+        h = aot_pk_mix(h, &fl, 1);
+        if ((pr->flags & JS_PROP_TMASK) == JS_PROP_NORMAL && !po->is_exotic) {
+            JSValue v = po->prop[k].u.value;
+            switch (JS_VALUE_GET_TAG(v)) {
+            case JS_TAG_OBJECT: {
+                JSObject *o = JS_VALUE_GET_OBJ(v);
+                if (o->class_id == JS_CLASS_BYTECODE_FUNCTION) {
+                    uint8_t d[16];
+                    js_aot_digest(o->u.func.function_bytecode, d);
+                    h = aot_pk_mix(h, d, 16);
+                    kind = 'f';
+                } else {
+                    kind = o->class_id == JS_CLASS_C_FUNCTION ? 'n' : 'O';
+                }
+                break;
+            }
+            case JS_TAG_INT: case JS_TAG_FLOAT64: kind = 'i'; break;
+            case JS_TAG_STRING: kind = 's'; break;
+            default: kind = 'p'; break;
+            }
+        } else {
+            kind = 'a';
+        }
+        h = aot_pk_mix(h, &kind, 1);
+    }
+    if (depth > 0 && po->shape->proto != NULL) {
+        uint64_t up = aot_proto_key(ctx, po->shape->proto, depth - 1);
+        h = aot_pk_mix(h, &up, sizeof(up));
+    }
+    return h;
+}
+
 /* The shape table the generator reads: one `P` line per distinct shape a field
    site observed, printed once, with the prototype it belongs to and its ordered
    property list. A site's `shape%d=` entry carries the table index instead of a
@@ -65598,6 +65667,7 @@ static void aot_dump_shapes(FILE *f, JSRuntime *rt, JSContext *ctx)
         }
         if (sh->aot_prof_seen & 2)
             fprintf(f, " isproto=1");
+        fprintf(f, " pk=%016llx", (unsigned long long)(sh->proto != NULL ? aot_proto_key(ctx, sh->proto, 3) : 0));
         fprintf(f, " n=%d props=", (int)sh->prop_count);
         for (k = 0; k < (uint32_t)sh->prop_count; k++) {
             JSShapeProperty *pr = &get_shape_prop(sh)[k];
