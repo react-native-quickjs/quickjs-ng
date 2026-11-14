@@ -7,7 +7,23 @@
 #include <stdint.h>
 #include "quickjs.h"
 
-/* One AOT-eligible function, flattened out of the engine's bytecode. */
+/* Why a function did not make it into the unit. Only AOT_GEN_ELIGIBLE has
+   meaningful `code`/`len`; the others carry a stack-bytecode length for the
+   census. */
+enum {
+    AOT_GEN_ELIGIBLE = 0,
+    AOT_GEN_REF_LAZY,    /* body still in the source blob */
+    AOT_GEN_REF_REGVM,   /* register backend refused it (with/eval/complex) */
+    AOT_GEN_REF_EMPTY,   /* compiled, but an empty program */
+    AOT_GEN_REF_TOO_BIG, /* register program over AOT_GEN_MAX_LEN bytes */
+    AOT_GEN_REF_REASON_COUNT
+};
+
+/* Refuse very large bodies: one emitted step body per instruction would
+   balloon the unit. */
+#define AOT_GEN_MAX_LEN (1 << 18)
+
+/* One function flattened out of the engine's bytecode (eligible or refused). */
 typedef struct JSAotGenFunc {
     uint8_t digest[16];        /* the binding key */
     uint32_t code_crc;         /* IRVERIFY hash of the register program */
@@ -19,16 +35,16 @@ typedef struct JSAotGenFunc {
     int var_count;
     int defined_arg_count;
     int func_kind;
+    int eligible;              /* AOT_GEN_ELIGIBLE or an AOT_GEN_REF_* reason */
+    int stack_len;             /* stack bytecode length when refused, else 0 */
     const uint8_t *code;       /* the register program; owned by the runtime */
     char name[128];
     char file[256];
 } JSAotGenFunc;
 
-/*
- * Collect every AOT-eligible function in `rt`. Returns the count and stores a
- * malloc'd array in *pout (release with js_aot_gen_free). Zero with *pout NULL
- * on allocation failure.
- */
+/* Collect every function bytecode in `rt`, eligible or not. Returns the count
+   and a malloc'd array in *pout (release with js_aot_gen_free); zero with
+   *pout NULL on allocation failure. */
 int js_aot_gen_collect(JSRuntime *rt, JSAotGenFunc **pout);
 void js_aot_gen_free(JSRuntime *rt, JSAotGenFunc *arr);
 

@@ -27129,11 +27129,25 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
 #if QJS_AOT
         /* AOT entry. A bound function is never record-eligible, so its calls
            reach this path. The generated unit owns the frame from here and
-           returns a value or JS_EXCEPTION; on an exception it has already
-           walked the control stack, so `exception` just propagates. */
-        if (unlikely(b->aot_fn != NULL && regvm_resume_marker == NULL)) {
+           returns a value, JS_EXCEPTION, or a parked generator/async frame. A
+           resume re-enters here: the marker is an instruction start, so the
+           unit jumps to it. */
+        if (unlikely(b->aot_fn != NULL)) {
+            uint32_t aot_entry_pc = 0;
+            if (regvm_resume_marker != NULL)
+                aot_entry_pc = (uint32_t)(regvm_resume_marker - b->regvm_code);
             js_aot_enter_count++;
-            ret_val = ((JSAotFn)b->aot_fn)(ctx, &run, regs, 0);
+            run.resume_marker = regvm_resume_marker;
+            ret_val = ((JSAotFn)b->aot_fn)(ctx, &run, regs, aot_entry_pc);
+            regvm_resume_marker = run.resume_marker;
+            /* Every exit of a generator/async body hands the parked frame to
+               the machinery, as done_generator does. The test is the call flag,
+               not the kind: a module body takes the ordinary exit. */
+            if (unlikely(run.flags & JS_CALL_FLAG_GENERATOR)) {
+                pc = run.sf->cur_pc;
+                sp = run.sf->cur_sp;
+                goto done_generator;
+            }
             if (likely(!JS_IsException(ret_val)))
                 goto done;
             goto exception;
@@ -55545,8 +55559,7 @@ static void js_aot_bind(JSFunctionBytecode *b)
     b->aot_state = 2;           /* known-absent until a match is found */
     if (!aot_unit_present())
         return;
-    if (!b->regvm_compiled || b->regvm_len <= 0 ||
-        b->func_kind != JS_FUNC_NORMAL)
+    if (!b->regvm_compiled || b->regvm_len <= 0 || b->is_lazy)
         return;
     js_aot_digest(b, digest);
     lo = 0;
@@ -55601,6 +55614,14 @@ JSValue qjs_aot_unwind(JSContext *ctx, JSRegRun *f, JSValue *fr,
     JSRuntime *rt = ctx->rt;
 
     (void)pc;
+#ifdef AOT_MUT_SKIP_UNWIND
+    /* Gate mutant: never look for a handler, so every exception leaving an AOT
+       body is uncaught. Test-only. */
+    (void)fr;
+    (void)resume_pc;
+    f->nctl = 0; /* drop the handlers so the exception cannot be caught */
+    return JS_EXCEPTION;
+#endif
     if (needs_backtrace(rt->current_exception)) {
         f->sf->cur_pc = NULL;
         build_backtrace(ctx, rt->current_exception, JS_UNDEFINED,
@@ -55646,12 +55667,6 @@ JSValue qjs_aot_unwind(JSContext *ctx, JSRegRun *f, JSValue *fr,
 /* ------------------------------------------------------------------------ */
 #include "quickjs-aot-gen.h"
 
-static int aot_gen_eligible(JSFunctionBytecode *b)
-{
-    return b->regvm_compiled && b->regvm_len > 0 &&
-           b->func_kind == JS_FUNC_NORMAL && !b->is_lazy;
-}
-
 int js_aot_gen_collect(JSRuntime *rt, JSAotGenFunc **pout)
 {
     JSAotGenFunc *arr = NULL;
@@ -55670,8 +55685,6 @@ int js_aot_gen_collect(JSRuntime *rt, JSAotGenFunc **pout)
             if (JS_GC_TYPE(gp) != JS_GC_OBJ_TYPE_FUNCTION_BYTECODE)
                 continue;
             b = (JSFunctionBytecode *)gp;
-            if (!aot_gen_eligible(b))
-                continue;
             if (n == cap) {
                 JSAotGenFunc *na;
                 cap = cap ? cap * 2 : 64;
@@ -55684,20 +55697,39 @@ int js_aot_gen_collect(JSRuntime *rt, JSAotGenFunc **pout)
             }
             g = &arr[n];
             memset(g, 0, sizeof(*g));
-            js_aot_digest(b, g->digest);
-            g->code_crc = js_aot_code_crc(b);
-            g->len = b->regvm_len;
-            g->reg_count = b->regvm_reg_count;
-            g->ctl_count = b->regvm_ctl_count;
-            g->pic_count = b->regvm_pic_count;
             g->arg_count = b->arg_count;
             g->var_count = b->var_count;
             g->defined_arg_count = b->defined_arg_count;
             g->func_kind = b->func_kind;
-            g->code = b->regvm_code;
             JS_AtomGetStrRT(rt, g->name, sizeof(g->name), b->func_name);
             if (b->filename != JS_ATOM_NULL)
                 JS_AtomGetStrRT(rt, g->file, sizeof(g->file), b->filename);
+
+            /* Classify for the census. The digest is computed for every
+               materialized body, so a profile can be joined by digest. */
+            if (b->is_lazy) {
+                g->eligible = AOT_GEN_REF_LAZY;
+            } else if (!b->regvm_compiled) {
+                g->eligible = AOT_GEN_REF_REGVM;
+                g->stack_len = b->byte_code_len;
+            } else if (b->regvm_len <= 0) {
+                g->eligible = AOT_GEN_REF_EMPTY;
+                g->stack_len = b->byte_code_len;
+                js_aot_digest(b, g->digest);
+            } else if (b->regvm_len > AOT_GEN_MAX_LEN) {
+                g->eligible = AOT_GEN_REF_TOO_BIG;
+                g->stack_len = b->byte_code_len;
+                js_aot_digest(b, g->digest);
+            } else {
+                g->eligible = AOT_GEN_ELIGIBLE;
+                js_aot_digest(b, g->digest);
+                g->code_crc = js_aot_code_crc(b);
+                g->len = b->regvm_len;
+                g->reg_count = b->regvm_reg_count;
+                g->ctl_count = b->regvm_ctl_count;
+                g->pic_count = b->regvm_pic_count;
+                g->code = b->regvm_code;
+            }
             n++;
         }
     }
