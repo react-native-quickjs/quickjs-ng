@@ -38004,6 +38004,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 js_aot_enter_count++;
                 if (unlikely(y_formless) && aot_entry_pc == 0) {
                     int nr = regvm_frame_regs(b), k;
+                    Y_FORMLESS_ARGS(this_obj, argv, argc);
                     for (k = 0; k < nr; k++)
                         if (JS_VALUE_GET_TAG(regs[k]) == JS_TAG_OBJECT && Y_IS(JS_VALUE_GET_PTR(regs[k])) && Y_YOUNG(JS_VALUE_GET_PTR(regs[k])))
                             y_promote_now(JS_VALUE_GET_OBJ(regs[k]));
