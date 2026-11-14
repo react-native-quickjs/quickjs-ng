@@ -4683,7 +4683,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_put_field(uint8_t *ip, JSValue *fr, JSRegRu
                             int ah;
                             REGVM_CAPTURE_IP_MONO(rpc - 1);
                             ah = regvm_put_field_add_hit(ctx, b, pic, p,
-                                                         regs[v], site);
+                                                         regs[v], site, 1);
                             if (ah > 0)
                                 REGVM_NEXT();
                             if (ah < 0)
