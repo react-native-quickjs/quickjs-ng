@@ -80199,6 +80199,12 @@ typedef struct JSRegSlotSim {
        hook records a permutation here (see JSRegBScratch). A field rather than
        a regvm_sim_step parameter, so the walks keep their signatures. */
     void *owner;
+    /* Optional, for the SSA sweep: ver_read[v] marks a version whose home_of
+       entry a split test read during the sweep, and *ver_dirty is set when such
+       an entry changes later in the same sweep. A clean sweep read only final
+       entries. */
+    uint8_t *ver_read;
+    int *ver_dirty;
 } JSRegSlotSim;
 
 /* The state observed at one bytecode step, so the liveness and allocation
@@ -80233,6 +80239,14 @@ static void regvm_note_version_raw(int *home_of, int n_values, int v, int k)
 
 static void regvm_note_version(JSRegSlotSim *sim, int v, int k)
 {
+    if (sim->ver_read && sim->home_of && v >= 0 && v < sim->n_values &&
+        sim->ver_read[v]) {
+        int old = sim->home_of[v];
+        regvm_note_version_raw(sim->home_of, sim->n_values, v, k);
+        if (sim->home_of[v] != old)
+            *sim->ver_dirty = 1;
+        return;
+    }
     regvm_note_version_raw(sim->home_of, sim->n_values, v, k);
 }
 
@@ -80342,6 +80356,8 @@ static int regvm_sim_step(const JSFunctionDef *fd, const uint8_t *bc, int pos,
     if (sim->split_of && sim->split_of[pos] >= 0 && ev->home_k >= 0) {
         int cur = sim->sval[ev->home_k];
         int split = 0;
+        if (sim->ver_read && cur >= 0 && cur < sim->n_values)
+            sim->ver_read[cur] = 1;
         if (cur >= 0 && cur < sim->n_values && sim->home_of &&
             sim->home_of[cur] == ev->home_k) {
             for (i = 0; i < d; i++) {
@@ -82694,6 +82710,8 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
     int *bof = NULL, *bstart = NULL, *succ = NULL, *exc = NULL;
     int *in_depth = NULL, *out_depth = NULL, *bterm = NULL;
     JSRegSimLog slog = { 0 };
+    uint8_t *ver_read = NULL;
+    int ver_dirty = 0, ssa_acyclic = 0, ssa_logged = 0;
     int *pred_off = NULL, *pred = NULL, *n_pred = NULL;
     int *ent_off = NULL, *ent = NULL, *out_off = NULL, *out = NULL;
     int *phi_b = NULL, *phi_i = NULL, *scratch = NULL, *popbuf = NULL;
@@ -83552,9 +83570,36 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
     for (i = 0; i < out_pool; i++)
         out[i] = -1;
 
+    /* Each sweep records its simulation (see JSRegSimLog) and notes whether a
+       split test read a home_of entry that changed later in the same sweep.
+       When every predecessor precedes its block (an acyclic CFG in sweep
+       order), a clean sweep has merged final predecessor outputs and read
+       final entries, so the sweep after it would repeat it exactly: the
+       fixed point is reached without that confirming sweep. The record of
+       the last sweep, when clean, is the liveness walk's simulation. */
+    ssa_acyclic = 1;
+    for (b = 0; b < n_blocks && ssa_acyclic; b++)
+        for (k = pred_off[b]; k < pred_off[b + 1]; k++)
+            if (pred[k] >= b) {
+                ssa_acyclic = 0;
+                break;
+            }
+    ver_read = js_malloc(ctx, (size_t)(n_ver > 0 ? n_ver : 1));
+    if (!ver_read)
+        goto done;
+    slog.rec_of_pc = js_malloc(ctx, (size_t)(bc_len > 0 ? bc_len : 1) * sizeof(int));
+    if (slog.rec_of_pc) {
+        for (i = 0; i < bc_len; i++)
+            slog.rec_of_pc[i] = -1;
+        slog.ok = 1;
+    }
     /* Operand-stack SSA to a fixed point. */
     for (iter = 0; iter < REGVM_MAX_ITERS; iter++) {
         changed = 0;
+        ver_dirty = 0;
+        memset(ver_read, 0, (size_t)(n_ver > 0 ? n_ver : 1));
+        slog.n_rec = 0;
+        slog.n_val = 0;
         /* Merge and simulate in one ascending sweep: a block merges its
            predecessors' outputs from this pass, so a straight-line chain
            settles in one pass and only back edges carry values from the
@@ -83683,10 +83728,12 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                 JSRegStepEv ev;
                 JSRegSlotSim sim = { slot_ok, ok_index, sst, home_of, n_ver,
                                      split_of, copy_of, home_slot_of_def,
-                                     home_mode >= 1, 0, NULL };
+                                     home_mode >= 1, 0, NULL, ver_read,
+                                     &ver_dirty };
                 if (regvm_sim_step(fd, bc, pos, scratch, &d, push_base, &sim,
                                    pv, pdef, &ev, popbuf, popcap, NULL, NULL))
                     REGVM_DEFER("the stack-shape simulator refused an instruction (SSA)");
+                regvm_simlog_add(ctx, &slog, pos, &ev, pv, pdef);
             }
             if (d != out_depth[b]) {
                 JS_ThrowInternalError(ctx, "regvm: CFG depth drifted at pc=%d", bstart[b]);
@@ -83699,9 +83746,18 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
         }
         if (!changed)
             break;
+        if (ssa_acyclic && !ver_dirty && iter + 1 < REGVM_MAX_ITERS)
+            break;
     }
     if (iter == REGVM_MAX_ITERS)
         REGVM_DEFER("the SSA did not settle");
+    /* The last sweep's record serves the liveness walk only when it was clean;
+       otherwise liveness simulates and records afresh. */
+    ssa_logged = slog.ok && !ver_dirty;
+    if (!ssa_logged) {
+        slog.n_rec = 0;
+        slog.n_val = 0;
+    }
 
     /* Every reachable block must have a complete promoted-slot entry state.
        Convergence guarantees it; this is a failsafe that refuses the function.
@@ -83807,12 +83863,6 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
         memset(live_in, 0, nbits);
         memset(live_out, 0, nbits);
 
-        slog.rec_of_pc = js_malloc(ctx, (size_t)(bc_len > 0 ? bc_len : 1) * sizeof(int));
-        if (slog.rec_of_pc) {
-            for (i = 0; i < bc_len; i++)
-                slog.rec_of_pc[i] = -1;
-            slog.ok = 1;
-        }
         for (b = 0; b < n_blocks; b++) {
             int d;
             uint64_t *U, *D;
@@ -83862,10 +83912,17 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
                 JSRegSlotSim sim = { slot_ok, ok_index, sst, home_of, n_ver,
                                      split_of, copy_of, home_slot_of_def,
                                      home_mode >= 1, 0, NULL };
-                if (regvm_sim_step(fd, bc, pos, scratch, &d, push_base, &sim,
-                                   pv, pdef, &ev, popbuf, popcap, NULL, NULL))
-                    REGVM_DEFER("the stack-shape simulator refused an instruction (liveness)");
-                regvm_simlog_add(ctx, &slog, pos, &ev, pv, pdef);
+                if (ssa_logged) {
+                    if (regvm_sim_replay(&slog, fd, bc, pos, scratch, &d,
+                                         push_base, &sim, pv, pdef, &ev, popbuf,
+                                         popcap))
+                        REGVM_DEFER("the stack-shape simulator refused an instruction (liveness)");
+                } else {
+                    if (regvm_sim_step(fd, bc, pos, scratch, &d, push_base, &sim,
+                                       pv, pdef, &ev, popbuf, popcap, NULL, NULL))
+                        REGVM_DEFER("the stack-shape simulator refused an instruction (liveness)");
+                    regvm_simlog_add(ctx, &slog, pos, &ev, pv, pdef);
+                }
                 prom_role = ev.slot_role;
                 prom_k = ev.slot_k;
                 if (sim.apply_homes && ev.split_v >= 0) {
@@ -85094,6 +85151,7 @@ static __exception int js_regvm_build_cfg(JSContext *ctx, JSFunctionDef *fd,
     js_free(ctx, out_depth);
     js_free(ctx, bterm);
     regvm_simlog_free(ctx, &slog);
+    js_free(ctx, ver_read);
     js_free(ctx, n_pred);
     js_free(ctx, pred_off);
     js_free(ctx, pred);
