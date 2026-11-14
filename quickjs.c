@@ -18206,6 +18206,9 @@ static int64_t js_arr_packed_find(const JSObject *p, JSValueConst target, int64_
 }
 #endif
 
+/* Stores val at idx past the end of a fast array, leaving holes in the gap. Takes val on every path: 1 stored it, -1 is an
+   exception, 0 declines (the gap is too large or too sparse, or length is not a writable int) and frees it; the caller then
+   converts the array and stores its own reference. */
 static int js_array_store_hole_gap(JSContext *ctx, JSObject *p, uint32_t idx,
                                    JSValue val)
 {
@@ -18218,20 +18221,20 @@ static int js_array_store_hole_gap(JSContext *ctx, JSObject *p, uint32_t idx,
     count = p->u.array.count;
     gap = idx - count;
     if (gap > JS_ARRAY_HOLE_MAX_GAP)
-        return 0;
+        goto decline;
     if (idx >= (uint32_t)INT32_MAX)
-        return 0;
+        goto decline;
     new_count = idx + 1;
     elems = new_count - ((p->holey ? p->u.array.hole_count : 0) + gap);
     if (new_count > JS_ARRAY_HOLE_DENSE_FLOOR &&
         elems * (uint64_t)JS_ARRAY_HOLE_MIN_DENSITY < new_count)
-        return 0;
+        goto decline;
     if (unlikely(JS_VALUE_GET_TAG(p->prop[0].u.value) != JS_TAG_INT))
-        return 0;
+        goto decline;
     array_len = JS_VALUE_GET_INT(p->prop[0].u.value);
     if (new_count > array_len &&
         unlikely(!(get_shape_prop(p->shape)->flags & JS_PROP_WRITABLE)))
-        return 0;
+        goto decline;
     if (new_count > p->u.array.u1.size) {
         if (expand_fast_array(ctx, p, new_count)) {
             JS_FreeValue(ctx, val);
@@ -18250,6 +18253,9 @@ static int js_array_store_hole_gap(JSContext *ctx, JSObject *p, uint32_t idx,
     }
     p->u.array.hole_count += gap;
     return 1;
+ decline:
+    JS_FreeValue(ctx, val);
+    return 0;
 }
 
 static void js_array_fill_hole(JSObject *p, uint32_t idx, JSValue val)
