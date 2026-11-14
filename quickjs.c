@@ -23530,7 +23530,6 @@ _Static_assert(JS_TAG_FIRST < 0 && JS_TAG_INT == 0,
 #define REGVM_HAS_COUNT(v) JS_VALUE_HAS_REF_COUNT(v)
 #endif
 
-#if QJS_REGVM_THREAD
 /*
  * --- the threaded interpreter -------------------------------------------
  *
@@ -23553,7 +23552,7 @@ _Static_assert(JS_TAG_FIRST < 0 && JS_TAG_INT == 0,
  *
  * Off by default: the default build compiles none of this.
  */
-#if QJS_REGVM_ASM
+#if QJS_REGVM_THREAD && QJS_REGVM_ASM
 #error "QJS_REGVM_THREAD and QJS_REGVM_ASM are two designs for the same loop"
 #endif
 
@@ -23574,6 +23573,11 @@ _Static_assert(JS_TAG_FIRST < 0 && JS_TAG_INT == 0,
 
 typedef struct JSRegRun {
     JSContext *ctx;
+    /* The caller's realm. The monolith's bodies throw through it rather than
+       the callee's `ctx`: a derived-constructor return check throws in the
+       realm of the code that ran `new C()`. The step twins and
+       `regvm_exec_one`'s cold arms both read it here. */
+    JSContext *caller_ctx;
     JSFunctionBytecode *b;
     JSRegPIC *pic;              /* register VM property-cache base for this frame */
     JSStackFrame *sf;
@@ -23629,6 +23633,10 @@ typedef struct JSRegRun {
     int       rcc_prev;         /* record index of the previous instruction */
     const uint8_t *rcc_ip;      /* its code address, for the report */
 #endif
+    /* The step engine's coroutine resume marker (the monolith keeps its own in
+       a local). A yield/await twin compares it with the instruction's address
+       to tell a resume from a fresh suspension. */
+    uint8_t *resume_marker;
 } JSRegRun;
 
 #if REGVM_SLIM_FRAME
@@ -23673,6 +23681,20 @@ typedef uint8_t *(*regvm_handler)(uint8_t *ip, JSValue *fr, JSRegRun *f,
 
 #define REGVM_ARGS  uint8_t *ip, JSValue *fr, JSRegRun *f, JSContext *ctx
 #define REGVM_PASS  ip, fr, f, ctx
+
+/* Returned by `regvm_exec_one` for a tail call. A record frame has a caller,
+   so leaving it means handing the value in `f->ret` to the caller through
+   `regvm_t_return_common`. `NULL` already means a throw, and no real
+   instruction pointer is 1. */
+#define REGVM_COLD_RET ((uint8_t *)1)
+
+/* Returned by a `regvm_step` twin that parks the frame (yield, await, a
+   generator's return). The continuation is in `sf->cur_pc`, the handshake
+   slots are filled, and `rf->ret` holds the code the generator machinery
+   reads. */
+#define REGVM_STEP_SUSPEND ((uint8_t *)2)
+
+#if QJS_REGVM_THREAD
 
 /*
  * Instruction sizes: one opcode byte plus two bytes per `r`/`u`/`s` operand and
@@ -24229,12 +24251,6 @@ regvm_record_release(JSRuntime *rt, JSRegRun *rec);
  */
 static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                                JSContext *ctx);
-
-/* Returned by `regvm_exec_one` for a tail call. A record frame has a caller,
-   so leaving it means handing the value in `f->ret` to the caller through
-   `regvm_t_return_common`. `NULL` already means a throw, and no real
-   instruction pointer is 1. */
-#define REGVM_COLD_RET ((uint8_t *)1)
 
 static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_cold_slow(REGVM_ARGS)
 {
@@ -26788,6 +26804,11 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
 
 #endif /* QJS_REGVM_INLOOP_CALL */
 
+/* The single-instruction entry, defined in quickjs-regvm-step.inc, which is
+   included after js_regvm_execute while the RD_* and SET_REG_* macros are
+   still defined. Declared here for the QJS_REGVM_STEPCHECK loop. */
+uint8_t *regvm_step(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx);
+
 #if QJS_REGVM_ASM
 static __attribute__((used)) int js_regvm_execute(JSRegAsmState *ast)
 #else
@@ -26885,11 +26906,12 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
            step. */
         JSRegFrame *regvm_frame = NULL;
 #endif
-#if QJS_REGVM_THREAD
+#if QJS_REGVM_THREAD || QJS_REGVM_STEPCHECK
         /* Filled once per activation. The handlers only read these, and all are
            fixed for the activation (the var_refs pointer too, though not its
            contents). */
         JSRegRun run;
+        run.caller_ctx = caller_ctx;
 #ifdef QJS_REGVM_RCCHECK
         run.ctx = ctx;
 #endif
@@ -26924,7 +26946,10 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
         run.local_buf = local_buf;
         run.local_count = 0;
         run.arg_owned = arg_owned;
+        run.resume_marker = NULL;
+#if QJS_REGVM_THREAD
         REGVM_T_CHECK_SIZES();
+#endif
 #endif
 /* Register operands are always two bytes: a register operand is one load and
    the advance is a constant. */
@@ -27044,12 +27069,13 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
         }
         sp = regs + b->regvm_reg_count + REGVM_HS - 1;
         regvm_ctl = (JSRegCtl *)(sf->var_refs + b->var_ref_count);
-#if QJS_REGVM_THREAD
+#if QJS_REGVM_THREAD || QJS_REGVM_STEPCHECK
         /* From here the monolith's control stack is the entry record's: cold
            opcodes run in the chain's arms, which write `f->ctl`/`f->nctl` with
            `f == &run`, so a separate copy of the depth would drift. */
         run.ctl = regvm_ctl;
         run.nctl = regvm_nctl;
+        run.resume_marker = NULL;
 #define regvm_ctl (run.ctl)
 #define regvm_nctl (run.nctl)
 #endif
@@ -27615,13 +27641,49 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
 #if QJS_REGVM_ASM
      regvm_stretch:
 #endif
+#if !QJS_REGVM_STEPCHECK
         REGVM_NEXT();
+#endif
  regvm_resume:
+#if QJS_REGVM_STEPCHECK
+        /* Step self-check: the dispatch is one regvm_step call per instruction.
+           The monolith arms below stay compiled but are unreachable. */
+        for (;;) {
+            uint8_t *nip;
+
+            if (regvm_resume_pending) {
+                rpc = regvm_rpc;
+                regvm_resume_pending = 0;
+            }
+            AOT_PROF_OP(b, rpc);
+            run.resume_marker = regvm_resume_marker;
+            nip = regvm_step(rpc, regs, &run, ctx);
+            regvm_resume_marker = run.resume_marker;
+            if (nip == NULL) {
+                ret_val = run.ret;
+                goto exception;
+            }
+            if (nip == REGVM_COLD_RET) {
+                ret_val = run.ret;
+                if (likely(!JS_IsException(ret_val)))
+                    goto done;
+                goto exception;
+            }
+            if (nip == REGVM_STEP_SUSPEND) {
+                pc = sf->cur_pc;
+                sp = sf->cur_sp;
+                ret_val = run.ret;
+                goto done_generator;
+            }
+            rpc = nip;
+        }
+#else
         if (regvm_resume_pending) {
             rpc = regvm_rpc;
             regvm_resume_pending = 0;
         }
         REGVM_NEXT();
+#endif
             L_ROP_load_i8:
                 { int d = RD_REG(); SET_REG_P(d, js_int32((int8_t)RD_U8())); REGVM_NEXT(); }
             L_ROP_load_i8_s:
@@ -30390,6 +30452,11 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
 #endif
     }
 }
+
+/* The step engine: the monolith's `L_ROP_*` bodies recompiled with
+   `REGVM_NEXT()` = `return rpc`, so each runs one instruction. Included here,
+   while the RD_* and SET_REG_* macros and the frame layout are in scope. */
+#include "quickjs-regvm-step.inc"
 
 #if QJS_REGVM_THREAD
 /*
@@ -53740,6 +53807,16 @@ static int regvm_homes_mode(void)
  */
 #ifndef QJS_REGVM_THREAD
 #define QJS_REGVM_THREAD 0
+#endif
+
+/* Step self-check: the monolith's dispatch is replaced by one `regvm_step`
+   call per instruction, so every step helper runs under test262. A test
+   configuration, off by default. */
+#ifndef QJS_REGVM_STEPCHECK
+#define QJS_REGVM_STEPCHECK 0
+#endif
+#if QJS_REGVM_STEPCHECK && QJS_REGVM_THREAD
+#error "QJS_REGVM_STEPCHECK replaces the monolith dispatch; it cannot be combined with QJS_REGVM_THREAD"
 #endif
 
 #ifndef QJS_REGVM_INLOOP_CALL
