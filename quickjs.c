@@ -11545,6 +11545,69 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
     }
 }
 
+/* mark_children for the commonest garbage and live data: a plain object or a fast Array without weak references. The shape, the data properties and (for an
+   Array) the elements are marked in a loop the compiler specialises for the mark function it is called with (gc_decref_child, gc_scan_incref_child,
+   gc_scan_incref_child2); a property that is not plain data (accessor, var_ref, autoinit) takes mark_children's own code. Marks the same set of references, in the same
+   order, as mark_children. Returns 0 (nothing done) for any other object. */
+static void mark_prop_special(JSRuntime *rt, JSProperty *pr, JSShapeProperty *prs, JS_MarkFunc *mark_func)
+{
+    if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
+        if (pr->u.getset.getter)
+            mark_func(rt, &pr->u.getset.getter->header);
+        if (pr->u.getset.setter)
+            mark_func(rt, &pr->u.getset.setter->header);
+    } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF) {
+        if (pr->u.var_ref->is_detached ||
+            pr->u.var_ref->is_coro) {
+            mark_func(rt, &pr->u.var_ref->header);
+        }
+    } else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_AUTOINIT) {
+        js_autoinit_mark(rt, pr, mark_func);
+    }
+}
+
+static inline __attribute__((always_inline)) int
+mark_children_fast(JSRuntime *rt, JSGCObjectHeader *gp, JS_MarkFunc *mark_func)
+{
+    JSObject *p;
+    JSShape *sh;
+    JSShapeProperty *prs;
+    int i;
+
+    if (unlikely(JS_GC_TYPE(gp) != JS_GC_OBJ_TYPE_JS_OBJECT))
+        return 0;
+    p = (JSObject *)gp;
+    if (unlikely(p->first_weak_ref != NULL ||
+                 (p->class_id != JS_CLASS_OBJECT && p->class_id != JS_CLASS_ARRAY)))
+        return 0;
+    sh = p->shape;
+    mark_func(rt, &sh->header);
+    prs = get_shape_prop(sh);
+    for(i = 0; i < sh->prop_count; i++) {
+        if (prs->atom != JS_ATOM_NULL) {
+            if (unlikely(prs->flags & JS_PROP_TMASK)) {
+                mark_prop_special(rt, &p->prop[i], prs, mark_func);
+            } else {
+                JSValue v = p->prop[i].u.value;
+                if (JS_VALUE_HAS_REF_COUNT(v) &&
+                    (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT || JS_VALUE_GET_TAG(v) == JS_TAG_FUNCTION_BYTECODE))
+                    mark_func(rt, JS_VALUE_GET_PTR(v));
+            }
+        }
+        prs++;
+    }
+    if (p->class_id == JS_CLASS_ARRAY && JS_ARR_GENERIC(p)) {
+        uint32_t n = p->u.array.count, k;
+        for(k = 0; k < n; k++) {
+            JSValue v = JS_ARR_VALS(p)[k];
+            if (JS_VALUE_HAS_REF_COUNT(v) &&
+                (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT || JS_VALUE_GET_TAG(v) == JS_TAG_FUNCTION_BYTECODE))
+                mark_func(rt, JS_VALUE_GET_PTR(v));
+        }
+    }
+    return 1;
+}
+
 static void gc_decref_child(JSRuntime *rt, JSGCObjectHeader *p)
 {
     assert(JS_REF_COUNT(p) > 0);
@@ -11568,7 +11631,8 @@ static void gc_decref(JSRuntime *rt)
     list_for_each_safe(el, el1, &rt->gc_obj_list) {
         p = list_entry(el, JSGCObjectHeader, link);
         assert(JS_GC_MARK(p) == 0);
-        mark_children(rt, p, gc_decref_child);
+        if (!mark_children_fast(rt, p, gc_decref_child))
+            mark_children(rt, p, gc_decref_child);
         JS_GC_MARK(p) = 1;
         if (JS_REF_COUNT(p) == 0) {
             list_del(&p->link);
@@ -11604,13 +11668,15 @@ static void gc_scan(JSRuntime *rt)
         p = list_entry(el, JSGCObjectHeader, link);
         assert(JS_REF_COUNT(p) > 0);
         JS_GC_MARK(p) = 0; /* reset the mark for the next GC call */
-        mark_children(rt, p, gc_scan_incref_child);
+        if (!mark_children_fast(rt, p, gc_scan_incref_child))
+            mark_children(rt, p, gc_scan_incref_child);
     }
 
     /* restore the refcount of the objects to be deleted. */
     list_for_each(el, &rt->tmp_obj_list) {
         p = list_entry(el, JSGCObjectHeader, link);
-        mark_children(rt, p, gc_scan_incref_child2);
+        if (!mark_children_fast(rt, p, gc_scan_incref_child2))
+            mark_children(rt, p, gc_scan_incref_child2);
     }
 }
 
