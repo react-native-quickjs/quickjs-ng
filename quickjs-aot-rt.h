@@ -384,6 +384,10 @@ void qjs_aot_set_reg_b(JSContext *ctx, JSValue *fr, int off, JSValue v);
    old and move in the owning build). Used where the handler uses SET_REG_P. */
 void qjs_aot_set_reg_p(JSContext *ctx, JSValue *fr, int off, JSValue v);
 
+/* The last reference of a counted value whose count is 1 goes: JS_FreeValue without its
+   intermediate calls. */
+void qjs_aot_drc_zero(JSContext *ctx, JSValue v);
+
 /* The builtins a unit lowers inline. `qjs_aot_intrinsic_fn(id)` returns the C
    function pointer the builtin's function object holds (`min` and `max` share
    one, told apart by the magic number 0 and 1), or NULL for an unknown id. The
