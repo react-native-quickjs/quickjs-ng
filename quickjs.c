@@ -3126,6 +3126,13 @@ static void *js_dbuf_realloc(void *ctx, void *ptr, size_t size)
     return js_realloc(ctx, ptr, size);
 }
 
+/* The runtime-keyed twin of the above: casting `js_realloc_rt` to
+   `DynBufReallocFunc` is a function-pointer type mismatch (UBSan). */
+static void *js_dbuf_realloc_rt(void *rt, void *ptr, size_t size)
+{
+    return js_realloc_rt(rt, ptr, size);
+}
+
 static inline void js_dbuf_init(JSContext *ctx, DynBuf *s)
 {
     dbuf_init2(s, ctx, js_dbuf_realloc);
@@ -24724,6 +24731,9 @@ static JSRegRun *regvm_rec_of_sf(JSRuntime *rt, JSStackFrame *sf)
     const uint8_t *lo = rt->regvm_frames;
     size_t top = rt->regvm_frames_top;
 
+    /* no arena yet: nothing is a record */
+    if (lo == NULL)
+        return NULL;
     /* the newest frames are in the current chunk; older ones in its prev chain */
     while (p < lo || p >= lo + top) {
         if (!c || !(c = c->prev))
@@ -26646,7 +26656,7 @@ regvm_t_return_light_nested(REGVM_ARGS)
     if (b->var_count <= 255)
         vc = b->regvm_var_count;
 #endif
-    end = f->var_buf + vc;
+    end = vc > 0 ? f->var_buf + vc : f->var_buf;
     for (p = f->var_buf; p < end; p++)
         if (REGVM_HAS_COUNT(*p))
             JS_FreeValueRT(ctx->rt, *p);
@@ -29293,7 +29303,7 @@ static uint8_t *REGVM_CC regvm_t_unwind_loop(REGVM_ARGS)
         if (b->var_count <= 255)
             vc = b->regvm_var_count;
 #endif
-        end = f->var_buf + vc;
+        end = vc > 0 ? f->var_buf + vc : f->var_buf;
         for (p = f->var_buf; p < end; p++)
             if (REGVM_HAS_COUNT(*p))
                 JS_FreeValueRT(ctx->rt, *p);
@@ -82542,7 +82552,7 @@ static JSValue js_string_localeCompare(JSContext *ctx, JSValueConst this_val,
 
     // TODO(bnoordhuis) skip normalization when input is latin1
     an = unicode_normalize(&ts, as, an, UNICODE_NFC, ctx,
-                           (DynBufReallocFunc *)js_realloc);
+                           js_dbuf_realloc);
     if (an == -1)
         goto exception;
     js_free(ctx, as);
@@ -82550,7 +82560,7 @@ static JSValue js_string_localeCompare(JSContext *ctx, JSValueConst this_val,
 
     // TODO(bnoordhuis) skip normalization when input is latin1
     bn = unicode_normalize(&ts, bs, bn, UNICODE_NFC, ctx,
-                           (DynBufReallocFunc *)js_realloc);
+                           js_dbuf_realloc);
     if (bn == -1)
         goto exception;
     js_free(ctx, bs);
@@ -82730,7 +82740,7 @@ static JSValue js_string_normalize(JSContext *ctx, JSValueConst this_val,
     }
 
     out_len = unicode_normalize(&out_buf, buf, buf_len, n_type,
-                                ctx->rt, (DynBufReallocFunc *)js_realloc_rt);
+                                ctx->rt, js_dbuf_realloc_rt);
     js_free(ctx, buf);
     if (out_len < 0)
         return JS_EXCEPTION;
