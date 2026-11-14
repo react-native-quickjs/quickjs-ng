@@ -25782,6 +25782,21 @@ static uint8_t *REGVM_CC regvm_t_branch_if_not(REGVM_ARGS)
         int32_t _off = (OFFEXPR); \
         JSValue _a = FR(_la), _b = FR(_rb); \
         int _r; \
+        /* `===`/`!==` against an undefined read at run time: true exactly when \
+           both are undefined, one tag test ahead of the numeric blocks. The \
+           `!==` and inverted senses fold into the same `_se ^ inv` as the \
+           strict block. */ \
+        if ((_sub & ~REG_CMP_INVERT) == REG_BIN_STRICT_EQ || \
+            (_sub & ~REG_CMP_INVERT) == REG_BIN_STRICT_NEQ) { \
+            int _ta = JS_VALUE_GET_TAG(_a), _tb = JS_VALUE_GET_TAG(_b); \
+            if (likely(_ta == JS_TAG_UNDEFINED || _tb == JS_TAG_UNDEFINED)) { \
+                int _se = (_ta == JS_TAG_UNDEFINED && _tb == JS_TAG_UNDEFINED) \
+                              ^ ((_sub & ~REG_CMP_INVERT) == REG_BIN_STRICT_NEQ); \
+                int _take = _se ^ ((_sub & REG_CMP_INVERT) != 0); \
+                if (_take) { T_BR_NEXT((SZ_) + _off); } \
+                T_NEXT((SZ_)); \
+            } \
+        } \
         if (likely(JS_VALUE_IS_BOTH_INT(_a, _b) && \
                    !((_r = regvm_int_cmp(_sub & ~REG_CMP_INVERT, \
                                          JS_VALUE_GET_INT(_a), \
