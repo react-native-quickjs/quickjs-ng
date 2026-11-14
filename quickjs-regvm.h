@@ -616,7 +616,7 @@ enum { REG_CONST_CPOOL = 0, REG_CONST_ATOM };
 /* The register bytecode's format version, checked per function record before
    any instruction is parsed. Bump it whenever an opcode is added, removed or
    renumbered, or an operand's width or meaning changes. */
-#define REGVM_FORMAT_VERSION 13
+#define REGVM_FORMAT_VERSION 14
 
 /* ROP_get_field and ROP_put_field use this site index when the source
    instruction has no inline cache. */
@@ -658,6 +658,13 @@ typedef enum JSRegBinaryOp {
        only. */
     REG_BIN_COUNT,
 } JSRegBinaryOp;
+
+/* Pseudo sub-operations of ROP_branch_cmp_*: a fused strict compare against a
+   just-loaded undefined, where the remaining operand's tag is the whole test.
+   They sit between the real REG_BIN_* members and REG_CMP_INVERT (0x40), and
+   only regvm_fuse_branches produces them. */
+#define REG_BIN_IS_UNDEF     0x3e
+#define REG_BIN_IS_NOT_UNDEF 0x3f
 
 /*
  * --- the register frame -------------------------------------------------
