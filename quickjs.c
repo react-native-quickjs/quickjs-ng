@@ -49472,6 +49472,7 @@ typedef struct JSONShapeCache {
     uint8_t *plain;     /* plain[k]: atoms[k] is an 8-bit string of bytes a key needs no escape for (printable ASCII, no quote or backslash);
                            2 when also k16[k] holds it */
     uint8_t (*k16)[16]; /* k16[k]: a plain key of at most 14 bytes, its closing quote, zeros, and its length in byte 15 */
+    uint32_t gen;       /* bumped whenever entries below n are dropped, so a reader can tell its entry k still holds */
     JSShape **shapes;   /* shapes[k] = shape after k keys; shapes[n] is valid */
 } JSONShapeCache;
 
@@ -106313,6 +106314,7 @@ static int json_obj_add(JSContext *ctx, JSParseState *s, int depth, JSValue val,
                 for (j = k; j < jsc->n; j++)
                     JS_FreeAtom(ctx, jsc->atoms[j]);
                 jsc->n = k;
+                jsc->gen++;
             }
             *matched = 0;
         }
@@ -106708,9 +106710,9 @@ static int json_fast_value(JSParseState *s, const uint8_t **pp, int depth, JSVal
                     if (*p != '"')
                         goto obj_fail;
                     p++;
-                    /* the expected next key, plain, with a primitive value: its bytes compared in place, the value read here and
-                       stored with the cached shape; the key atom is only borrowed from the chain, which nothing changes before the
-                       store (a string or number reader touches no shape cache) */
+                    /* the expected next key, plain: its bytes compared in place, the value read here and stored with the cached
+                       shape; the key atom is only borrowed from the chain (a string, number or literal reader touches no shape
+                       cache; after a nested value the chain's generation says whether entry k still holds) */
                     if (jsc && matched && k < jsc->n && jsc->plain[k] && jsc->shapes[k] == jsobj->shape &&
                         jsc->shapes[k + 1] != jsc->shapes[k]) {
                         uint32_t n;
@@ -106734,35 +106736,83 @@ static int json_fast_value(JSParseState *s, const uint8_t **pp, int depth, JSVal
                         if (kmatch) {
                             q = json_fast_ws(p + n + 1);
                             if (*q == ':') {
+                                const uint8_t *kp = p;
                                 q = json_fast_ws(q + 1);
-                                if (*q == '"' || *q == '-' || is_digit(*q)) {
-                                    if (*q == '"') {
-                                        q++;
-                                        if (json_parse_string(s, &q))
-                                            goto obj_fail;
-                                        prop_val = s->token.u.str.str;
-                                    } else {
+                                switch (*q) {
+                                case '"':
+                                    q++;
+                                    if (json_parse_string(s, &q))
+                                        goto obj_fail;
+                                    prop_val = s->token.u.str.str;
+                                    s->token.val = ' ';
+                                    break;
+                                case '-': case '0': case '1': case '2': case '3': case '4':
+                                case '5': case '6': case '7': case '8': case '9':
+                                    {
                                         const uint8_t *d = q + (*q == '-');
                                         if (!is_digit(*d) || (d[0] == '0' && is_digit(d[1])))
                                             goto obj_fail;
                                         if (json_parse_number(s, &q))
                                             goto obj_fail;
                                         prop_val = s->token.u.num.val;
+                                        s->token.val = ' ';
                                     }
-                                    s->token.val = ' ';
-                                    if (json_obj_adopt_shape(ctx, jsobj, jsc->shapes[k + 1], prop_val)) {
-                                        JS_FreeValue(ctx, prop_val);
+                                    break;
+                                case 't':
+                                    if (q[1] != 'r' || q[2] != 'u' || q[3] != 'e')
                                         goto obj_fail;
+                                    prop_val = JS_TRUE;
+                                    q += 4;
+                                    break;
+                                case 'f':
+                                    if (q[1] != 'a' || q[2] != 'l' || q[3] != 's' || q[4] != 'e')
+                                        goto obj_fail;
+                                    prop_val = JS_FALSE;
+                                    q += 5;
+                                    break;
+                                case 'n':
+                                    if (q[1] != 'u' || q[2] != 'l' || q[3] != 'l')
+                                        goto obj_fail;
+                                    prop_val = JS_NULL;
+                                    q += 4;
+                                    break;
+                                default:
+                                    {
+                                        /* a nested value may rebuild this chain (a slot collision): its entry k is used only
+                                           if no entry below n was dropped meanwhile, else the key is read again from the input
+                                           and added the general way */
+                                        uint32_t gen = jsc->gen;
+                                        if (json_fast_value(s, &q, json_child_slot(depth, jsc->atoms[k]), &prop_val))
+                                            goto obj_fail;
+                                        jsc = json_shape_cache_at(ctx, s, depth);
+                                        if (!(jsc && jsc->gen == gen && k < jsc->n && jsc->shapes[k] == jsobj->shape &&
+                                              jsc->shapes[k + 1] != jsc->shapes[k])) {
+                                            JSAtom a2 = JS_NewAtomLen(ctx, (const char *)kp, n);
+                                            if (a2 == JS_ATOM_NULL) {
+                                                JS_FreeValue(ctx, prop_val);
+                                                goto obj_fail;
+                                            }
+                                            if (json_obj_add(ctx, s, depth, val, jsobj, k, &matched, a2, prop_val) < 0)
+                                                goto obj_fail;
+                                            jsc = json_shape_cache_at(ctx, s, depth);
+                                            goto fast_next;
+                                        }
                                     }
-                                    k++;
-                                    p = json_fast_ws(q);
-                                    if (*p == '}')
-                                        break;
-                                    if (*p != ',')
-                                        goto obj_fail;
-                                    p = json_fast_ws(p + 1);
-                                    continue;
+                                    break;
                                 }
+                                if (json_obj_adopt_shape(ctx, jsobj, jsc->shapes[k + 1], prop_val)) {
+                                    JS_FreeValue(ctx, prop_val);
+                                    goto obj_fail;
+                                }
+                            fast_next:
+                                k++;
+                                p = json_fast_ws(q);
+                                if (*p == '}')
+                                    break;
+                                if (*p != ',')
+                                    goto obj_fail;
+                                p = json_fast_ws(p + 1);
+                                continue;
                             }
                         }
                     }
