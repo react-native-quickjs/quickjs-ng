@@ -29785,7 +29785,7 @@ regvm_pic_install(rt, &pic[s2], &b->regvm_pic_holder[s2],
                               (uint32_t)(pr - p->prop));
             pic[s2].misses = (uint16_t)rt->ic_watchpoint_epoch;
         }
-        if (plain_add && nsh != pre_sh && nsh->is_hashed && nsh->prop_count == pre_count + 1)
+        if (!site_ok && plain_add && nsh != pre_sh && nsh->is_hashed && nsh->prop_count == pre_count + 1)
             js_putadd_fill(rt, pre_sh, atom, nsh, (uint32_t)(pr - p->prop));
     }
 }
@@ -29909,7 +29909,8 @@ static int regvm_put_field_ic(JSContext *ctx, JSFunctionBytecode *b,
             e2 = &(*ppic)[b->regvm_pic_count + site];
         /* A store whose receiver shape and atom the shared add-transition table knows is replayed from it: the site's own entry
            holds one transition, and a base constructor run for many subclasses sees one receiver shape per subclass. */
-        if (po->extensible && !po->is_exotic && !po->is_prototype && po->shape->is_hashed) {
+        if (po->extensible && !po->is_exotic && !po->is_prototype && po->shape->is_hashed &&
+            e2 != NULL && e2->kind != REG_PIC_EMPTY && e2->shape != po->shape) {
             JSPutAddEntry *pe = js_putadd_probe(rt, po->shape, atom);
             if (pe != NULL) {
                 int ah = regvm_put_add_apply(ctx, b, po, val, site, 0, pe->to_shape, pe->off);
