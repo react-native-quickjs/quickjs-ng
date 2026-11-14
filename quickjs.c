@@ -10821,6 +10821,39 @@ free_plain_object(JSRuntime *rt, JSObject *p)
     js_free_rt(rt, p);
 }
 
+/* free_object for a fast Array (JS_CLASS_ARRAY) without weak references, freed from free_zero_refcount (gc_phase DECREF): the property loop of free_plain_object, then
+   the array finalizer's work (release the elements, free the element block unless it is inline), without the finalizer lookup, the fail-safe stores and the
+   REMOVE_CYCLES test. Every step runs in the order free_object runs it. */
+static inline __attribute__((always_inline)) void
+free_array_object(JSRuntime *rt, JSObject *p)
+{
+    int i;
+    JSShape *sh;
+    JSShapeProperty *pr;
+
+    assert(p->class_id == JS_CLASS_ARRAY && !p->first_weak_ref);
+    assert(rt->gc_phase == JS_GC_PHASE_DECREF);
+    sh = p->shape;
+    pr = get_shape_prop(sh);
+    for(i = 0; i < sh->prop_count; i++) {
+        if (likely(!(pr->flags & JS_PROP_TMASK))) {
+            JSValue v = p->prop[i].u.value;
+            if (JS_VALUE_HAS_REF_COUNT(v) &&
+                --JS_REF_COUNT(JS_VALUE_GET_PTR(v)) <= 0)
+                js_free_value_rt(rt, v);
+        } else {
+            free_property(rt, &p->prop[i], pr->flags);
+        }
+        pr++;
+    }
+    if (p->prop_inline_cap == 0)
+        js_free_rt(rt, p->prop);
+    js_free_shape(rt, sh);
+    js_array_finalizer(rt, JS_MKPTR(JS_TAG_OBJECT, p));
+    remove_gc_object(&p->header);
+    js_free_rt(rt, p);
+}
+
 static void free_gc_object(JSRuntime *rt, JSGCObjectHeader *gp)
 {
     switch(JS_GC_TYPE(gp)) {
@@ -10851,6 +10884,10 @@ static void free_zero_refcount(JSRuntime *rt)
                    ((JSObject *)p)->class_id == JS_CLASS_OBJECT &&
                    ((JSObject *)p)->first_weak_ref == NULL))
             free_plain_object(rt, (JSObject *)p);
+        else if (likely(JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_JS_OBJECT &&
+                        ((JSObject *)p)->class_id == JS_CLASS_ARRAY &&
+                        ((JSObject *)p)->first_weak_ref == NULL))
+            free_array_object(rt, (JSObject *)p);
         else
             free_gc_object(rt, p);
     }
