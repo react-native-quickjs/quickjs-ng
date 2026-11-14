@@ -2796,6 +2796,8 @@ static void js_proxy_mark(JSRuntime *rt, JSValueConst val,
 static void js_map_finalizer(JSRuntime *rt, JSValueConst val);
 static void js_map_mark(JSRuntime *rt, JSValueConst val,
                                 JS_MarkFunc *mark_func);
+static void js_weakmap_mark(JSRuntime *rt, JSValueConst val,
+                            JS_MarkFunc *mark_func);
 static void js_map_iterator_finalizer(JSRuntime *rt, JSValueConst val);
 static void js_map_iterator_mark(JSRuntime *rt, JSValueConst val,
                                 JS_MarkFunc *mark_func);
@@ -3951,7 +3953,7 @@ static JSClassShortDef const js_std_class_def[] = {
     { JS_ATOM_BigInt, js_object_data_finalizer, js_object_data_mark },      /* JS_CLASS_BIG_INT */
     { JS_ATOM_Map, js_map_finalizer, js_map_mark },             /* JS_CLASS_MAP */
     { JS_ATOM_Set, js_map_finalizer, js_map_mark },             /* JS_CLASS_SET */
-    { JS_ATOM_WeakMap, js_map_finalizer, NULL },         /* JS_CLASS_WEAKMAP */
+    { JS_ATOM_WeakMap, js_map_finalizer, js_weakmap_mark }, /* JS_CLASS_WEAKMAP */
     { JS_ATOM_WeakSet, js_map_finalizer, NULL },         /* JS_CLASS_WEAKSET */
     { JS_ATOM_Iterator, NULL, NULL },                           /* JS_CLASS_ITERATOR */
     { JS_ATOM_IteratorConcat, js_iterator_concat_finalizer, js_iterator_concat_mark }, /* JS_CLASS_ITERATOR_CONCAT */
@@ -103658,6 +103660,25 @@ static void js_map_finalizer(JSRuntime *rt, JSValueConst val)
         }
         js_free_rt(rt, s->hash_table);
         js_free_rt(rt, s);
+    }
+}
+
+/* The values of a WeakMap entry whose key is an object are marked from that key (mark_weak_map_value). A symbol is not a collectable
+   object, so nothing marks the values of entries keyed by one: the collector would count the map's reference to such a value as
+   external and keep the value, and everything it reaches, alive for as long as the runtime lives. The map marks them itself. */
+static void js_weakmap_mark(JSRuntime *rt, JSValueConst val,
+                            JS_MarkFunc *mark_func)
+{
+    JSObject *p = JS_VALUE_GET_OBJ(val);
+    JSMapState *s = p->u.map_state;
+    struct list_head *el;
+
+    if (s) {
+        list_for_each(el, &s->records) {
+            JSMapRecord *mr = list_entry(el, JSMapRecord, link);
+            if (!mr->empty && JS_VALUE_GET_TAG(mr->key) == JS_TAG_SYMBOL)
+                JS_MarkValue(rt, mr->value, mark_func);
+        }
     }
 }
 
