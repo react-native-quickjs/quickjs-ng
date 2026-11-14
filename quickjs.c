@@ -28940,12 +28940,14 @@ regvm_t_get_field_chain_second_slow(REGVM_ARGS)
     T_SET_NEXT_P(d2, v2, T_SZ_CHAIN);
 }
 
+#if !QJS_DRC
 static __attribute__((noinline)) uint8_t *REGVM_CC
 regvm_t_get_field_chain_free1(REGVM_ARGS)
 {
     js_free_value_rt(ctx->rt, f->set_v);
     __attribute__((musttail)) return regvm_t_get_field_chain_second_slow(REGVM_PASS);
 }
+#endif /* !QJS_DRC */
 
 static __attribute__((noinline)) uint8_t *REGVM_CC
 regvm_t_get_field_chain_slow(REGVM_ARGS)
@@ -30568,6 +30570,7 @@ typedef struct JSRegFrameLayout {
     JSRegCtl     *ctl;
 } JSRegFrameLayout;
 
+#if QJS_REGVM_INLOOP_CALL
 static int regvm_frame_alloc(JSRuntime *rt, JSFunctionBytecode *b, int arg_slots,
                              JSRegFrameLayout *out)
 {
@@ -30640,6 +30643,7 @@ static inline int regvm_inloop_eligible(JSFunctionBytecode *cb)
 {
     return cb->func_kind == JS_FUNC_NORMAL && cb->regvm_compiled && !cb->is_lazy;
 }
+#endif /* QJS_REGVM_INLOOP_CALL */
 
 #if QJS_REGVM_RECORD
 /*
@@ -74521,6 +74525,7 @@ static int JS_WriteBigInt(BCWriterState *s, JSValueConst obj)
 static int JS_WriteObjectRec(BCWriterState *s, JSValueConst obj);
 
 #if QJS_REGVM
+#if QJS_AOT
 /* Serialize an atom operand: the raw atom becomes the writer's index. */
 static int regvm_writer_atom(void *opaque, uint32_t *patom)
 {
@@ -74532,6 +74537,7 @@ static int regvm_writer_atom(void *opaque, uint32_t *patom)
     *patom = v;
     return 0;
 }
+#endif /* QJS_AOT */
 
 /* Wire form of an atom operand: bc_put_atom's tagged-int / bundle-index
    split, appended to the caller's buffer. */
@@ -75551,6 +75557,7 @@ static void js_scan_arg_flags_raw(const uint8_t *bc, int len,
     *argv_safe = true;
 }
 
+#if !QJS_REGVM || QJS_AOT
 static void js_scan_argv_safe(JSFunctionBytecode *b)
 {
     bool argv_safe, args_captured;
@@ -75564,6 +75571,7 @@ static void js_scan_argv_safe(JSFunctionBytecode *b)
     if (argv_safe)
         b->argv_safe = 1;
 }
+#endif
 
 #if QJS_REGVM
 /* The register-code form of js_arg_ref_opcode: does the instruction create a
@@ -76394,6 +76402,7 @@ fail:
 }
 
 #if QJS_REGVM
+#if QJS_AOT
 /* Read an atom operand of a register program: the writer's index becomes an
    interned atom this function owns (see regvm_owns_atoms). */
 static int regvm_reader_atom(void *opaque, uint32_t *patom)
@@ -76556,6 +76565,7 @@ static int regvm_validate_code(JSContext *ctx, const JSFunctionBytecode *b)
     js_free(ctx, targets);
     return rc;
 }
+#endif /* QJS_AOT */
 #endif /* QJS_REGVM */
 
 /* Parses the deferrable region of a function record: vardefs, constant pool,
