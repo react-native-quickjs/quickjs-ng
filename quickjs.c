@@ -80909,8 +80909,12 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
        lattice has height one (NONE -> OWN -> MAYBE). `inq` keeps each block in
        the LIFO at most once, so its capacity is n_blocks. */
     /* Seed every block: successors are enqueued only when an output changes, so
-       an all-NONE block 0 would otherwise stop the analysis. */
-    for (b = 0; b < n_blocks; b++) {
+       an all-NONE block 0 would otherwise stop the analysis. Seeded in reverse,
+       the LIFO pops blocks in ascending order: when every edge goes forward each
+       block is visited once, after all its predecessors. Both halves start from
+       their bottom with monotone transfers, so the fixed point does not depend
+       on the order. */
+    for (b = n_blocks - 1; b >= 0; b--) {
         queue[sp++] = b;
         inq[b] = 1;
     }
