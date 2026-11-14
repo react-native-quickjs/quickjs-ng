@@ -334,6 +334,17 @@ QJS_AOT_STUB uint32_t qjs_aot_layout_build(JSContext *ctx, JSValue proto_val,
                                            const JSAtom *atoms, uint32_t n,
                                            void *out, uint32_t out_cap,
                                            uint32_t layout_id);
+#ifndef QJS_AOT_CLAIM_NOREF
+/* One byte per (layout, slot) in JSRuntime.aot_slot_claim. A layout id has 6 bits (at most 63
+   layouts), so an object claim is the id itself (the object's shape ends that layout, or the
+   value is null/undefined) and CLAIM_OBJ_NN adds 0x40 (never null/undefined). */
+#define QJS_AOT_CLAIM_NOREF 0x80
+#define QJS_AOT_CLAIM_INT 0x81
+#define QJS_AOT_CLAIM_OBJ(l) ((l))
+#define QJS_AOT_CLAIM_OBJ_NN(l) (0x40 | (l))
+#define QJS_AOT_CLAIM_MAX_LAYOUTS 63
+_Static_assert(QJS_AOT_CLAIM_MAX_LAYOUTS == (QJS_AOT_CLAIM_OBJ_NN(63) & 0x3f), "a layout id fits in 6 bits");
+#endif
 /* What the unit promises about one slot of a layout (see JSRuntime.aot_slot_claim). */
 QJS_AOT_STUB int qjs_aot_layout_claim(JSContext *ctx, uint32_t layout_id, uint32_t slot,
                                       uint32_t claim);
