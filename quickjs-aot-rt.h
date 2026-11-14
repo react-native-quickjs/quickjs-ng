@@ -141,6 +141,12 @@ typedef struct JSAotGenLayout {
     /* The cache entry kind of a holder two prototypes up, and the byte and mask of
        `is_HTMLDDA`: an inline null test of an object has to ask it. */
     uint32_t reg_pic_proto2, off_object_htmldda_byte, object_htmldda_mask;
+    /* What an inline append to a dense array tests: the object's `extensible` and `fast_array`
+       bits, the capacity of its element storage, and in the context the initial array shape
+       (an array of that shape has Array.prototype and `length` as its first property) and the
+       "standard array prototype" bit (no indexed accessor on the prototype chain). */
+    uint32_t off_object_ext_byte, object_ext_mask, off_object_fast_array_byte, object_fast_array_mask;
+    uint32_t off_array_size, off_ctx_array_shape, off_ctx_std_array_proto_byte, ctx_std_array_proto_mask;
     /* The global variable cell sets: a store to a global the read cache holds is a lookup of
        the atom's set, a generation test and a store into the slot when the cell says the
        property is plainly writable. */
