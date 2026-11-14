@@ -138,6 +138,9 @@ typedef struct JSAotGenLayout {
        array, as the engine's own fast store does, since filling a hole has
        bookkeeping the inline path does not do. */
     uint32_t off_object_holey_byte, object_holey_mask;
+    /* The cache entry kind of a holder two prototypes up, and the byte and mask of
+       `is_HTMLDDA`: an inline null test of an object has to ask it. */
+    uint32_t reg_pic_proto2, off_object_htmldda_byte, object_htmldda_mask;
     /* The rest of the light-frame header a generated native entry writes, so
        it can build the frame the engine's own light call builds. The header is
        the frame's first `light_prefix_slots` words; `off_regrun_fr` is where
