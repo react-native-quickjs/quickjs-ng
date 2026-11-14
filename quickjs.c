@@ -17949,17 +17949,19 @@ static no_inline int js_relational_slow(JSContext *ctx, JSValue *sp,
         /* fast path for float64/int */
         goto float64_compare;
     } else {
-        if ((((tag1 == JS_TAG_BIG_INT || tag1 == JS_TAG_SHORT_BIG_INT) &&
-              tag2 == JS_TAG_STRING) ||
-             ((tag2 == JS_TAG_BIG_INT || tag2 == JS_TAG_SHORT_BIG_INT) &&
-              tag1 == JS_TAG_STRING))) {
-            if (tag1 == JS_TAG_STRING) {
+        /* tag_is_string: a rope is a String too, and must take StringToBigInt
+           rather than ToNumber (IsLessThan step 3.c/3.d). */
+        if (((tag1 == JS_TAG_BIG_INT || tag1 == JS_TAG_SHORT_BIG_INT) &&
+             tag_is_string(tag2)) ||
+            ((tag2 == JS_TAG_BIG_INT || tag2 == JS_TAG_SHORT_BIG_INT) &&
+             tag_is_string(tag1))) {
+            if (tag_is_string(tag1)) {
                 op1 = JS_StringToBigInt(ctx, op1);
                 if (JS_VALUE_GET_TAG(op1) != JS_TAG_BIG_INT &&
                     JS_VALUE_GET_TAG(op1) != JS_TAG_SHORT_BIG_INT)
                     goto invalid_bigint_string;
             }
-            if (tag2 == JS_TAG_STRING) {
+            if (tag_is_string(tag2)) {
                 op2 = JS_StringToBigInt(ctx, op2);
                 if (JS_VALUE_GET_TAG(op2) != JS_TAG_BIG_INT &&
                     JS_VALUE_GET_TAG(op2) != JS_TAG_SHORT_BIG_INT) {
