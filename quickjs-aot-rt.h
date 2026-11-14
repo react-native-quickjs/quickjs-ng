@@ -409,10 +409,12 @@ QJS_AOT_STUB int qjs_aot_cmp_take(JSContext *ctx, int sub, JSValue a, JSValue b)
 int qjs_aot_binary(JSContext *ctx, int sub, JSValue a, JSValue b, JSValue *out);
 /* `a <sub> const` for the forms whose right operand is not a register: a
    constant-pool entry (`kind` REG_CONST_CPOOL) or an atom. 0 with an owned
-   *out, -1 on exception. */
+   *out, -1 on exception. `d` and `ra` are the destination and the left operand's register
+   indexes: `s += 'x'` appends in place, like the interpreter's handler, and returns 2 with
+   the result left in register `d` (`*out` unset). */
 QJS_AOT_STUB int qjs_aot_binary_cpool(JSContext *ctx, JSRegRun *f, int sub,
                                       uint32_t idx, int kind, JSValue a,
-                                      JSValue *out);
+                                      int d, int ra, JSValue *out);
 
 /* The frame's argument window: AOT_ARG(ab, slot). */
 JSValue *qjs_aot_arg_buf(JSRegRun *f);
