@@ -5686,6 +5686,8 @@ void JS_FreeRuntime(JSRuntime *rt)
     leak &= check_dump_flag(rt, JS_ABORT_ON_LEAKS);
 
     js_arena_free_all(rt);
+    /* the regexp backtrack stack this thread keeps between matches: a runtime is freed on its thread, and a thread that ends keeps nothing */
+    lre_scratch_release();
 
     {
         JSMallocState *ms = &rt->malloc_state;
