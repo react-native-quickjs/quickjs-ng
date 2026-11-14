@@ -53,6 +53,11 @@ typedef struct JSAotGenFunc {
     /* For every constant-pool entry that is a function, that function's digest (all zero for any
        other entry), so the generator can follow a `make_closure` to the function it creates. */
     const uint8_t (*cpool_fn)[16];
+    /* The object-literal templates: `objlit_atoms[i]` lists the `objlit_nprops[i]` property names of template i, in
+       the order `object_fill` stores its window, so the generator can follow which value a literal puts under which name. */
+    int objlit_count;
+    const JSAtom *const *objlit_atoms;
+    const uint16_t *objlit_nprops;
     /* The light-frame size a direct call needs, when this function is one a
        compiled caller may enter on the C stack (`light_ok`), i.e. it is light
        eligible. */

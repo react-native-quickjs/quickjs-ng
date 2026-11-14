@@ -67908,6 +67908,30 @@ int js_aot_gen_collect(JSRuntime *rt, JSAotGenFunc **pout)
                         g->cpool_fn = (const uint8_t (*)[16])fns;
                     }
                 }
+                if (b->objlit_count > 0 && b->objlit_tab != NULL) {
+                    JSAtom **atoms = js_mallocz_rt(rt, sizeof(JSAtom *) * (size_t)b->objlit_count);
+                    uint16_t *np = js_mallocz_rt(rt, sizeof(uint16_t) * (size_t)b->objlit_count);
+                    if (atoms && np) {
+                        int oi, pi;
+                        for (oi = 0; oi < b->objlit_count; oi++) {
+                            JSObjLitTemplate *tp = &b->objlit_tab[oi];
+                            if (tp->prop_count == 0 || (tp->atoms == NULL && tp->shape == NULL))
+                                continue;
+                            atoms[oi] = js_malloc_rt(rt, sizeof(JSAtom) * tp->prop_count);
+                            if (atoms[oi] == NULL)
+                                continue;
+                            for (pi = 0; pi < tp->prop_count; pi++)
+                                atoms[oi][pi] = js_objlit_template_atom(tp, pi);
+                            np[oi] = tp->prop_count;
+                        }
+                        g->objlit_count = b->objlit_count;
+                        g->objlit_atoms = (const JSAtom *const *)atoms;
+                        g->objlit_nprops = np;
+                    } else {
+                        js_free_rt(rt, atoms);
+                        js_free_rt(rt, np);
+                    }
+                }
             }
             n++;
         }
@@ -67925,6 +67949,13 @@ void js_aot_gen_free(JSRuntime *rt, JSAotGenFunc *arr, int n)
             js_free_rt(rt, (void *)arr[i].cpool_num);
             js_free_rt(rt, (void *)arr[i].cpool_numeric);
             js_free_rt(rt, (void *)arr[i].cpool_fn);
+            if (arr[i].objlit_atoms != NULL) {
+                int oi;
+                for (oi = 0; oi < arr[i].objlit_count; oi++)
+                    js_free_rt(rt, (void *)arr[i].objlit_atoms[oi]);
+            }
+            js_free_rt(rt, (void *)arr[i].objlit_atoms);
+            js_free_rt(rt, (void *)arr[i].objlit_nprops);
         }
     }
     js_free_rt(rt, arr);
