@@ -934,6 +934,11 @@ struct JSRuntime {
     uint8_t gc_young_streak;
     bool gc_need_full;
     size_t gc_full_after;
+    /* What the collector has cost and found, for js_gc_admit: cycles spent in collections, the runtime's start, the heap size the last collection left,
+       and whether the last collection found at least a sixteenth of the allocation it swept to be garbage (gc_yield_ok; true until one has run). */
+    uint64_t gc_t0, gc_spent;
+    size_t gc_after_last;
+    bool gc_yield_ok;
 };
 
 #if QJS_REGVM_RECORD
@@ -3312,7 +3317,7 @@ JSValue JS_DupValueRT(JSRuntime *rt, JSValueConst v)
    delayed without retaining anything it would have freed; garbage produced
    meanwhile is bounded by JS_GC_PACE_MAX_PCT. */
 /* Where collections were asked for (QJS_GC_STATS): the allocation threshold path (calls, reconcile that was enough, collection run) and the safepoint path. */
-static uint64_t gc_trig[4], gc_rec_n, gc_rec_peak, gc_rec_thr;
+static uint64_t gc_trig[4], gc_rec_n, gc_rec_peak, gc_rec_thr, gc_admit_refused;
 static int gc_stat_on = -1;
 #define GC_MIN_STEP ((size_t)4 << 20)
 
@@ -3361,6 +3366,8 @@ static void js_gc_rearm_pace0(JSRuntime *rt, size_t before, size_t after)
         step = maxstep;
     rt->malloc_gc_threshold = after + step;
 }
+
+static bool js_gc_admit(JSRuntime *rt);
 
 static __attribute__((noinline)) void js_trigger_gc_slow(JSRuntime *rt, size_t size)
 {
@@ -3413,6 +3420,8 @@ static __attribute__((noinline)) void js_trigger_gc_slow(JSRuntime *rt, size_t s
                 }
             }
 #endif
+            if (!js_gc_admit(rt))
+                return;
             gc_trig[2]++;
             js_gc_auto(rt);
             rt->gc_pending = false;
@@ -4304,6 +4313,10 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     rt->gc_young_streak = 0;
     rt->gc_need_full = false;
     rt->gc_full_after = 0;
+    rt->gc_t0 = __builtin_ia32_rdtsc();
+    rt->gc_spent = 0;
+    rt->gc_after_last = 0;
+    rt->gc_yield_ok = true;
     init_list_head(&rt->gc_notrace_list);
     rt->gc_notrace_ok = 1;
     init_list_head(&rt->gc_zero_ref_count_list);
@@ -12402,7 +12415,7 @@ static void js_drc_reconcile(JSRuntime *rt)
     /* The parked values are drained and the registers are pinned: if the heap has grown past the collection threshold, collect cycles here, while the
        recent allocations are still in cache, instead of waiting for an allocation that goes through the slow path (compiled code that allocates from
        the nursery never does). */
-    if (unlikely(rt->malloc_state.malloc_size > rt->malloc_gc_threshold) && !rt->gc_deferred) {
+    if (unlikely(rt->malloc_state.malloc_size > rt->malloc_gc_threshold) && !rt->gc_deferred && js_gc_admit(rt)) {
         gc_trig[3]++;
         js_gc_auto_pinned(rt);
     }
@@ -13299,8 +13312,8 @@ static void gc_stat_report(void)
             (unsigned long)gc_ph[2], (unsigned long)gc_ph[3], (unsigned long)gc_ph[4], (unsigned long)gc_ph[5]);
     fprintf(stderr, "gc reconciles=%lu peak_malloc_size_at_reconcile=%lu threshold_at_last=%lu\n", (unsigned long)gc_rec_n, (unsigned long)gc_rec_peak,
             (unsigned long)gc_rec_thr);
-    fprintf(stderr, "gc trigger: allocation threshold calls=%lu reconcile_enough=%lu collections=%lu; safepoint collections=%lu\n", (unsigned long)gc_trig[0],
-            (unsigned long)gc_trig[1], (unsigned long)gc_trig[2], (unsigned long)gc_trig[3]);
+    fprintf(stderr, "gc trigger: allocation threshold calls=%lu reconcile_enough=%lu collections=%lu; safepoint collections=%lu; refused=%lu\n", (unsigned long)gc_trig[0],
+            (unsigned long)gc_trig[1], (unsigned long)gc_trig[2], (unsigned long)gc_trig[3], (unsigned long)gc_admit_refused);
     static const char *nm[2] = { "full", "young" };
     int k;
 
@@ -13350,8 +13363,10 @@ static void js_run_gc(JSRuntime *rt, bool young)
 static void js_gc_passes(JSRuntime *rt, bool young, uint64_t t0, size_t sz0)
 {
     uint64_t t1 = 0, t2 = 0, t3 = 0, t4 = 0, tp = 0;
+    uint64_t c_in = __builtin_ia32_rdtsc();
+    size_t s_in = rt->malloc_state.malloc_size;
     if (unlikely(gc_stat_on))
-        t1 = __builtin_ia32_rdtsc();
+        t1 = c_in;
     if (young) {
         gc_young(rt);
     } else {
@@ -13397,6 +13412,16 @@ static void js_gc_passes(JSRuntime *rt, bool young, uint64_t t0, size_t sz0)
         rt->gc_need_full = false;
         rt->gc_full_after = rt->malloc_state.malloc_size;
     }
+    {
+        /* What this collection found against what it swept: a young one swept the allocation since the previous collection, a full one the heap. */
+        size_t s_out = rt->malloc_state.malloc_size;
+        size_t freed = s_in > s_out ? s_in - s_out : 0;
+        size_t swept = young ? (s_in > rt->gc_after_last ? s_in - rt->gc_after_last : 0) : s_in;
+
+        rt->gc_yield_ok = freed >= (swept >> 4);
+        rt->gc_after_last = s_out;
+        rt->gc_spent += __builtin_ia32_rdtsc() - c_in;
+    }
     if (unlikely(gc_stat_on)) {
         int k = young;
 
@@ -13425,6 +13450,40 @@ static bool js_gc_full_due(JSRuntime *rt)
     unsigned k = rt->gc_cyc_empty_streak > 4 ? 4 : rt->gc_cyc_empty_streak;
 
     return rt->malloc_state.malloc_size > rt->gc_full_after + (rt->gc_full_after >> 1) * (1 + k);
+}
+
+/* Whether the collection an allocation threshold or a safepoint asks for is worth its cost now. A collection that found a good part of what it
+   swept to be garbage is paced as before. After one that did not, the program is building a live structure and the next sweep would mostly
+   walk live objects, so it waits until the collector's total cost is under a sixteenth of the time the runtime has run (plus a small allowance),
+   judging the sweep's cost by the bytes it would walk; the heap growing to eight times what the last collection left (and past 192 MB), or nearing a memory limit,
+   ends the wait. A refused request moves the threshold up with the heap. QJS_GC_NOADMIT=1 admits every request. */
+#define GC_ADMIT_CYC_PER_BYTE 3
+static bool js_gc_pick_young(JSRuntime *rt);
+#define GC_ADMIT_ALLOWANCE    ((uint64_t)20000000)
+#define GC_ADMIT_HEAP_FLOOR   ((size_t)192 << 20)
+static bool js_gc_admit(JSRuntime *rt)
+{
+    static int off = -1;
+    size_t size = rt->malloc_state.malloc_size, window;
+    uint64_t est, budget;
+
+    if (rt->gc_yield_ok)
+        return true;
+    if (off < 0)
+        off = getenv("QJS_GC_NOADMIT") != NULL;
+    if (off)
+        return true;
+    if ((size > (rt->gc_after_last << 3) && size > GC_ADMIT_HEAP_FLOOR) ||
+        (rt->malloc_state.malloc_limit != 0 && size > (rt->malloc_state.malloc_limit >> 1)))
+        return true;
+    window = js_gc_pick_young(rt) ? (size > rt->gc_after_last ? size - rt->gc_after_last : 0) : size;
+    est = (uint64_t)window * GC_ADMIT_CYC_PER_BYTE;
+    budget = (__builtin_ia32_rdtsc() - rt->gc_t0) / 16 + GC_ADMIT_ALLOWANCE;
+    if (rt->gc_spent + est <= budget)
+        return true;
+    gc_admit_refused++;
+    rt->malloc_gc_threshold = size + (size >> 1);
+    return false;
 }
 
 static bool js_gc_pick_young(JSRuntime *rt)
