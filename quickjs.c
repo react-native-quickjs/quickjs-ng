@@ -25312,7 +25312,7 @@ static int regvm_record_eligible(JSFunctionBytecode *cb);
 static int regvm_code_light_safe(const uint8_t *code, int len);
 static __attribute__((always_inline)) inline JSRegRun *
 regvm_light_prepare(REGVM_ARGS, JSObject *co, JSFunctionBytecode *cb,
-                    int ret_off, JSValueConst this_obj, JSValue *oargv,
+                    int ret_off, JSValue *oargv,
                     int na, JSValue **out_regs);
 static __attribute__((noinline)) uint8_t *REGVM_CC
 regvm_t_return_light_nested(REGVM_ARGS);
@@ -26136,6 +26136,9 @@ regvm_t_return_trivial_chunk(REGVM_ARGS)
 #endif
 
 #if QJS_REGVM_RECORD
+/* A plain call stores `this_obj = undefined`; copying from this constant
+   keeps it a single 16-byte store. */
+static const JSValue regvm_undefined_value = { { .int32 = 0 }, JS_TAG_UNDEFINED };
 /*
  * The call handler. The fast path builds the callee's record and dispatches
  * the callee's first opcode with it; the slow path (ineligible, native, or an
@@ -26163,11 +26166,12 @@ static uint8_t *REGVM_CC regvm_t_call(REGVM_ARGS)
                 int ab = T_REG(5), na = T_U8(7);
                 JSValue *regs;
                 JSRegRun *nf = regvm_light_prepare(REGVM_PASS, co, cb, 8,
-                                                   JS_UNDEFINED, FRP(ab), na,
-                                                   &regs);
+                                                   FRP(ab), na, &regs);
                 if (unlikely(nf == NULL))
                     __attribute__((musttail))
                         return regvm_t_call_record(REGVM_PASS);
+                memcpy(&nf->this_obj, &regvm_undefined_value,
+                       sizeof(JSValue));
                 ctx->rt->regvm_cur = nf;
                 __attribute__((musttail))
                     return regvm_t_dispatch(cb->regvm_code, regs, nf,
@@ -26199,10 +26203,11 @@ static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS)
                 JSValue tv = FR(r);
                 JSValue *regs;
                 JSRegRun *nf = regvm_light_prepare(REGVM_PASS, co, cb, 10,
-                                                   tv, FRP(ab), na, &regs);
+                                                   FRP(ab), na, &regs);
                 if (unlikely(nf == NULL))
                     __attribute__((musttail))
                         return regvm_t_call_method_record(REGVM_PASS);
+                nf->this_obj = tv;
                 ctx->rt->regvm_cur = nf;
                 __attribute__((musttail))
                     return regvm_t_dispatch(cb->regvm_code, regs, nf,
@@ -26392,7 +26397,7 @@ regvm_light_alloc(JSRuntime *rt, JSFunctionBytecode *cb)
    Inlined into both handlers. */
 static __attribute__((always_inline)) inline JSRegRun *
 regvm_light_enter(JSContext *ctx, JSObject *co, JSFunctionBytecode *cb,
-                  JSRegRun *f, int d, uint8_t *ret_ip, JSValueConst this_obj,
+                  JSRegRun *f, int d, uint8_t *ret_ip,
                   JSValue *oargv, int na, JSValue **out_regs)
 {
     JSRegRun *nf = regvm_light_alloc(ctx->rt, cb);
@@ -26410,7 +26415,6 @@ regvm_light_enter(JSContext *ctx, JSObject *co, JSFunctionBytecode *cb,
     nf->func = co;
     nf->cap_ip = NULL;
     nf->sf = NULL;
-    nf->this_obj = this_obj;
     /* `ret` and `set_v` are written before they are read on every path a light
        function can take, so they are not initialised here. */
     vc = cb->var_count;
@@ -26460,7 +26464,7 @@ regvm_light_enter(JSContext *ctx, JSObject *co, JSFunctionBytecode *cb,
    record path (the classifier owns the `musttail` jump). */
 static __attribute__((always_inline)) inline JSRegRun *
 regvm_light_prepare(REGVM_ARGS, JSObject *co, JSFunctionBytecode *cb,
-                    int ret_off, JSValueConst this_obj, JSValue *oargv,
+                    int ret_off, JSValue *oargv,
                     int na, JSValue **out_regs)
 {
     int d = T_REG(1);
@@ -26470,7 +26474,7 @@ regvm_light_prepare(REGVM_ARGS, JSObject *co, JSFunctionBytecode *cb,
         return NULL;
     if (unlikely(na < cb->arg_count))
         return NULL;
-    nf = regvm_light_enter(ctx, co, cb, f, d, ip + ret_off, this_obj,
+    nf = regvm_light_enter(ctx, co, cb, f, d, ip + ret_off,
                            oargv, na, out_regs);
     return nf;
 }
