@@ -514,6 +514,8 @@ void qjs_aot_construct_done(JSObject *ctor, JSValue inst);
    non-derived light bytecode constructor (the caller takes the generic path); -1 on an
    exception. Runs no JavaScript. */
 int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out);
+JSValue qjs_aot_wrap_init(JSContext *ctx, JSRegRun *caller_f, JSObject *co, JSValue thisv, JSValue *argv,
+                          int argc, void **wc, int init_off, int apply_off);
 /* What `qjs_aot_ctor_replayable` remembers between calls (zero-initialised, one per use). */
 typedef struct JSAotCtorCache {
     const void *shape, *proto;

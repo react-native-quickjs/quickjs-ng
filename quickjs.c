@@ -65818,6 +65818,129 @@ int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out)
     return 1;
 }
 
+/* A constructor wrapper `function () { this.X.apply(this, arguments); }` (the generator recognises it by its register
+   program, see qjs_aot_wrapper_shape) called with a fresh `this`: the same effect as running the wrapper, without its frame,
+   its `arguments` object, the polymorphic read of `this.X` (one wrapper bytecode serves every class built by the same
+   factory) or the trip through the `apply` builtin. `wc` is the construct site's cache, eight words the generated code owns:
+   the receiver shape, the epoch, the function X resolved for it, X's shape, the wrapper bytecode and X's atom. The cache
+   says: for a `this` of this shape, `this.X` is that function while `aot_pic_epoch` has not moved (every write that can
+   change what a prototype holds, a prototype link, or a cache cell moves it, and so does unbinding a compiled function),
+   and X has no own `apply` while its shape is this one. Only a plain data property found on ordinary objects, holding an
+   ordinary bytecode function whose prototype is its realm's Function.prototype, whose `apply` is the builtin, is cached.
+   Returns JS_UNINITIALIZED, with nothing done, when any of that does not hold: the caller then runs the wrapper. Otherwise
+   returns undefined (what the wrapper returns) or the exception. */
+#define AOT_WC_SHAPE 0
+#define AOT_WC_EPOCH 1
+#define AOT_WC_INIT 2
+#define AOT_WC_ISHAPE 3
+#define AOT_WC_CB 4
+#define AOT_WC_ATOM 5
+#define AOT_WC_SFE 6
+JSValue qjs_aot_wrap_init(JSContext *ctx, JSRegRun *caller_f, JSObject *co, JSValue thisv, JSValue *argv,
+                          int argc, void **wc, int init_off, int apply_off)
+{
+    JSRuntime *rt = ctx->rt;
+    JSFunctionBytecode *cb = co->u.func.function_bytecode, *cb2;
+    JSObject *p, *init;
+    JSValue ret;
+
+    if (JS_VALUE_GET_TAG(thisv) != JS_TAG_OBJECT)
+        return JS_UNINITIALIZED;
+    p = JS_VALUE_GET_OBJ(thisv);
+#ifdef QJS_KIT_TEST_KNOBS
+    /* Negative control: a cache that is never invalidated once filled, as if nothing moved the epoch or X's shape. */
+    static int wc_stale = -1;
+    if (wc_stale < 0)
+        wc_stale = getenv("QJS_AOT_WCSTALE") != NULL;
+#endif
+    /* The cache holds raw pointers: the receiver shape and X are compared or dereferenced only after the two epochs agree.
+       `shape_free_epoch` moves whenever any shape is freed, so a shape freed since the fill (and its address possibly reused
+       by another one, which a pointer compare cannot tell) fails the test before anything cached is dereferenced; and while
+       no shape has been freed the cached shape is alive, so are its prototype chain and X (which only a write or delete on
+       a prototype can drop, and those move aot_pic_epoch). */
+#ifdef QJS_KIT_TEST_KNOBS
+    if (wc[AOT_WC_SHAPE] == (void *)p->shape && wc[AOT_WC_EPOCH] == (void *)(uintptr_t)rt->aot_pic_epoch &&
+        wc[AOT_WC_SFE] != (void *)(uintptr_t)rt->shape_free_epoch && getenv("QJS_AOT_WCABA") != NULL)
+        fprintf(stderr, "wc: a freed shape's address was reused (the cache would have hit)\n");
+#endif
+    if (unlikely(wc[AOT_WC_SHAPE] != (void *)p->shape || wc[AOT_WC_CB] != (void *)cb ||
+                 (
+#ifdef QJS_KIT_TEST_KNOBS
+                  !wc_stale &&
+#endif
+                  (wc[AOT_WC_EPOCH] != (void *)(uintptr_t)rt->aot_pic_epoch ||
+                   wc[AOT_WC_SFE] != (void *)(uintptr_t)rt->shape_free_epoch ||
+                   ((JSObject *)wc[AOT_WC_INIT])->shape != (JSShape *)wc[AOT_WC_ISHAPE])))) {
+        JSAtom atom;
+        JSObject *holder;
+        JSProperty *pr;
+        JSShapeProperty *prs;
+        JSValue v = JS_UNDEFINED;
+        int depth;
+
+        wc[AOT_WC_SHAPE] = NULL;
+        if (wc[AOT_WC_CB] != (void *)cb) {
+            uint32_t a_init, a_apply;
+            wc[AOT_WC_CB] = NULL;
+            memcpy(&a_init, cb->regvm_code + init_off, 4);
+            memcpy(&a_apply, cb->regvm_code + apply_off, 4);
+            if (a_apply != JS_ATOM_apply || a_init == JS_ATOM_NULL)
+                return JS_UNINITIALIZED;
+            wc[AOT_WC_ATOM] = (void *)(uintptr_t)a_init;
+            wc[AOT_WC_CB] = (void *)cb;
+        }
+        atom = (JSAtom)(uintptr_t)wc[AOT_WC_ATOM];
+        if (p->class_id != JS_CLASS_OBJECT || p->is_exotic || find_own_property(&pr, p, atom) != NULL)
+            return JS_UNINITIALIZED;
+        holder = p->shape->proto;
+        for (depth = 0; holder != NULL; depth++) {
+            if (depth >= 8 || holder->class_id != JS_CLASS_OBJECT || holder->is_exotic)
+                return JS_UNINITIALIZED;
+            prs = find_own_property(&pr, holder, atom);
+            if (prs != NULL) {
+                if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+                    return JS_UNINITIALIZED;
+                v = pr->u.value;
+                break;
+            }
+            holder = holder->shape->proto;
+        }
+        if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
+            return JS_UNINITIALIZED;
+        init = JS_VALUE_GET_OBJ(v);
+        if (init->class_id != JS_CLASS_BYTECODE_FUNCTION || init->is_exotic)
+            return JS_UNINITIALIZED;
+        cb2 = init->u.func.function_bytecode;
+        if (cb2->is_derived_class_constructor || cb2->func_kind != JS_FUNC_NORMAL)
+            return JS_UNINITIALIZED;
+        {
+            JSObject *fp = JS_VALUE_GET_OBJ(cb2->realm->function_proto);
+            if (init->shape->proto != fp || find_own_property(&pr, init, JS_ATOM_apply) != NULL)
+                return JS_UNINITIALIZED;
+            prs = find_own_property(&pr, fp, JS_ATOM_apply);
+            if (prs == NULL || (prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL ||
+                js_args_apply_is_builtin(pr->u.value) == NULL)
+                return JS_UNINITIALIZED;
+        }
+        wc[AOT_WC_EPOCH] = (void *)(uintptr_t)rt->aot_pic_epoch;
+        wc[AOT_WC_SFE] = (void *)(uintptr_t)rt->shape_free_epoch;
+        wc[AOT_WC_INIT] = init;
+        wc[AOT_WC_ISHAPE] = init->shape;
+        wc[AOT_WC_SHAPE] = p->shape;
+    }
+    init = (JSObject *)wc[AOT_WC_INIT];
+    cb2 = init->u.func.function_bytecode;
+    if (cb2->aot_nfn != NULL && argc >= cb2->arg_count)
+        ret = ((JSValue (*)(JSContext *, JSRegRun *, JSObject *, JSValue, JSValue *, int))cb2->aot_nfn)(
+            ctx, caller_f, init, thisv, argv, argc);
+    else
+        ret = JS_Call(ctx, JS_MKPTR(JS_TAG_OBJECT, init), thisv, argc, vc(argv));
+    if (JS_IsException(ret))
+        return ret;
+    JS_FreeValue(ctx, ret);
+    return JS_UNDEFINED;
+}
+
 /* Whether constructing `ctor` now is fully described by the engine's own add-transition cells:
    a fresh `this` has the shape the first cell starts from, each cell leads to the shape the next
    one starts from, and no prototype interceptor has appeared since they were filled. Then `new
