@@ -381,6 +381,10 @@ QJS_AOT_STUB uint8_t *qjs_aot_iter_next(uint8_t *ip, JSValue *fr, JSRegRun *f,
 QJS_AOT_STUB int qjs_aot_put_add(JSContext *ctx, JSRegRun *f, JSValue recv,
                                  JSValue v, int site);
 
+/* `get_super` and a constant-key `get_element`, each with an owned result. */
+int qjs_aot_get_proto(JSContext *ctx, JSValue obj, JSValue *out);
+int qjs_aot_get_prop_atom(JSContext *ctx, JSValue obj, uint32_t atom, JSValue *out);
+
 /* A compiled `new` finished with `inst`: the constructor learns its instance capacity. */
 void qjs_aot_construct_done(JSObject *ctor, JSValue inst);
 
