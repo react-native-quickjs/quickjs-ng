@@ -65891,8 +65891,15 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                         sentinel_bits[push_base[pos] + 2] = 1;
                 } else if (op2 == OP_catch) {
                     sentinel_bits[push_base[pos]] = 1;
-                } else if (op2 == OP_gosub) {
-                    /* the return address is a slot with no value in it */
+                } else if (op2 == OP_gosub && !fd->regvm_baseline) {
+                    /* The return address is a slot with no value, so a hand
+                       `OP_drop` of it removes the control-stack entry (the
+                       sentinel convention of `regvm_lower`). The baseline tier
+                       must not mark it: its control stack is address-based
+                       (`ROP_finally_enter`/`ROP_finally_leave`), and its shape
+                       expansion moves the operand stack around the gosub push,
+                       so a set `sentinel_bit` would let an unrelated hand-drop
+                       remove a continuation whose finally has not run. */
                     sentinel_bits[push_base[pos]] = 1;
                 }
             }
