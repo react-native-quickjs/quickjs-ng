@@ -19460,6 +19460,62 @@ exception:
     return -1;
 }
 
+/* Fast path for `{...src}`: walk the source's shape instead of building a
+ * name array and probing the source per name.
+ *
+ * Nothing in the loop can run user code, so the source's shape cannot change
+ * underneath it: accessors are rejected before the copy starts, neither object
+ * is exotic, and the target is a plain extensible object. Anything else takes
+ * the generic path.
+ *
+ * Returns 1 if the copy was done, 0 if the caller should fall back.
+ */
+static int JS_CopyDataPropertiesFast(JSContext *ctx, JSValue target,
+                                     JSValue source)
+{
+    JSObject *sp, *tp;
+    JSShape *sh;
+    JSShapeProperty *prs;
+    uint32_t i;
+
+    if (JS_VALUE_GET_TAG(source) != JS_TAG_OBJECT ||
+        JS_VALUE_GET_TAG(target) != JS_TAG_OBJECT)
+        return 0;
+
+    sp = JS_VALUE_GET_OBJ(source);
+    tp = JS_VALUE_GET_OBJ(target);
+
+    if (sp->class_id != JS_CLASS_OBJECT || sp->is_exotic || sp->fast_array)
+        return 0;
+    if (tp->class_id != JS_CLASS_OBJECT || tp->is_exotic || tp->fast_array)
+        return 0;
+    if (!tp->extensible)
+        return 0;
+
+    /* Reject the whole object rather than bail mid-copy, which would leave a
+       partially copied target. */
+    sh = sp->shape;
+    for (i = 0, prs = get_shape_prop(sh); i < sh->prop_count; i++, prs++) {
+        if (prs->atom == JS_ATOM_NULL)
+            continue; /* deleted slot */
+        if (prs->flags & JS_PROP_TMASK)
+            return 0; /* accessor, var ref or auto-init: may run code */
+    }
+
+    for (i = 0, prs = get_shape_prop(sh); i < sh->prop_count; i++, prs++) {
+        JSValue val;
+        if (prs->atom == JS_ATOM_NULL)
+            continue;
+        if (!(prs->flags & JS_PROP_ENUMERABLE))
+            continue;
+        val = js_dup(sp->prop[i].u.value);
+        if (JS_DefinePropertyValue(ctx, target, prs->atom, val,
+                                   JS_PROP_C_W_E) < 0)
+            return -1;
+    }
+    return 1;
+}
+
 static __exception int JS_CopyDataProperties(JSContext *ctx,
                                              JSValue target,
                                              JSValue source,
@@ -19475,8 +19531,28 @@ static __exception int JS_CopyDataProperties(JSContext *ctx,
     int desc_flags;
     bool is_enumerable;
 
-    if (JS_VALUE_GET_TAG(source) != JS_TAG_OBJECT)
-        return 0;
+    if (JS_VALUE_GET_TAG(source) != JS_TAG_OBJECT) {
+        /* CopyDataProperties does ToObject(source), so `{...'ab'}` is
+           `{0:'a',1:'b'}`; box a string and carry on. */
+        if (JS_VALUE_GET_TAG(source) != JS_TAG_STRING)
+            return 0;
+        val = JS_ToObject(ctx, source);
+        if (JS_IsException(val))
+            return -1;
+        ret = JS_CopyDataProperties(ctx, target, val, excluded, setprop);
+        JS_FreeValue(ctx, val);
+        return ret;
+    }
+
+    /* No exclusion list means plain `{...src}` / Object.assign, which is the
+       shape worth specialising. `setprop` (Object.assign) would additionally
+       have to honour setters on the target; the fast path only accepts targets
+       that cannot have any, so both callers can share it. */
+    if (JS_VALUE_GET_TAG(excluded) != JS_TAG_OBJECT) {
+        ret = JS_CopyDataPropertiesFast(ctx, target, source);
+        if (ret != 0)
+            return ret < 0 ? -1 : 0;
+    }
 
     if (JS_VALUE_GET_TAG(excluded) == JS_TAG_OBJECT)
         pexcl = JS_VALUE_GET_OBJ(excluded);
