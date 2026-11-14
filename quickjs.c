@@ -29500,16 +29500,18 @@ static void regvm_pic_install(JSRuntime *rt, JSRegPIC *e, JSShape **pholder,
  * counted reference does not stop an unhashed shape from being mutated in
  * place; a hashed one with refcount >= 2 is copy-on-write, which the hit path
  * needs. The hash is recomputed from the property list because `sh->hash` is
- * only maintained while `is_hashed`. A shape with a deleted property is left
- * as it is: every delete makes its own copy, which no transition reaches, so
- * hashing them puts one more equal shape in the same bucket per object and
- * each free walks the chain. Its sites take the uncached path.
+ * only maintained while `is_hashed`. An ordinary object's shape with a deleted
+ * property (`copy`) is left as it is: every delete makes the object its own
+ * copy, which no transition reaches, so hashing them puts one more equal shape
+ * in the same bucket per object and each free walks the chain. Its sites take
+ * the uncached path. A prototype's shape is one long-lived shape however many
+ * objects read through it, so it is hashed even with a deleted property.
  */
-static void regvm_shape_hashify(JSRuntime *rt, JSShape *sh)
+static void regvm_shape_hashify(JSRuntime *rt, JSShape *sh, bool copy)
 {
     uint32_t h, i;
 
-    if (sh->is_hashed || sh->deleted_prop_count != 0)
+    if (sh->is_hashed || (copy && sh->deleted_prop_count != 0))
         return;
     if (2 * (rt->shape_hash_count + 1) > rt->shape_hash_size)
         resize_shape_hash(rt, rt->shape_hash_bits + 1);
@@ -29594,13 +29596,13 @@ static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
     /* A depth-0/1 site hashes its receiver shape (see regvm_shape_hashify);
        depth-2 sites use the global stub cache, which does not need it. */
     if (depth <= 1) {
-        regvm_shape_hashify(rt, rsh);
+        regvm_shape_hashify(rt, rsh, !p->is_prototype);
         if (hsh)
-            regvm_shape_hashify(rt, hsh);
+            regvm_shape_hashify(rt, hsh, false);
     } else {
-        regvm_shape_hashify(rt, rsh);
-        regvm_shape_hashify(rt, mid);
-        regvm_shape_hashify(rt, holder->shape);
+        regvm_shape_hashify(rt, rsh, !p->is_prototype);
+        regvm_shape_hashify(rt, mid, false);
+        regvm_shape_hashify(rt, holder->shape, false);
     }
 
     /* The site's state before the install below, which can newly kill it. A
@@ -70551,7 +70553,7 @@ QJS_AOT_STUB JSValue qjs_aot_gated_call(JSContext *ctx, JSObject *co, JSValue th
    needs the slot to be writable and the object not to be a prototype. It never
    runs JavaScript, so a compiled body may call it without a safepoint. */
 #if QJS_AOT || QJS_AOT_GEN
-static void regvm_shape_hashify(JSRuntime *rt, JSShape *sh);
+static void regvm_shape_hashify(JSRuntime *rt, JSShape *sh, bool copy);
 
 static int js_aot_poly_lookup(JSObject *obj, JSAtom atom, int write, uint32_t *off)
 {
