@@ -199,7 +199,7 @@ typedef struct JSAotGenLayout {
        kind, the runtime's epoch, and the object's flag word (where it is, the
        extensible bit, the bits that forbid the replay, and the inline slot
        capacity's mask and shift). */
-    uint32_t off_regpic_misses, reg_pic_add_w, off_rt_ic_epoch, off_rt_lazy_json;
+    uint32_t off_regpic_misses, reg_pic_add_w, off_rt_ic_epoch, off_rt_lazy_json, off_rt_shape_free_epoch;
     uint32_t off_object_flags16, object_extensible_mask, object_noadd_mask;
     uint32_t object_inline_cap_mask, object_inline_cap_shift;
     /* A rope whose linearised form is memoised holds the flat string on the left and the
@@ -520,7 +520,7 @@ JSValue qjs_aot_wrap_init(JSContext *ctx, JSRegRun *caller_f, JSObject *co, JSVa
 typedef struct JSAotCtorCache {
     const void *shape, *proto;
     const void *final_shape; /* the shape of the constructed object, all fields added */
-    uint32_t slot, pic_epoch;
+    uint32_t slot, pic_epoch, sfe; /* aot_pic_epoch and shape_free_epoch when the answer was filled */
 } JSAotCtorCache;
 
 /* 1 when `new C(...)` now is described by the engine's own add-transition cells: a fresh

@@ -762,6 +762,9 @@ struct JSRuntime {
        function that validated its cache cells at some epoch may trust them while it is
        unchanged. */
     uint32_t aot_pic_epoch;
+    /* Bumped whenever a shape is freed or edited in place: an address-keyed cache validates against it. Kept here, with the
+       other epochs a compiled unit reads by offset, where its offset does not depend on the build's optional fields. */
+    uint32_t shape_free_epoch;
     /* Atoms of global-object properties a compiled body holds as literals. A write to one moves
        `aot_pic_epoch`; the cells of such a property never take the direct store. */
     JSAtom aot_gwatch[JS_AOT_GWATCH_MAX];
@@ -854,7 +857,6 @@ struct JSRuntime {
     size_t regvm_chunks_bytes;   /* data bytes of the chunks in the live chain */
 #endif
     JSMegaEntry *mega_cache;
-    uint32_t shape_free_epoch;
     void *user_opaque;
     void *libc_opaque;
     JSRuntimeFinalizerState *finalizers;
@@ -63094,6 +63096,7 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->reg_pic_add_w = REG_PIC_ADD_W;
     out->off_rt_ic_epoch = (uint32_t)offsetof(JSRuntime, ic_watchpoint_epoch);
     out->off_rt_lazy_json = (uint32_t)offsetof(JSRuntime, lazy_json_seen);
+    out->off_rt_shape_free_epoch = (uint32_t)offsetof(JSRuntime, shape_free_epoch);
     {
         /* The object's flag bits and its inline slot capacity share one 16-bit word:
            find where it is and which bits each field takes by setting them in a
@@ -66074,8 +66077,11 @@ int qjs_aot_ctor_replayable(JSContext *ctx, JSObject *ctor, const uint16_t *site
 
     if (cc->shape == (const void *)ctor->shape &&
         cc->proto == JS_VALUE_GET_PTR(ctor->prop[cc->slot].u.value) &&
-        cc->pic_epoch == rt->aot_pic_epoch)
+        cc->pic_epoch == rt->aot_pic_epoch && cc->sfe == rt->shape_free_epoch)
         return 1;
+    /* Past saturation the watchpoint epoch can no longer say that an interceptor appeared (and no cell is filled then). */
+    if (rt->ic_watchpoint_epoch >= JS_IC_EPOCH_MAX)
+        return 0;
     if (n <= 0 || ctor->class_id != JS_CLASS_BYTECODE_FUNCTION || !ctor->is_constructor)
         return 0;
     cb = ctor->u.func.function_bytecode;
@@ -66113,6 +66119,7 @@ int qjs_aot_ctor_replayable(JSContext *ctx, JSObject *ctor, const uint16_t *site
     cc->proto = JS_VALUE_GET_PTR(pv);
     cc->slot = (uint32_t)(ppr - ctor->prop);
     cc->pic_epoch = rt->aot_pic_epoch;
+    cc->sfe = rt->shape_free_epoch;
     return 1;
 }
 
