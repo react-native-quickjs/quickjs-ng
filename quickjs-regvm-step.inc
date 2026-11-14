@@ -376,13 +376,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_array_from(uint8_t *ip, JSValue *fr, JSRegR
                 int d = RD_REG();
                 int ab = RD_REG();
                 int na = RD_U8();
-                int k;
-                JSValue vals[256];
-                for (k = 0; k < na; k++)
-                    vals[k] = js_dup(regs[ab + k]);
-                ret_val = JS_NewArrayFrom(ctx, na, vals);
-                /* The constructor consumes its copies; source registers may
-                   remain live through aliases. */
+                ret_val = regvm_array_from_regs(ctx, regs + ab, na);
                 if (JS_IsException(ret_val))
                     goto exception;
                 SET_REG_P(d, ret_val);
