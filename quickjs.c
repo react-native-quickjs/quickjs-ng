@@ -3341,7 +3341,11 @@ static inline __attribute__((always_inline)) void y_note(void *p) { if (unlikely
 #endif
 #define Y_RCB 0x80000000u /* a young cell's count carries this bias until it is promoted: the sign bit marks it */
 #define Y_RCN(rc) ((int)((uint32_t)(rc) - Y_RCB))
-static __attribute__((noinline, preserve_all)) void y_dup_young(void *p) { if (Y_RCN(JS_REF_COUNT(p)) <= 2) y_note(p); }
+/* A linked unit without young-cell forms: the heap and compiled code never see a nursery cell. A counted reference promotes the cell, and the places a
+   register-held cell reaches compiled code (a call into a compiled body, the return of a call) promote it. */
+static int y_formless;
+static void y_promote_now(JSObject *p);
+static __attribute__((noinline, preserve_all)) void y_dup_young(void *p) { if (unlikely(y_formless)) { y_promote_now((JSObject *)p); return; } if (Y_RCN(JS_REF_COUNT(p)) <= 2) y_note(p); }
 static inline __attribute__((always_inline)) JSValue js_dup(JSValueConst v)
 {
     if (JS_VALUE_HAS_REF_COUNT(v)) {
@@ -4828,6 +4832,22 @@ static_assert(offsetof(JSObject, arr_kind) == 21, "young flag byte");
 #define Y_KIND(p) (((uint8_t *)(p))[21])
 static inline int y_is(const void *p) { unsigned m; if (!Y_REG(p)) return 0; m = ((YChunk *)((uintptr_t)p & ~(uintptr_t)65535))->ymode; return m == 1 || (m == 2 && Y_KIND(p) == 0x80); }
 #define Y_IS(p) y_is(p)
+static void y_formless_args_slow(JSValue this_obj, const JSValue *argv, int na)
+{
+    int k;
+    if (JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT && Y_IS(JS_VALUE_GET_PTR(this_obj)) && Y_YOUNG(JS_VALUE_GET_PTR(this_obj)))
+        y_promote_now(JS_VALUE_GET_OBJ(this_obj));
+    for (k = 0; k < na; k++)
+        if (JS_VALUE_GET_TAG(argv[k]) == JS_TAG_OBJECT && Y_IS(JS_VALUE_GET_PTR(argv[k])) && Y_YOUNG(JS_VALUE_GET_PTR(argv[k])))
+            y_promote_now(JS_VALUE_GET_OBJ(argv[k]));
+}
+/* A call into compiled code that has no young-cell forms: the cells the caller's registers name are promoted first. */
+#define Y_FORMLESS_ARGS(this_, argv_, na_) do { \
+        if (unlikely(y_formless)) { \
+            JSValue ft_ = (this_); const JSValue *fa_ = (const JSValue *)(argv_); int fn_ = (na_), fk_, fo_ = JS_VALUE_GET_TAG(ft_) == JS_TAG_OBJECT; \
+            for (fk_ = 0; fk_ < fn_ && !fo_; fk_++) fo_ = JS_VALUE_GET_TAG(fa_[fk_]) == JS_TAG_OBJECT; \
+            if (fo_) y_formless_args_slow(ft_, fa_, fn_); \
+        } } while (0)
 #define Y_VAL(v) (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && Y_IS(JS_VALUE_GET_PTR(v)))
 static int y_tsc_on = -1;
 static inline uint64_t y_tsc(void) { if (unlikely(y_tsc_on < 0)) y_tsc_on = getenv("QJS_Y_STATS") != NULL; return y_tsc_on ? __builtin_ia32_rdtsc() : 0; }
@@ -5075,6 +5095,7 @@ __attribute__((constructor)) static void js_drc_repark_init(void)
     }
 #endif
     if (getenv("QJS_NONURSERY")) y_interp_on = 0;
+    if (getenv("QJS_FORMLESS")) y_formless = 1;
     if (getenv("QJS_Y_GATE")) { qjs_y_gate = atoi(getenv("QJS_Y_GATE")); y_gate_fixed = 1; }
     if (getenv("QJS_DRC_MINLIM")) js_drc_minlim = (uint32_t)atoi(getenv("QJS_DRC_MINLIM"));
     if (getenv("QJS_DRC_SLACK_MB")) js_drc_slack_min = (size_t)atoi(getenv("QJS_DRC_SLACK_MB")) << 20;
@@ -12399,7 +12420,7 @@ static __attribute__((noinline)) void ss_scan(JSRuntime *rt)
 static void js_drc_pend_flush(JSRuntime *rt);
 /* The unit tells the engine its root form: 1 = roots are found by scanning the native stack, 2 = frame records are found by their magic word. */
 static int qjs_aot_form_v;
-void qjs_aot_set_form(int f) { qjs_aot_form_v |= f; }
+void qjs_aot_set_form(int f) { qjs_aot_form_v |= f; if (f & 8) y_formless = 1; }
 static void js_drc_pin(JSRuntime *rt)
 {
     js_drc_pend_flush(rt);
@@ -32913,6 +32934,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_aot(REGVM_ARGS)
     REGVM_CAPTURE_IP();
     if (unlikely(js_check_stack_overflow(ctx->rt, 0)))
         __attribute__((musttail)) return regvm_t_call_slow(REGVM_PASS);
+    Y_FORMLESS_ARGS(JS_UNDEFINED, FRP(ab), na);
     r = aot_call_light_impl(ctx, f, na, FR(c), JS_UNDEFINED, FRP(ab), &rv);
     if (r == 0)
         __attribute__((musttail)) return regvm_t_call_slow(REGVM_PASS);
@@ -32931,6 +32953,7 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_call_method_aot(REGVM
     REGVM_CAPTURE_IP();
     if (unlikely(js_check_stack_overflow(ctx->rt, 0)))
         __attribute__((musttail)) return regvm_t_call_method_slow(REGVM_PASS);
+    Y_FORMLESS_ARGS(FR(t), FRP(ab), na);
     r = aot_call_light_impl(ctx, f, na, FR(c), FR(t), FRP(ab), &rv);
     if (r == 0)
         __attribute__((musttail)) return regvm_t_call_method_slow(REGVM_PASS);
@@ -37787,6 +37810,12 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                     aot_entry_pc =
                         (uint32_t)(regvm_resume_marker - b->regvm_code);
                 js_aot_enter_count++;
+                if (unlikely(y_formless) && aot_entry_pc == 0) {
+                    int nr = regvm_frame_regs(b), k;
+                    for (k = 0; k < nr; k++)
+                        if (JS_VALUE_GET_TAG(regs[k]) == JS_TAG_OBJECT && Y_IS(JS_VALUE_GET_PTR(regs[k])) && Y_YOUNG(JS_VALUE_GET_PTR(regs[k])))
+                            y_promote_now(JS_VALUE_GET_OBJ(regs[k]));
+                }
                 run.resume_marker = regvm_resume_marker;
                 ret_val = ((JSAotFn)b->aot_fn)(ctx, &run, regs, aot_entry_pc);
                 regvm_resume_marker = run.resume_marker;
@@ -41250,6 +41279,8 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
             js_closcyc_frame(rt, sf, true);
         rt->regvm_cur = sf->rv_light;
         rt->current_stack_frame = sf->prev_frame;
+        if (unlikely(y_formless) && JS_VALUE_GET_TAG(ret_val) == JS_TAG_OBJECT && Y_IS(JS_VALUE_GET_PTR(ret_val)) && Y_YOUNG(JS_VALUE_GET_PTR(ret_val)))
+            y_promote_now(JS_VALUE_GET_OBJ(ret_val));
         return ret_val;
     }
 }
@@ -43344,6 +43375,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         {
             JSValue aot_ret;
             js_aot_enter_count++;
+            Y_FORMLESS_ARGS(this_obj, argv, argc);
             aot_ret = ((JSAotNFn)b->aot_nfn)(caller_ctx, rt->regvm_cur, p, this_obj,
                                              (JSValue *)argv, argc);
             return aot_ret;
@@ -46955,6 +46987,7 @@ JSValue JS_Call(JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj,
                        !((ar->disabled[b->aot_index >> 3] >> (b->aot_index & 7)) & 1))) {
                 if (js_poll_interrupts(ctx))
                     return JS_EXCEPTION;
+                Y_FORMLESS_ARGS(this_obj, argv, argc);
                 res = ((JSAotNFn)b->aot_nfn)(ctx, rt->regvm_cur, p, this_obj, (JSValue *)argv, argc);
                 if (rt->current_stack_frame == NULL && regvm_light_head(rt->regvm_cur) == NULL)
                     js_drc_safepoint(rt);
