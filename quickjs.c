@@ -12127,6 +12127,8 @@ void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
         case JS_CLASS_BIG_INT:           /* u.object_data */
             compute_value_size(p->u.object_data, hp);
             break;
+        case JS_CLASS_OBJECT:            /* no class data: the union is not used */
+            break;
         case JS_CLASS_C_FUNCTION:        /* u.cfunc */
             s->c_func_count++;
             break;
