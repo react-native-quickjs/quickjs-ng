@@ -51014,7 +51014,7 @@ static __exception int compute_stack_size(JSContext *ctx,
 static int regvm_homes_mode(void)
 {
     const char *mode = REGVM_KNOB("REGVM_HOMES");
-    return mode ? atoi(mode) : 0;
+    return mode ? atoi(mode) : 5;
 }
 
 /*
