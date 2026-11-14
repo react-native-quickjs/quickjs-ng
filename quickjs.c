@@ -86403,6 +86403,14 @@ static JSValue JS_ReadModule(BCReaderState *s)
     m->func_obj = JS_ReadObjectRec(s);
     if (JS_IsException(m->func_obj))
         goto fail;
+    /* A module's body is function bytecode. Any other value is owned by the
+       module definition, which the collector does not trace: a plain object
+       there counts as an outside reference and keeps its prototype chain, and
+       through it the whole realm, alive after the context is released. */
+    if (JS_VALUE_GET_TAG(m->func_obj) != JS_TAG_FUNCTION_BYTECODE) {
+        JS_ThrowSyntaxError(ctx, "invalid module function");
+        goto fail;
+    }
     return obj;
  fail:
     if (m) {
