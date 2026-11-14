@@ -79028,9 +79028,9 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
     ir.aw_n = 0;
     ir.aw_scanned = 0;
     ir.aw_last_win = -1;
-    /* The baseline tier has no SSA or argument retargeting, and the staging
-       index's arrays grow with the peak depth, so it is disabled there. */
-    if (n_values > 0 && !fd->regvm_baseline) {
+    /* The staging index answers the retarget scan's questions without
+       scanning, so the baseline tier needs it as much as the others. */
+    if (n_values > 0) {
         int32_t *awd = js_malloc(ctx, (size_t)n_values * sizeof(int32_t));
         int32_t *awr = js_malloc(ctx, (size_t)n_values * sizeof(int32_t));
         if (awd && awr) {
