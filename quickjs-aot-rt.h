@@ -141,6 +141,11 @@ typedef struct JSAotGenLayout {
     /* The cache entry kind of a holder two prototypes up, and the byte and mask of
        `is_HTMLDDA`: an inline null test of an object has to ask it. */
     uint32_t reg_pic_proto2, off_object_htmldda_byte, object_htmldda_mask;
+    /* The global variable cell sets: a store to a global the read cache holds is a lookup of
+       the atom's set, a generation test and a store into the slot when the cell says the
+       property is plainly writable. */
+    uint32_t off_ctx_gv_cells, sizeof_gv_cell, gv_cell_sets, gv_cell_ways;
+    uint32_t off_gvc_atom, off_gvc_gen, off_gvc_slot, off_gvc_wr;
     /* The rest of the light-frame header a generated native entry writes, so
        it can build the frame the engine's own light call builds. The header is
        the frame's first `light_prefix_slots` words; `off_regrun_fr` is where
