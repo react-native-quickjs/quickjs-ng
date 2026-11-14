@@ -6059,8 +6059,9 @@ static JSAtom __JS_NewAtom(JSRuntime *rt, JSString *str, int atom_type)
         /* Note: the atom 0 is not used */
         start = rt->atom_size;
         if (start == 0) {
-            /* JS_ATOM_NULL entry */
-            p = js_mallocz_rt(rt, sizeof(JSAtomStruct));
+            /* JS_ATOM_NULL entry. JS_AtomToString hands it out as the (empty) string it is, and JS_ToCStringLen
+               returns a string's bytes in place: they need the terminator that follows every string body. */
+            p = js_mallocz_rt(rt, sizeof(JSAtomStruct) + 1);
             if (!p) {
                 js_free_rt(rt, new_array);
                 goto fail;
@@ -84919,6 +84920,18 @@ static int bc_get_atom(BCReaderState *s, JSAtom *patom)
     }
 }
 
+/* An atom that names a module or one of its imports and exports: JS_ATOM_NULL names nothing, and the writer never emits it. */
+static int bc_get_name_atom(BCReaderState *s, JSAtom *patom)
+{
+    if (bc_get_atom(s, patom))
+        return -1;
+    if (unlikely(*patom == JS_ATOM_NULL)) {
+        JS_ThrowSyntaxError(s->ctx, "invalid module name atom");
+        return -1;
+    }
+    return 0;
+}
+
 #if QJS_REGVM
 /* ULEB128 from a wire buffer, bounded by `end`. A value longer than 32 bits is
    an error, and so is running off the end. */
@@ -86382,7 +86395,7 @@ static JSValue JS_ReadModule(BCReaderState *s)
     int i;
     uint8_t v8;
 
-    if (bc_get_atom(s, &module_name))
+    if (bc_get_name_atom(s, &module_name))
         goto fail;
 #ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
     if (check_dump_flag(s->ctx->rt, JS_DUMP_READ_OBJECT)) {
@@ -86409,7 +86422,7 @@ static JSValue JS_ReadModule(BCReaderState *s)
             JSReqModuleEntry *rme = &m->req_module_entries[i];
             JSModuleDef **pm = &rme->module;
             rme->attributes = JS_UNDEFINED;
-            if (bc_get_atom(s, &rme->module_name))
+            if (bc_get_name_atom(s, &rme->module_name))
                 goto fail;
             // Resolves a module either from the cache or by requesting
             // it from the module loader. From cache is not ideal because
@@ -86448,10 +86461,10 @@ static JSValue JS_ReadModule(BCReaderState *s)
                     goto fail;
                 if ((uint32_t)me->u.req_module_idx >= (uint32_t)m->req_module_entries_count)
                     goto fail_index;
-                if (bc_get_atom(s, &me->local_name))
+                if (bc_get_name_atom(s, &me->local_name))
                     goto fail;
             }
-            if (bc_get_atom(s, &me->export_name))
+            if (bc_get_name_atom(s, &me->export_name))
                 goto fail;
         }
     }
@@ -86485,7 +86498,7 @@ static JSValue JS_ReadModule(BCReaderState *s)
             JSImportEntry *mi = &m->import_entries[i];
             if (bc_get_leb128_int(s, &mi->var_idx))
                 goto fail;
-            if (bc_get_atom(s, &mi->import_name))
+            if (bc_get_name_atom(s, &mi->import_name))
                 goto fail;
             if (bc_get_leb128_int(s, &mi->req_module_idx))
                 goto fail;
