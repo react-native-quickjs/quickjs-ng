@@ -2222,7 +2222,8 @@ int main(int argc, char **argv)
         } else if (str_equal(arg, "-d")) {
             enumerate_tests(get_opt_arg(arg, argv[optind++]));
         } else if (str_equal(arg, "-e")) {
-            error_filename = get_opt_arg(arg, argv[optind++]);
+            free(error_filename);
+            error_filename = strdup(get_opt_arg(arg, argv[optind++]));
         } else if (str_equal(arg, "-x")) {
             namelist_load(&exclude_list, get_opt_arg(arg, argv[optind++]));
         } else if (str_equal(arg, "-f")) {
