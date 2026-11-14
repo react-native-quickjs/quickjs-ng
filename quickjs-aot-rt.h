@@ -227,6 +227,8 @@ QJS_AOT_STUB const void *qjs_aot_array_iterator_next_fn(void);
 QJS_AOT_STUB const void *qjs_aot_array_builtin_fn(int which);
 /* push of one value through the builtin on a plain array the body checked (the capacity miss of the inline push); 0 = it threw and nothing happened */
 QJS_AOT_STUB int qjs_aot_array_push_slow(JSContext *ctx, JSValue arr, JSValue v, JSValue *out);
+/* the byte offset of the own data property `atom` in objects of `shape`, or 0 when it is not one (a compiled copy resolves its receiver's slots from the shape) */
+QJS_AOT_STUB int qjs_aot_shape_slot(const void *shape, uint32_t atom, uint32_t *off);
 /* The function pointer of the builtin `Function.prototype.apply`, which a C function object holds,
    with cproto generic_magic and magic 0, when it is that builtin. A unit that bypasses a
    `f.apply(this, arguments)` compares the `apply` it would bypass against this, so a program that

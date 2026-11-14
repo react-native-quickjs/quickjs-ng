@@ -65255,6 +65255,34 @@ QJS_AOT_STUB int qjs_aot_array_push_slow(JSContext *ctx, JSValue arr, JSValue v,
     return 1;
 }
 
+/* Where the property `atom` lives in objects of shape `shape`: 1 with the byte offset of its slot in the property array when it is an own
+   data property of the shape (an accessor, a variable reference or an auto-initialised slot is not), else 0. Reads nothing but the shape,
+   so it is only as good as the shape is: the caller keeps the answer while the shape cannot be freed or edited in place (shape_free_epoch)
+   and the properties of its prototypes cannot change (aot_pic_epoch). */
+QJS_AOT_STUB int qjs_aot_shape_slot(const void *shape, uint32_t atom, uint32_t *off)
+{
+    JSShape *sh = (JSShape *)shape;
+    JSShapeProperty *pr, *prop;
+    intptr_t h;
+
+    if (sh == NULL)
+        return 0;
+    h = (uintptr_t)atom & sh->prop_hash_mask;
+    h = prop_hash_end(sh)[-h - 1];
+    prop = get_shape_prop(sh);
+    while (h) {
+        pr = &prop[h - 1];
+        if (pr->atom == (JSAtom)atom) {
+            if ((pr->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+                return 0;
+            *off = (uint32_t)((pr - prop) * sizeof(JSProperty));
+            return 1;
+        }
+        h = pr->hash_next;
+    }
+    return 0;
+}
+
 QJS_AOT_STUB const void *qjs_aot_function_apply_fn(void)
 {
     return (const void *)js_function_apply;
