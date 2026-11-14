@@ -319,6 +319,8 @@ void qjs_aot_release(JSRuntime *rt);
 QJS_AOT_STUB void *qjs_aot_layout_dup(void *sh);
 QJS_AOT_STUB void qjs_aot_layout_free(JSRuntime *rt, void *sh);
 QJS_AOT_STUB uint32_t qjs_aot_shape_layout(const void *sh);
+QJS_AOT_STUB JSValue qjs_aot_object_prototype(JSContext *ctx);
+QJS_AOT_STUB JSValue qjs_aot_function_prototype(JSContext *ctx, JSValueConst fn);
 QJS_AOT_STUB uint32_t qjs_aot_layout_build(JSContext *ctx, JSValue proto_val,
                                            const JSAtom *atoms, uint32_t n,
                                            void *out, uint32_t out_cap,
