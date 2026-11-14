@@ -4085,6 +4085,42 @@ static uint8_t *REGVM_CC regvm_s_ROP_mul(uint8_t *ip, JSValue *fr, JSRegRun *rf,
     return NULL;
 }
 
+static uint8_t *REGVM_CC regvm_s_ROP_post_inc(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+{
+    JSFunctionBytecode *b = rf->b;
+    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
+    JSRegPIC *pic = rf->pic;
+    uint8_t *rpc = ip;
+    int op = *rpc++;
+    JSValue ret_val = JS_UNDEFINED;
+    JSValue *regs = fr;
+    JSValue *arg_buf = rf->arg_buf;
+    int argc = rf->argc;
+    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ { REGVM_POST_OP(REG_UN_INC); }
+ exception:
+    rf->ret = JS_EXCEPTION;
+    return NULL;
+}
+
+static uint8_t *REGVM_CC regvm_s_ROP_post_dec(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
+{
+    JSFunctionBytecode *b = rf->b;
+    JSObject *p = JS_VALUE_GET_OBJ(rf->sf->cur_func);
+    JSRegPIC *pic = rf->pic;
+    uint8_t *rpc = ip;
+    int op = *rpc++;
+    JSValue ret_val = JS_UNDEFINED;
+    JSValue *regs = fr;
+    JSValue *arg_buf = rf->arg_buf;
+    int argc = rf->argc;
+    (void)b; (void)p; (void)pic; (void)rpc; (void)op; (void)ret_val; (void)regs; (void)arg_buf; (void)argc;
+ { REGVM_POST_OP(REG_UN_DEC); }
+ exception:
+    rf->ret = JS_EXCEPTION;
+    return NULL;
+}
+
 static uint8_t *REGVM_CC regvm_s_ROP_mul_add(uint8_t *ip, JSValue *fr, JSRegRun *rf, JSContext *ctx)
 {
     JSFunctionBytecode *b = rf->b;
@@ -6547,6 +6583,8 @@ static const regvm_handler regvm_step_table[ROP_COUNT] = {
     [ROP_get_field_chain] = regvm_s_ROP_get_field_chain,
     [ROP_get_field_chain_own] = regvm_s_ROP_get_field_chain,
     [ROP_mul_add] = regvm_s_ROP_mul_add,
+    [ROP_post_inc] = regvm_s_ROP_post_inc,
+    [ROP_post_dec] = regvm_s_ROP_post_dec,
     [ROP_mul_sub] = regvm_s_ROP_mul_sub,
     [ROP_add_mul] = regvm_s_ROP_add_mul,
     [ROP_sub_mul] = regvm_s_ROP_sub_mul,
@@ -6789,6 +6827,8 @@ static const uint8_t regvm_step_covered[ROP_COUNT] = {
     [ROP_get_field_chain] = 1,
     [ROP_get_field_chain_own] = 1,
     [ROP_mul_add] = 1,
+    [ROP_post_inc] = 1,
+    [ROP_post_dec] = 1,
     [ROP_mul_sub] = 1,
     [ROP_add_mul] = 1,
     [ROP_sub_mul] = 1,
