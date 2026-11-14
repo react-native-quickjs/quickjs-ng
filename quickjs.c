@@ -103651,6 +103651,50 @@ static JSValue js_regexp_replace_fast(JSContext *ctx, JSObject *rxo,
         return js_dup(S);
     }
     has_dollar = !functional && string_indexof_char(rp, '$', 0) >= 0;
+    if (!functional && !has_dollar && !sp->is_wide_char && !rp->is_wide_char) {
+        /* 8-bit subject and replacement without `$`: the result length is known from the match vector, so the string is allocated once at its
+           size and filled by copying the spans (no growing buffer, no trimming realloc) */
+        int64_t total = 0;
+        JSString *out;
+        uint8_t *w;
+        for (mi = 0; mi < m.n; mi++) {
+            const int32_t *e = m.v + mi * m.stride;
+            if (e[0] >= next) {
+                total += (int64_t)(e[0] - next) + rp->len;
+                next = e[1];
+            }
+        }
+        total += (int64_t)sp->len - next;
+        if (total == 0) {
+            js_re_matches_free(&m);
+            return js_empty_string(ctx->rt);
+        }
+        if (total > JS_STRING_LEN_MAX) {
+            js_re_matches_free(&m);
+            return JS_ThrowRangeError(ctx, "invalid string length");
+        }
+        out = js_alloc_string(ctx, (int)total, 0);
+        if (!out) {
+            js_re_matches_free(&m);
+            return JS_EXCEPTION;
+        }
+        w = str8(out);
+        next = 0;
+        for (mi = 0; mi < m.n; mi++) {
+            const int32_t *e = m.v + mi * m.stride;
+            if (e[0] >= next) {
+                memcpy(w, str8(sp) + next, (size_t)(e[0] - next));
+                w += e[0] - next;
+                memcpy(w, str8(rp), rp->len);
+                w += rp->len;
+                next = e[1];
+            }
+        }
+        memcpy(w, str8(sp) + next, (size_t)(sp->len - next));
+        w[sp->len - next] = 0;
+        js_re_matches_free(&m);
+        return JS_MKPTR(JS_TAG_STRING, out);
+    }
     string_buffer_init(ctx, b, 0);
     if (functional && ncap + 2 > (int)countof(args_stack)) {
         args = js_malloc(ctx, sizeof(args[0]) * (ncap + 2));
