@@ -70299,9 +70299,12 @@ static int bc_intern_atom(BCReaderState *s, uint32_t idx)
     JSAtom atom;
     uint8_t type;
 
-    s->ptr = s->buf_start + s->atom_offset[idx];
-    if (s->lazy_src)
+    if (s->lazy_src) {
+        s->ptr = s->lazy_src->buf + s->atom_offset[idx];
         s->buf_end = s->lazy_src->buf + s->lazy_src->buf_len;
+    } else {
+        s->ptr = s->buf_start + s->atom_offset[idx];
+    }
     s->ptr_last = NULL;
 
     if (bc_get_u8(s, &type))
@@ -70680,7 +70683,9 @@ static int regvm_validate_code(JSContext *ctx, const JSFunctionBytecode *b)
     const uint8_t *code = b->regvm_code;
     int len = b->regvm_len;
     int wide = 1;                       /* register operands are two bytes */
-    uint32_t atom_count = ctx->rt->atom_count;
+    /* atom indices range over the whole table, free slots included, so the
+       bound is its size, not the number of live atoms */
+    uint32_t atom_count = ctx->rt->atom_size;
     uint8_t *is_start = NULL;
     int *targets = NULL;
     int p, i, n_targets = 0, rc = -1;
