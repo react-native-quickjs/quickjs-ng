@@ -87,6 +87,13 @@ QJS_AOT_STUB JSValue qjs_aot_deopt(JSContext *ctx, JSRegRun *f, JSValue *fr,
    execution to fail. Only such a unit calls it; a normal unit has no sweep. */
 QJS_AOT_STUB int qjs_aot_should_deopt(JSContext *ctx, uint32_t site);
 
+/* A compiled loop's back edge polls the embedder's interrupt handler here, the
+   way every interpreter back edge does, so a compiled `while (true) {}` can
+   still be stopped. The counter is the context's own, so a compiled loop and
+   an interpreted one share the same budget. Returns 0 to continue, -1 after
+   throwing. */
+QJS_AOT_STUB int qjs_aot_poll(JSContext *ctx);
+
 /* Sentinels returned by qjs_aot_step; they mirror REGVM_COLD_RET and
    REGVM_STEP_SUSPEND in quickjs.c. */
 #define QJS_AOT_COLD_RET ((uint8_t *)1)
