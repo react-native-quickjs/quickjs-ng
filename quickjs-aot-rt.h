@@ -199,6 +199,10 @@ QJS_AOT_STUB JSValue qjs_aot_unwind(JSContext *ctx, JSRegRun *f, JSValue *fr,
 /* The register file holds JSValues at byte offsets; operands are byte offsets. */
 #define AOT_REG(fr, off) (*(JSValue *)((uint8_t *)(fr) + (off)))
 
+/* How often a specialised body was refused at entry, and how many exits it
+   took, under QJS_AOT_STATS. The unit bumps these directly. */
+extern uint64_t qjs_aot_spec_refused, qjs_aot_spec_exits;
+
 /* Re-read a 32-bit little-endian operand (an atom) from the live bytecode. */
 static inline uint32_t qjs_aot_ld_u32(const uint8_t *p)
 {
