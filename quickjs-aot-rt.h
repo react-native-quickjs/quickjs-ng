@@ -125,6 +125,10 @@ typedef struct JSAotGenLayout {
     /* The frame flags a generated native entry composes, from REGVM_FLAG_*. */
     uint32_t regvm_flag_light, regvm_flag_c_entry, regvm_flag_stack;
     uint32_t regvm_flag_trivial_ret, regvm_flag_same_realm;
+    /* How far before an object pointer its reference count lives (an int in
+       the allocator's block header, js_rc()), so a unit counts a reference
+       inline instead of calling JS_DupValue. */
+    uint32_t off_rc_back;
 } JSAotGenLayout;
 
 /* Fold every field after `hash` (the hash field itself is excluded). Shared by
