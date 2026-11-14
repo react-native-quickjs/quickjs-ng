@@ -14805,6 +14805,10 @@ static JSProperty *add_property(JSContext *ctx,
         }
     }
     assert(JS_REF_COUNT(p->shape) == 1);
+    /* A hashed shape that no other object or cache references and for which no transition exists is extended in place: the
+       same address now names a shape with one more property. See js_shape_prepare_update. */
+    if (p->shape->is_hashed)
+        ctx->rt->shape_free_epoch++;
     if (add_shape_property(ctx, &p->shape, p, prop, prop_flags))
         return NULL;
     return &p->prop[p->shape->prop_count - 1];
@@ -16814,6 +16818,10 @@ static int js_shape_prepare_update(JSContext *ctx, JSObject *p,
             js_aot_shape_stat[2]++;
             if (sh->aot_observed) js_aot_shape_stat[3]++;
 #endif
+            /* The shape is about to be edited where it stands, at the same address. Every cache that names a shape by its
+               address (the global stub cache, the compiled code's statics) validates with shape_free_epoch, so this move
+               retires what they recorded about it. */
+            ctx->rt->shape_free_epoch++;
             js_shape_hash_unlink(ctx->rt, sh);
             sh->is_hashed = false;
         }
