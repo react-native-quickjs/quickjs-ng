@@ -67068,13 +67068,14 @@ QJS_AOT_STUB void qjs_aot_stack_release(JSContext *ctx, JSValue obj, JSValue arr
     }
 }
 
-/* Move a stack object and its stack array (either may be undefined) to the heap: the heap array takes the elements (their references move), the heap object takes
-   the fields (the field that held the stack array holds the heap array), and the stack blocks are emptied and released. *hobj and *harr each hold one reference for
-   the caller. 1, or 0 with nothing moved on an out-of-memory. */
-QJS_AOT_STUB int qjs_aot_stack_migrate(JSContext *ctx, JSValue obj, JSValue arr, JSValue *hobj, JSValue *harr)
+/* Move a stack object, its stack array and its stack child object (any may be undefined) to the heap: the heap array takes the elements (their references move), the heap child and the
+   heap object take the fields (a field of the object that held the stack array holds the heap array, a field that held the stack child holds the heap child), and the stack blocks are
+   emptied and released. A field that no longer holds the child (it was overwritten after the store) is left alone, and the child is moved all the same: the code that made it may still hold
+   it. *hobj, *harr and *hchild each hold one reference for the caller. 1, or 0 with nothing moved on an out-of-memory. */
+static int js_stack_migrate2(JSContext *ctx, JSValue obj, JSValue arr, JSValue child, JSValue *hobj, JSValue *harr, JSValue *hchild)
 {
-    JSValue ha = JS_UNDEFINED, ho = JS_UNDEFINED;
-    JSObject *a = NULL, *p = NULL;
+    JSValue ha = JS_UNDEFINED, hc = JS_UNDEFINED, ho = JS_UNDEFINED;
+    JSObject *a = NULL, *c = NULL, *p = NULL;
     uint32_t k;
     int i;
     if (JS_VALUE_GET_TAG(arr) == JS_TAG_OBJECT) {
@@ -67083,11 +67084,20 @@ QJS_AOT_STUB int qjs_aot_stack_migrate(JSContext *ctx, JSValue obj, JSValue arr,
         if (JS_IsException(ha))
             return 0;
     }
+    if (JS_VALUE_GET_TAG(child) == JS_TAG_OBJECT) {
+        c = JS_VALUE_GET_OBJ(child);
+        hc = qjs_aot_new_from_shape_cap(ctx, c->shape, c->prop_inline_cap);
+        if (JS_IsException(hc)) {
+            JS_FreeValue(ctx, ha);
+            return 0;
+        }
+    }
     if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
         p = JS_VALUE_GET_OBJ(obj);
         ho = qjs_aot_new_from_shape_cap(ctx, p->shape, p->prop_inline_cap);   /* the room the stack block had: fields the object gains after the move fit as they did before it */
         if (JS_IsException(ho)) {
             JS_FreeValue(ctx, ha);
+            JS_FreeValue(ctx, hc);
             return 0;
         }
     }
@@ -67099,22 +67109,48 @@ QJS_AOT_STUB int qjs_aot_stack_migrate(JSContext *ctx, JSValue obj, JSValue arr,
         h->prop[0].u.value = js_int32((int32_t)a->u.array.count);
         a->u.array.count = 0;
     }
+    if (c != NULL) {
+        JSObject *h = JS_VALUE_GET_OBJ(hc);
+        for (i = 0; i < c->shape->prop_count; i++) {
+            h->prop[i].u.value = c->prop[i].u.value;
+            c->prop[i].u.value = JS_UNDEFINED;
+        }
+    }
     if (p != NULL) {
         JSObject *h = JS_VALUE_GET_OBJ(ho);
         for (i = 0; i < p->shape->prop_count; i++) {
             JSValue v = p->prop[i].u.value;
             if (a != NULL && JS_VALUE_HAS_REF_COUNT(v) && JS_VALUE_GET_PTR(v) == (void *)a)
                 v = JS_DupValue(ctx, ha);
+            else if (c != NULL && JS_VALUE_HAS_REF_COUNT(v) && JS_VALUE_GET_PTR(v) == (void *)c)
+                v = JS_DupValue(ctx, hc);
             h->prop[i].u.value = v;
             p->prop[i].u.value = JS_UNDEFINED;
         }
     }
     qjs_aot_stack_release(ctx, obj, arr);
+    qjs_aot_stack_release(ctx, child, JS_UNDEFINED);   /* its fields moved: what is left is its shape reference */
+    if (c != NULL)
+        qjs_aot_object_filled(ctx, hc);
     if (p != NULL)
         qjs_aot_object_filled(ctx, ho);   /* the slot-claim check the stack object skipped */
     *hobj = ho;
     *harr = ha;
+    *hchild = hc;
     return 1;
+}
+
+QJS_AOT_STUB int qjs_aot_stack_migrate(JSContext *ctx, JSValue obj, JSValue arr, JSValue *hobj, JSValue *harr)
+{
+    JSValue hc;
+    return js_stack_migrate2(ctx, obj, arr, JS_UNDEFINED, hobj, harr, &hc);
+}
+
+/* The same for a stack object and a stack object that a field of it holds (or held: see above), either may be undefined. */
+QJS_AOT_STUB int qjs_aot_stack_migrate_child(JSContext *ctx, JSValue obj, JSValue child, JSValue *hobj, JSValue *hchild)
+{
+    JSValue ha;
+    return js_stack_migrate2(ctx, obj, JS_UNDEFINED, child, hobj, &ha, hchild);
 }
 
 /* `a + b` where one side is a string and the other a string or a primitive whose string form runs no code (a number, a boolean,
