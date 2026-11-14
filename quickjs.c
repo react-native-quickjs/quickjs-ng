@@ -22004,6 +22004,30 @@ static void regvm_pic_install(JSRuntime *rt, JSRegPIC *e, uint16_t kind,
     e->kind = kind;
 }
 
+/* Hash an unhashed shape in place so the per-function PIC can hold it. A
+ * counted reference does not stop an unhashed shape from being mutated in
+ * place; a hashed one with refcount >= 2 is copy-on-write, which the hit path
+ * needs. The hash is recomputed from the property list because `sh->hash` is
+ * only maintained while `is_hashed`.
+ */
+static void regvm_shape_hashify(JSRuntime *rt, JSShape *sh)
+{
+    uint32_t h, i;
+
+    if (sh->is_hashed)
+        return;
+    if (2 * (rt->shape_hash_count + 1) > rt->shape_hash_size)
+        resize_shape_hash(rt, rt->shape_hash_bits + 1);
+    h = shape_initial_hash(sh->proto);
+    for (i = 0; i < sh->prop_count; i++) {
+        JSShapeProperty *pr = get_shape_prop(sh) + i;
+        h = shape_hash(shape_hash(h, pr->atom), pr->flags);
+    }
+    sh->hash = h;
+    sh->is_hashed = true;
+    js_shape_hash_link(rt, sh);
+}
+
 static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
                            JSRegPIC **ppic, JSValue recv, JSAtom atom, int site)
 {
@@ -22067,6 +22091,14 @@ static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
 
     rsh = p->shape;
     slot = (uint32_t)(pr - holder->prop);
+
+    /* A depth-0/1 site hashes its receiver shape (see regvm_shape_hashify);
+       depth-2 sites use the global stub cache, which does not need it. */
+    if (depth <= 1) {
+        regvm_shape_hashify(rt, rsh);
+        if (hsh)
+            regvm_shape_hashify(rt, hsh);
+    }
 
     /* The site's state before the install below, which can newly kill it. A
        site with no table yet is not dead. */
