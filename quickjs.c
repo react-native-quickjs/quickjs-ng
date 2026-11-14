@@ -58446,9 +58446,9 @@ static void regvm_unmap_atoms(uint8_t *code, int len, int wide, int n,
             if (fmt[m] == 'a' ||
                 ((op == ROP_load_const || op == ROP_binary_cpool) && fmt[m] == 'c' &&
                  kind == REG_CONST_ATOM)) {
-                uint32_t a = (uint32_t)(code[q] | (code[q + 1] << 8) |
-                                        (code[q + 2] << 16) |
-                                        (code[q + 3] << 24));
+                uint32_t a = ((uint32_t)code[q] | ((uint32_t)code[q + 1] << 8) |
+                              ((uint32_t)code[q + 2] << 16) |
+                              ((uint32_t)code[q + 3] << 24));
                 JS_FreeAtomRT(rt, a);
                 if (++seen == n)
                     return;
@@ -70898,6 +70898,10 @@ regvm_wire_decode(BCReaderState *s, JSFunctionBytecode *b,
         }
         nar = regvm_rop_narrow((uint16_t)op);
         q = exec + 1;
+        if (q > exec_len) {
+            JS_ThrowSyntaxError(ctx, "register program too long");
+            goto fail_ins;
+        }
         for (m = 0; fmt[m]; m++) {
             int need, is_atom = 0;
             uint32_t v;
@@ -71024,6 +71028,59 @@ regvm_wire_decode(BCReaderState *s, JSFunctionBytecode *b,
             ops[1] != REG_CONST_CPOOL && ops[1] != REG_CONST_ATOM) {
             JS_ThrowSyntaxError(ctx, "invalid register constant kind %d", ops[1]);
             goto fail_ins;
+        }
+        {
+            /* Slot operands index the frame's local, argument or closure-ref
+               arrays, which the runtime dereferences unchecked, so bound every
+               one here. A var_ref slot may name a captured local or a closure
+               variable, so its bound is the larger of var_ref_count and
+               closure_var_count. */
+            uint32_t vr_bound = b->var_ref_count > b->closure_var_count
+                                    ? b->var_ref_count : b->closure_var_count;
+            int slot = -1;
+            uint32_t bound = 0;
+            switch (op) {
+            case ROP_get_local:
+                slot = ops[1]; bound = b->var_count; break;
+            case ROP_put_local:
+            case ROP_local_check:
+            case ROP_local_check_init:
+            case ROP_local_uninit:
+            case ROP_close_local:
+                slot = ops[0]; bound = b->var_count; break;
+            case ROP_get_local_s0: case ROP_get_local_s1:
+            case ROP_get_local_s2: case ROP_get_local_s3:
+                slot = op - ROP_get_local_s0; bound = b->var_count; break;
+            case ROP_put_local_s0: case ROP_put_local_s1:
+            case ROP_put_local_s2: case ROP_put_local_s3:
+                slot = op - ROP_put_local_s0; bound = b->var_count; break;
+            case ROP_get_arg:
+                slot = ops[1]; bound = b->arg_count; break;
+            case ROP_put_arg:
+            case ROP_put_arg_xfer:
+                slot = ops[0]; bound = b->arg_count; break;
+            case ROP_get_arg_el:
+                /* `u` names the `arguments` object's var_buf slot, not an
+                   argument index (see regvm_t_get_arg_el_slow). */
+                slot = ops[1]; bound = b->var_count; break;
+            case ROP_get_var_ref:
+                slot = ops[1]; bound = vr_bound; break;
+            case ROP_put_var_ref:
+            case ROP_var_ref_check:
+            case ROP_var_ref_check_init:
+                slot = ops[0]; bound = vr_bound; break;
+            case ROP_make_local_ref:
+                slot = ops[3];
+                bound = ops[4] == 0 ? b->var_count
+                      : ops[4] == 1 ? b->arg_count : vr_bound;
+                break;
+            default:
+                break;
+            }
+            if (slot >= 0 && (uint32_t)slot >= bound) {
+                JS_ThrowSyntaxError(ctx, "register slot out of range");
+                goto fail_ins;
+            }
         }
         if (op == ROP_make_local_ref && ops[4] == 1)
             borrowable = false;
@@ -71586,6 +71643,14 @@ static int JS_ReadFunctionBody(BCReaderState *s, JSFunctionBytecode *b,
                     b->args_captured = 1;
                 if (bc_get_leb128_u16(s, &vd->var_ref_idx))
                     return -1;
+#if QJS_REGVM
+                /* get_var_ref has no bound of its own on
+                   sf->var_refs[vd->var_ref_idx]. */
+                if (vd->var_ref_idx >= b->var_ref_count) {
+                    JS_ThrowSyntaxError(ctx, "invalid var_ref index");
+                    return -1;
+                }
+#endif
             }
 #ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
             if (check_dump_flag(s->ctx->rt, JS_DUMP_READ_OBJECT)) {
@@ -72077,6 +72142,14 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
                 goto fail;
             idx = 0;
             cv->closure_type = bc_get_flags(flags, &idx, 3);
+#if QJS_REGVM
+            /* js_closure2 aborts on an unknown closure type; reject it here. */
+            if (cv->closure_type > JS_CLOSURE_GLOBAL_REF) {
+                JS_ThrowSyntaxError(ctx, "invalid closure type %d",
+                                    cv->closure_type);
+                goto fail;
+            }
+#endif
             cv->is_const = bc_get_flags(flags, &idx, 1);
             cv->is_lexical = bc_get_flags(flags, &idx, 1);
             cv->var_kind = bc_get_flags(flags, &idx, 4);
