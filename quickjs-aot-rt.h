@@ -68,6 +68,19 @@ static inline uint32_t qjs_aot_layout_hash(const JSAotGenLayout *l)
 /* The unit's layout hash; defined by a generated unit, checked at bind. */
 extern const uint32_t qjs_aot_layout;
 
+/* The runtime's assumption cells and the compiled-function disable bits, both
+   per runtime and allocated at first use. A cell is one byte, one per
+   independent assumption group; it is set to 1 when a write breaks the
+   assumption and is never cleared. A function's disable bit routes its entry to
+   the interpreter once its guards have failed too many times, so a function
+   whose speculation never pays stops paying for it. The unit checks a cell with
+   a load and a branch from the base these return. */
+uint8_t *qjs_aot_cells(JSContext *ctx);
+int qjs_aot_func_disabled(JSContext *ctx, uint32_t fn);
+/* A failed guard: count it against its deopt site, and disable the site's
+   function once the count reaches the limit. */
+void qjs_aot_note_deopt(JSContext *ctx, uint32_t site);
+
 /* Sentinels returned by qjs_aot_step; they mirror REGVM_COLD_RET and
    REGVM_STEP_SUSPEND in quickjs.c. */
 #define QJS_AOT_COLD_RET ((uint8_t *)1)
@@ -85,10 +98,18 @@ typedef struct JSAotEntry {
 } JSAotEntry;
 
 /* The unit's table and size, referenced weakly by the engine; qjs_aot_count
-   is 0 without a unit. */
+   is 0 without a unit. `qjs_aot_cell_count` and `qjs_aot_site_count` are the
+   number of assumption cells and deopt sites the unit declares; the runtime
+   allocates its own arrays of those sizes at first use.
+   `qjs_aot_deopt_site_func` maps a deopt site to the index of its function in
+   `qjs_aot_table`, or UINT32_MAX when that function was not emitted, so the
+   engine can disable a function whose guards keep failing. */
 extern const JSAotEntry qjs_aot_table[];
 extern const uint32_t qjs_aot_count;
 extern const uint32_t qjs_aot_abi;
+extern const uint32_t qjs_aot_cell_count;
+extern const uint32_t qjs_aot_site_count;
+extern const uint32_t qjs_aot_deopt_site_func[];
 
 /* ABI entry points implemented by the engine. */
 QJS_AOT_STUB uint8_t *qjs_aot_step(uint8_t *ip, JSValue *fr, JSRegRun *f, JSContext *ctx);
@@ -210,8 +231,7 @@ JSValue *qjs_aot_var_ref_ptr(JSRegRun *f, int slot);
  * The prototype watchpoint epoch: the unit reads it at function entry; a
  * change means folded values must be re-read.
  */
-QJS_AOT_STUB uint32_t qjs_aot_epoch(JSContext *ctx);
-QJS_AOT_STUB JSValue qjs_aot_site_expect(JSContext *ctx, int site);
+QJS_AOT_STUB uint32_t qjs_aot_epoch(JSContext *ctx);QJS_AOT_STUB JSValue qjs_aot_site_expect(JSContext *ctx, int site);
 
 /* The specialised C-call path: 1 with an owned *out, 0 to fall back to the
    step engine, -1 on exception. `cproto` is the profile's prototype. */
