@@ -235,6 +235,14 @@ QJS_AOT_STUB int qjs_aot_shape_wslot(const void *shape, uint32_t atom, uint32_t 
 /* A counted reference to a shape, and its release (at the unit's teardown). */
 QJS_AOT_STUB void *qjs_aot_shape_hold(const void *shape);
 QJS_AOT_STUB void qjs_aot_shape_release(JSRuntime *rt, void *shape);
+/* A class's instance shape from its prototype and field list (held), a new object of it (fields undefined), the slot-claim check once the
+   fields are written, and a global binding's value without running code (borrowed). */
+QJS_AOT_STUB void *qjs_aot_class_shape(JSContext *ctx, JSValue proto, const uint32_t *atoms, int n);
+QJS_AOT_STUB JSValue qjs_aot_new_from_shape(JSContext *ctx, void *shape);
+QJS_AOT_STUB void qjs_aot_object_filled(JSContext *ctx, JSValue obj);
+/* the engine's once-per-constructor work before a first construct (the unit's layout chain), for a region that constructs the class itself */
+QJS_AOT_STUB void qjs_aot_ctor_prepare(JSContext *ctx, JSValue fn);
+QJS_AOT_STUB int qjs_aot_global_get(JSContext *ctx, uint32_t atom, JSValue *out);
 /* The digest of a bytecode function (the unit's binding key), whether or not it has been called: 1 with 16 bytes, or 0. */
 QJS_AOT_STUB int qjs_aot_function_digest(JSValue fnv, uint8_t out[16]);
 /* the function a receiver of `shape` finds as `atom` on its prototype chain, when it is a plain data property (a compiled copy resolves its receiver's methods from the shape) */

@@ -17382,10 +17382,16 @@ static inline void js_aot_content_store(JSRuntime *rt, JSObject *p, uint32_t slo
    last is already written (the caller of an add writes the last one afterwards, and a layout
    never promises it), so the promises are checked once here. The check runs before the object
    can reach JS: no safepoint lies between the shape set or the fill and this call. */
+/* The private object qjs_aot_class_shape walks a class's shape chain with: its fields are undefined
+   placeholders, not values of the class, so its adds are no evidence against a slot claim. */
+static JSObject *js_aot_shape_scratch;
+
 static void js_aot_content_enter_slow(JSRuntime *rt, JSObject *p, bool filled)
 {
     uint32_t id = p->shape->layout_id, f, n;
     if (js_aot_claim_hooks_off() && !p->is_prototype)
+        return;
+    if (unlikely(p == js_aot_shape_scratch))
         return;
     /* A prototype object entering a contracted shape breaks it: the layout promises that none
        of its objects is one. This runs whether or not the layout makes any slot promise. */
@@ -66382,6 +66388,116 @@ QJS_AOT_STUB void *qjs_aot_shape_hold(const void *shape)
 QJS_AOT_STUB void qjs_aot_shape_release(JSRuntime *rt, void *shape)
 {
     js_free_shape(rt, (JSShape *)shape);
+}
+
+/* A class's instance shape, from the bundle's field list: the hashed shape an object whose prototype is `proto` reaches by adding
+   `atoms[0..n)` in that order as ordinary data properties (what `this.x = v` adds in a constructor). A counted reference
+   (qjs_aot_shape_release), or NULL. Every transition looks a hashed shape up before it makes one, and this reference keeps the final
+   shape in the table, so the engine's own constructs of the class end on this same address. Runs no JS. */
+QJS_AOT_STUB void *qjs_aot_class_shape(JSContext *ctx, JSValue proto, const uint32_t *atoms, int n)
+{
+    JSValue obj;
+    JSObject *p;
+    JSShape *sh;
+    int i;
+
+    if (JS_VALUE_GET_TAG(proto) != JS_TAG_OBJECT || n < 0)
+        return NULL;
+    obj = JS_NewObjectProtoClass(ctx, proto, JS_CLASS_OBJECT);
+    if (JS_IsException(obj)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return NULL;
+    }
+    p = JS_VALUE_GET_OBJ(obj);
+    js_aot_shape_scratch = p;
+    for (i = 0; i < n; i++) {
+        JSProperty *pr;
+        if (find_own_property1(p, (JSAtom)atoms[i]) != NULL)
+            goto fail;
+        pr = add_property(ctx, p, (JSAtom)atoms[i], JS_PROP_C_W_E);
+        if (pr == NULL) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            goto fail;
+        }
+        pr->u.value = JS_UNDEFINED;
+    }
+    js_aot_shape_scratch = NULL;
+    sh = p->shape;
+    if (!sh->is_hashed)
+        goto fail;
+    sh = js_dup_shape(sh);
+    JS_FreeValue(ctx, obj);
+    return sh;
+ fail:
+    js_aot_shape_scratch = NULL;
+    JS_FreeValue(ctx, obj);
+    return NULL;
+}
+
+/* A new ordinary object of a class shape (qjs_aot_class_shape), every field undefined. The caller writes the fields and then calls
+   qjs_aot_object_filled, which checks the slot claims of a contracted layout as the last add of a field would. */
+QJS_AOT_STUB JSValue qjs_aot_new_from_shape(JSContext *ctx, void *shape)
+{
+    JSShape *sh = (JSShape *)shape;
+    JSValue obj;
+    JSObject *p;
+    int i;
+
+    obj = JS_NewObjectFromShape(ctx, js_dup_shape(sh), JS_CLASS_OBJECT, NULL);
+    if (JS_IsException(obj))
+        return obj;
+    p = JS_VALUE_GET_OBJ(obj);
+    for (i = 0; i < sh->prop_count; i++)
+        p->prop[i].u.value = JS_UNDEFINED;
+    return obj;
+}
+
+/* What the engine's construct path does once per constructor before its first construct (the unit's layout chain for it, built against
+   its `prototype` as it is now): a compiled region that makes the class's objects itself runs it at its init instead. */
+QJS_AOT_STUB void qjs_aot_ctor_prepare(JSContext *ctx, JSValue fn)
+{
+    JSObject *p;
+    JSFunctionBytecode *fb;
+
+    if (JS_VALUE_GET_TAG(fn) != JS_TAG_OBJECT)
+        return;
+    p = JS_VALUE_GET_OBJ(fn);
+    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION)
+        return;
+    fb = p->u.func.function_bytecode;
+    if (unlikely(JS_AOT_LAYOUT_CTOR(fb)))
+        js_aot_layout_fn_hook(ctx, fn);
+}
+
+QJS_AOT_STUB void qjs_aot_object_filled(JSContext *ctx, JSValue obj)
+{
+    if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)
+        js_aot_content_filled(ctx->rt, JS_VALUE_GET_OBJ(obj));
+}
+
+/* The value of the global binding `atom` without running code: a lexical binding (let/const/class at the top level) first, then an
+   own data property of the global object (var, function). 1 with a BORROWED value (the binding owns it), 0 when the binding is not
+   there, is an accessor, or is still in its temporal dead zone (the caller leaves its compiled code). */
+QJS_AOT_STUB int qjs_aot_global_get(JSContext *ctx, uint32_t atom, JSValue *out)
+{
+    JSShapeProperty *prs;
+    JSProperty *pr;
+    JSObject *p;
+
+    p = JS_VALUE_GET_OBJ(ctx->global_var_obj);
+    prs = find_own_property(&pr, p, (JSAtom)atom);
+    if (prs == NULL) {
+        p = JS_VALUE_GET_OBJ(ctx->global_obj);
+        prs = find_own_property(&pr, p, (JSAtom)atom);
+        if (prs == NULL)
+            return 0;
+    }
+    if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+        return 0;
+    if (JS_VALUE_GET_TAG(pr->u.value) == JS_TAG_UNINITIALIZED)
+        return 0;
+    *out = pr->u.value;
+    return 1;
 }
 
 /* The digest of the bytecode function `fnv` (the key the unit binds functions by), without needing the function to have been called: 1 and 16 bytes in *out,
