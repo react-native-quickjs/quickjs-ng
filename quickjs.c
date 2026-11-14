@@ -2422,6 +2422,9 @@ struct JSShape {
        the index the dumped table gives it. Only in a build that can profile. */
     uint8_t aot_prof_seen;
     uint16_t aot_prof_id;
+#ifdef QJS_AOT_BUMPSTATS
+    uint8_t aot_observed;   /* measurement only: some PIC cell has held this shape */
+#endif
     uint32_t hash; /* current hash value */
     uint32_t prop_hash_mask;
     int prop_size; /* allocated properties */
@@ -8430,6 +8433,9 @@ static JSShape *js_dup_shape(JSShape *sh)
     return sh;
 }
 
+#ifdef QJS_AOT_BUMPSTATS
+static uint64_t js_aot_shape_stat[8]; /* 0 frees, 1 frees of observed, 2 in-place edits, 3 in-place edits of observed */
+#endif
 static void js_free_shape0(JSRuntime *rt, JSShape *sh)
 {
     uint32_t i;
@@ -8437,6 +8443,10 @@ static void js_free_shape0(JSRuntime *rt, JSShape *sh)
 
     assert(JS_REF_COUNT(sh) == 0);
     rt->shape_free_epoch++;
+#ifdef QJS_AOT_BUMPSTATS
+    js_aot_shape_stat[0]++;
+    if (sh->aot_observed) js_aot_shape_stat[1]++;
+#endif
     if (sh->is_hashed)
         js_shape_hash_unlink(rt, sh);
     if (sh->proto != NULL) {
@@ -8598,6 +8608,26 @@ _Static_assert(sizeof(struct JSRegPIC) == 16, "register PIC entry is 16 bytes");
 
 /* Release one entry's shape references and clear it. Also used by a refill
    before storing the new shapes. */
+/* Counters for the sites that move aot_pic_epoch (a build with -DQJS_AOT_BUMPSTATS=1 prints them with QJS_AOT_STATS); free otherwise. */
+#ifdef QJS_AOT_BUMPSTATS
+static uint64_t js_aot_bump_n[16];
+typedef struct { void *b; int site; uint64_t n; } JSAotThrash;
+static JSAotThrash js_aot_thrash[512];
+static void js_aot_thrash_note(void *b, int site)
+{
+    uint32_t h = (uint32_t)(((uintptr_t)b >> 4) * 2654435761u + (uint32_t)site * 40503u) & 511, k;
+    for (k = 0; k < 512; k++) {
+        JSAotThrash *t = &js_aot_thrash[(h + k) & 511];
+        if (t->b == NULL) { t->b = b; t->site = site; t->n = 1; return; }
+        if (t->b == b && t->site == site) { t->n++; return; }
+    }
+}
+#define AOT_EPOCH_BUMP(rt_, id_) do { (rt_)->aot_pic_epoch++; js_aot_bump_n[id_]++; } while (0)
+#define AOT_THRASH(b_, s_) js_aot_thrash_note((b_), (s_))
+#else
+#define AOT_THRASH(b_, s_) ((void)0)
+#define AOT_EPOCH_BUMP(rt_, id_) do { (rt_)->aot_pic_epoch++; } while (0)
+#endif
 static void regvm_pic_entry_reset(JSRuntime *rt, JSRegPIC *e, JSShape **pholder)
 {
     if (e->shape && e->kind != REG_PIC_GLOBAL)
@@ -8609,7 +8639,7 @@ static void regvm_pic_entry_reset(JSRuntime *rt, JSRegPIC *e, JSShape **pholder)
     e->slot_off = 0;
     e->misses = 0;
     e->kind = REG_PIC_EMPTY;
-    rt->aot_pic_epoch++;
+    AOT_EPOCH_BUMP(rt, 0);
 }
 
 /* Free the whole register PIC of a function bytecode (finalizer path; RT-only).
@@ -8952,7 +8982,7 @@ static inline void ic_watchpoint_bump(JSRuntime *rt)
     if (rt->ic_watchpoint_epoch < JS_IC_EPOCH_MAX)
         rt->ic_watchpoint_epoch++;
     rt->aot_epoch_bumps++;
-    rt->aot_pic_epoch++;    /* add-transition entries stop hitting: a compiled function's cached verdicts too */
+    AOT_EPOCH_BUMP(rt, 1);    /* add-transition entries stop hitting: a compiled function's cached verdicts too */
 }
 
 /* Fill an add-transition IC entry: shape `from_sh` + adding the site's atom yields
@@ -9223,7 +9253,7 @@ static void js_gv_site_flush(JSRuntime *rt, struct list_head *head)
             if (b->regvm_pic[j].kind == REG_PIC_GLOBAL)
                 b->regvm_pic[j].slot_off = 0;
         }
-        rt->aot_pic_epoch++;
+        AOT_EPOCH_BUMP(rt, 2);
     }
 }
 #endif
@@ -9234,7 +9264,7 @@ static void js_gv_cell_invalidate(JSRuntime *rt)
 #if QJS_REGVM
     /* A compiled function holds the property slots of the global sites it read at some epoch;
        they are valid only for the generation they were read at. */
-    rt->aot_pic_epoch++;
+    AOT_EPOCH_BUMP(rt, 3);
 #endif
     if (unlikely(++rt->gv_cell_gen == 0)) {
         struct list_head *el;
@@ -16511,7 +16541,7 @@ static void js_aot_layout_break(JSRuntime *rt, uint32_t layout_id)
         return;
 #endif
     rt->aot_epoch_bumps++;
-    rt->aot_pic_epoch++;
+    AOT_EPOCH_BUMP(rt, 4);
 }
 
 static inline void js_aot_layout_leave(JSRuntime *rt, JSShape *old_sh)
@@ -16670,7 +16700,7 @@ static inline bool js_aot_gwatched(JSRuntime *rt, JSAtom atom)
 static inline void js_aot_gwrite(JSRuntime *rt, JSAtom atom)
 {
     if (unlikely(rt->aot_gwatch_n != 0) && js_aot_gwatched(rt, atom))
-        rt->aot_pic_epoch++;
+        AOT_EPOCH_BUMP(rt, 5);
 }
 
 static void js_aot_gwrite_slot(JSRuntime *rt, JSObject *p, uint32_t slot)
@@ -16780,6 +16810,10 @@ static int js_shape_prepare_update(JSContext *ctx, JSObject *p,
             if (pprs)
                 *pprs = &get_shape_prop(sh)[idx];
         } else {
+#ifdef QJS_AOT_BUMPSTATS
+            js_aot_shape_stat[2]++;
+            if (sh->aot_observed) js_aot_shape_stat[3]++;
+#endif
             js_shape_hash_unlink(ctx->rt, sh);
             sh->is_hashed = false;
         }
@@ -17473,7 +17507,7 @@ static void regvm_global_site_fill(JSContext *ctx, JSFunctionBytecode *b,
     e->gslot = slot;
     e->slot_off = gen;
     e->kind = REG_PIC_GLOBAL;
-    ctx->rt->aot_pic_epoch++;
+    AOT_EPOCH_BUMP(ctx->rt, 6);
     /* The profile counts the distinct generations a site was filled at: a site filled
        twice saw the global object change. */
     AOT_PROF_PIC(b, site, (JSShape *)(uintptr_t)((uintptr_t)gen + 1), REG_PIC_GLOBAL, -1);
@@ -25916,6 +25950,10 @@ static void regvm_pic_install(JSRuntime *rt, JSRegPIC *e, JSShape **pholder,
         return;                     /* already cached */
 
     misses = e->misses;
+    /* A dead site stays dead (the contract above): without this, the next fill of a dead site installed again and the one
+       after that dropped it again, so a polymorphic site cycled between cached and empty and moved the epoch every time. */
+    if (e->kind == REG_PIC_EMPTY && misses >= REG_PIC_MISS_LIMIT)
+        return;
     if (e->kind != REG_PIC_EMPTY) {
         if (++misses >= REG_PIC_MISS_LIMIT) {
             regvm_pic_entry_reset(rt, e, pholder);  /* drops the shape refs */
@@ -25927,11 +25965,15 @@ static void regvm_pic_install(JSRuntime *rt, JSRegPIC *e, JSShape **pholder,
     e->misses = misses;
     e->shape = js_dup_shape(rsh);
     *pholder = hsh ? js_dup_shape(hsh) : NULL;
+#ifdef QJS_AOT_BUMPSTATS
+    rsh->aot_observed = 1;
+    if (hsh) hsh->aot_observed = 1;
+#endif
     /* The property slot's own offset in the property array, not the value's
        size: JSProperty is at least 8 bytes in every encoding. */
     e->slot_off = slot * (uint32_t)sizeof(JSProperty);
     e->kind = kind;
-    rt->aot_pic_epoch++;
+    AOT_EPOCH_BUMP(rt, 7);
 }
 
 /* Hash an unhashed shape in place so the per-function PIC can hold it. A
@@ -26095,14 +26137,16 @@ static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
                 b->regvm_pic_holder[nw + s2] = NULL;
                 regvm_pic_entry_reset(rt, &pic[s2], &b->regvm_pic_holder[s2]);
             }
-            regvm_pic_install(rt, &pic[s2], &b->regvm_pic_holder[s2],
+            AOT_THRASH(b, site);
+regvm_pic_install(rt, &pic[s2], &b->regvm_pic_holder[s2],
                               kind, rsh, hsh, slot);
             if (!need_mega &&
                 pic[s2].kind == REG_PIC_EMPTY &&
                 pic[s2].misses >= REG_PIC_MISS_LIMIT)
                 need_mega = 1;
         } else {
-            regvm_pic_install(rt, &pic[site], &b->regvm_pic_holder[site],
+            AOT_THRASH(b, site);
+regvm_pic_install(rt, &pic[site], &b->regvm_pic_holder[site],
                               kind, rsh, hsh, slot);
             /* The install may have pushed a live site over the miss limit;
                cache it globally too. */
@@ -26149,7 +26193,8 @@ static void regvm_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
                 }
                 if (pic[s2].shape == rsh)
                     regvm_pic_entry_reset(rt, &pic[s2], &b->regvm_pic_holder[s2]);
-                regvm_pic_install(rt, &pic[s2], &b->regvm_pic_holder[s2],
+                AOT_THRASH(b, site);
+regvm_pic_install(rt, &pic[s2], &b->regvm_pic_holder[s2],
                                   REG_PIC_PROTO2, rsh, holder->shape, slot);
                 if (pic[s2].kind == REG_PIC_PROTO2)
                     b->regvm_pic_holder[nw + s2] = js_dup_shape(mid);
@@ -26317,7 +26362,7 @@ static inline __attribute__((always_inline)) JSValue regvm_get_field_ic_x(
                 *p1 = *p2; b->regvm_pic_holder[site] = b->regvm_pic_holder[s2];
                 *p2 = t; b->regvm_pic_holder[s2] = th;
                 p2->misses = p1->misses; p1->misses = 0;
-                ctx->rt->aot_pic_epoch++;
+                /* a swap of two ways of one site changes no fact about a shape or a prototype: compiled code that trusts the epoch keeps its shape keys */
             }
             return js_dup(v);
         }
@@ -26371,7 +26416,7 @@ static __attribute__((noinline)) JSValue regvm_get_field_ic_slow(JSContext *ctx,
                 *p1 = *p2; b->regvm_pic_holder[site] = b->regvm_pic_holder[s2];
                 *p2 = t; b->regvm_pic_holder[s2] = th;
                 p2->misses = p1->misses; p1->misses = 0;
-                ctx->rt->aot_pic_epoch++;
+                /* a swap of two ways of one site changes no fact about a shape or a prototype: compiled code that trusts the epoch keeps its shape keys */
             }
 #if QJS_DRC
             return js_dup(v2);
@@ -26465,7 +26510,8 @@ static void regvm_put_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
             return;
         *ppic = pic;
     }
-    regvm_pic_install(rt, &pic[site], &b->regvm_pic_holder[site],
+    AOT_THRASH(b, site);
+regvm_pic_install(rt, &pic[site], &b->regvm_pic_holder[site],
                       REG_PIC_OWN_W, p->shape, NULL,
                       (uint32_t)(pr - p->prop));
     /* Add-transition fill, in the secondary way. When the store created `atom`
@@ -26477,7 +26523,8 @@ static void regvm_put_pic_fill(JSContext *ctx, JSFunctionBytecode *b,
         JSShape *nsh = p->shape;
         if (nsh != pre_sh && nsh->is_hashed && nsh->prop_count == pre_count + 1) {
             int s2 = b->regvm_pic_count + site;
-            regvm_pic_install(rt, &pic[s2], &b->regvm_pic_holder[s2],
+            AOT_THRASH(b, site);
+regvm_pic_install(rt, &pic[s2], &b->regvm_pic_holder[s2],
                               REG_PIC_ADD_W, pre_sh, nsh,
                               (uint32_t)(pr - p->prop));
             pic[s2].misses = (uint16_t)rt->ic_watchpoint_epoch;
@@ -64717,6 +64764,36 @@ void js_aot_stats_dump(JSRuntime *rt)
     }
     for (i = 0; r && i < r->deopt_count; i++)
         sw += r->deopt_hits[i];
+#ifdef QJS_AOT_BUMPSTATS
+    {
+        static const char *const bn[] = {"pic_entry_reset","ic_watchpoint_bump","gv_site_flush","gv_cell_invalidate","layout_break","gwrite","global_site_fill","pic_install","ic_x_way_swap","ic_slow_way_swap","aot_unbind","aot_bind_rebind"};
+        int bi;
+        {
+            int ti, tj;
+            fprintf(stderr, "aot shapes: frees=%llu frees_observed=%llu inplace=%llu inplace_observed=%llu\n",
+                    (unsigned long long)js_aot_shape_stat[0], (unsigned long long)js_aot_shape_stat[1],
+                    (unsigned long long)js_aot_shape_stat[2], (unsigned long long)js_aot_shape_stat[3]);
+            for (ti = 0; ti < 12; ti++) {
+                int best = -1;
+                for (tj = 0; tj < 512; tj++)
+                    if (js_aot_thrash[tj].b != NULL && (best < 0 || js_aot_thrash[tj].n > js_aot_thrash[best].n)) best = tj;
+                if (best < 0 || js_aot_thrash[best].n == 0) break;
+                {
+                    JSFunctionBytecode *tb = js_aot_thrash[best].b;
+                    char nb[64];
+                    fprintf(stderr, "aot thrash: installs=%llu site=%d fn=%s idx=%u pic_count=%u\n",
+                            (unsigned long long)js_aot_thrash[best].n, js_aot_thrash[best].site,
+                            JS_AtomGetStrRT(rt, nb, 64, tb->func_name), (unsigned)tb->aot_index, (unsigned)tb->regvm_pic_count);
+                }
+                js_aot_thrash[best].n = 0;
+            }
+        }
+        fprintf(stderr, "aot bumps: pic_epoch=%u", rt->aot_pic_epoch);
+        for (bi = 0; bi < (int)(sizeof(bn) / sizeof(bn[0])); bi++)
+            fprintf(stderr, " %s=%llu", bn[bi], (unsigned long long)js_aot_bump_n[bi]);
+        fprintf(stderr, "\n");
+    }
+#endif
     fprintf(stderr, "aot: unit=%d table=%u bound=%llu enter=%llu epoch_bumps=%llu "
             "cells=%u/%u disabled=%u deopts=%llu%s\n",
             present, count,
@@ -64742,7 +64819,7 @@ static void js_aot_unbind(JSFunctionBytecode *b)
        it until the cache epoch moves, so dropping the binding moves it. */
     if (b->aot_fn != NULL) {
         b->realm->rt->aot_epoch_bumps++;
-        b->realm->rt->aot_pic_epoch++;
+        AOT_EPOCH_BUMP(b->realm->rt, 10);
     }
     b->aot_fn = NULL;
     b->aot_nfn = NULL;
@@ -64876,7 +64953,7 @@ static void js_aot_bind(JSFunctionBytecode *b)
         b->realm->rt->aot_bound[b->aot_index] = 0;
     if (b->aot_fn != NULL) {
         b->realm->rt->aot_epoch_bumps++;
-        b->realm->rt->aot_pic_epoch++;
+        AOT_EPOCH_BUMP(b->realm->rt, 11);
     }
     b->aot_fn = NULL;
     b->aot_nfn = NULL;
