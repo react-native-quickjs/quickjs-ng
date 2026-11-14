@@ -69539,7 +69539,7 @@ static void js_aot_bind(JSFunctionBytecode *b)
 
     if (rbc_n) rbc_del(b);
     if (b->aot_fn != NULL && b->aot_index != UINT32_MAX && b->realm->rt->aot_bound != NULL) {
-        b->realm->rt->aot_bound[b->aot_index] = 0;
+        if (b->realm->rt->aot_bound[b->aot_index] > 0) b->realm->rt->aot_bound[b->aot_index]--;
         if (aot_bc_tab && aot_bc_tab[b->aot_index] == b) aot_bc_tab[b->aot_index] = NULL;
     }
     if (b->aot_fn != NULL) {
@@ -69587,14 +69587,18 @@ static void js_aot_bind(JSFunctionBytecode *b)
             if (!js_aot_unit_claim(b->realm->rt))
                 return;         /* the unit is bound in another runtime: this one interprets */
             b->aot_ident = (void *)qjs_aot_table[mid].fn;
-            if (b->realm->rt->aot_bound == NULL || b->realm->rt->aot_bound[mid])
+            if (b->realm->rt->aot_bound == NULL)
+                return;
+            /* A second live bytecode with the same register program (two methods with identical bodies, or the same function
+               evaluated twice) runs the same entry: the bound count keeps the index held until the last one goes. */
+            if (b->realm->rt->aot_bound[mid] && (getenv("QJS_AOT_NOTWINS") != NULL || b->realm->rt->aot_bound[mid] == 255))
                 return;         /* another live bytecode holds this function */
-            b->realm->rt->aot_bound[mid] = 1;
+            b->realm->rt->aot_bound[mid]++;
             b->aot_fn = (void *)qjs_aot_table[mid].fn;
             b->aot_nfn = (void *)qjs_aot_table[mid].nfn;
             b->aot_index = mid;
             if (aot_bc_tab == NULL) aot_bc_tab = calloc(qjs_aot_count ? qjs_aot_count : 1, sizeof(*aot_bc_tab));
-            if (aot_bc_tab) aot_bc_tab[mid] = b;
+            if (aot_bc_tab && aot_bc_tab[mid] == NULL) aot_bc_tab[mid] = b;
             b->aot_state = 1;   /* bound */
             /* The register file the unit compiled this body for. It may be wider
                than `regvm_reg_count`: the generator allocates registers above the
@@ -85151,7 +85155,7 @@ static void free_function_bytecode(JSRuntime *rt, JSFunctionBytecode *b)
        another bytecode to bind. */
     if (rbc_n) rbc_del(b);
     if (b->aot_fn != NULL && b->aot_index != UINT32_MAX && rt->aot_bound != NULL) {
-        rt->aot_bound[b->aot_index] = 0;
+        if (rt->aot_bound[b->aot_index] > 0) rt->aot_bound[b->aot_index]--;
         if (aot_bc_tab && aot_bc_tab[b->aot_index] == b) aot_bc_tab[b->aot_index] = NULL;
     }
     /* The polymorphic property cache is independent of the register PIC, so it
