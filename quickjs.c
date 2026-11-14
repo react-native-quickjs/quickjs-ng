@@ -963,7 +963,9 @@ static inline void regvm_light_seal(JSRuntime *rt, struct JSRegRun *lf)
 typedef void (*JSRegRootFn)(void *opaque, JSValue *regs, uint32_t nregs);
 
 /* Walk one light chain (innermost first). Defined after JSRegRun. */
+#if QJS_REGVM
 static void regvm_light_walk(struct JSRegRun *lf, JSRegRootFn fn, void *opaque);
+#endif
 
 static void regvm_for_each_root_range(JSRuntime *rt, JSRegRootFn fn,
                                       void *opaque)
@@ -1751,11 +1753,14 @@ void js_aot_prof_dump(JSRuntime *rt);
 #define AOT_PROF_CALL(c_, b_, pc_, fn_, na_) \
         js_aot_prof_call((c_), (b_), (pc_), (fn_), (na_))
 #else
+/* Only register code expands these, so a stack-only build never needs them. */
+#if QJS_REGVM
 #define AOT_PROF_OP(b_, rpc_)       ((void)0)
 #define AOT_PROF_ENTER(b_)          ((void)0)
 #define AOT_PROF_PIC(b_, s_, sh_)   ((void)0)
 #define AOT_PROF_REG(b_, d_, v_)    ((void)0)
 #define AOT_PROF_CALL(c_, b_, pc_, fn_, na_) ((void)0)
+#endif
 #endif
 
 #if QJS_AOT
@@ -9182,6 +9187,7 @@ exception:
 
 /* Build an array from `count` registers, writing the values straight into the
    array's storage rather than a temporary on the C stack. */
+#if QJS_REGVM
 static JSValue regvm_array_from_regs(JSContext *ctx, const JSValue *src,
                                      int count)
 {
@@ -9202,6 +9208,7 @@ static JSValue regvm_array_from_regs(JSContext *ctx, const JSValue *src,
     p->prop[0].u.value = js_int32(count);
     return obj;
 }
+#endif /* QJS_REGVM */
 
 /* Take ownership of an already allocated dense value buffer. */
 static JSValue js_new_array_from_owned(JSContext *ctx, int count, JSValue *values)
@@ -10223,6 +10230,7 @@ static inline void js_drc_safepoint(JSRuntime *rt)
    dup'd values, so the old value is released and the new one referenced. A
    borrowed window is the caller's register area, rooted through the caller's
    frame, so the store is a plain write. */
+#if QJS_REGVM
 static inline void regvm_put_arg(JSContext *ctx, JSValue *buf, int owned,
                                  int slot, JSValue v)
 {
@@ -10231,6 +10239,7 @@ static inline void regvm_put_arg(JSContext *ctx, JSValue *buf, int owned,
     else
         buf[slot] = v;
 }
+#endif /* QJS_REGVM */
 #else /* !QJS_DRC */
 #define js_drc_safepoint(rt) ((void)0)
 #endif /* QJS_DRC */
@@ -21300,6 +21309,7 @@ static __exception int js_for_in_next(JSContext *ctx, JSValue *sp)
 /* Register-file wrappers for the for-in opcodes. A register borrows its value,
    so the iterator takes its own reference on the object, and the property
    name written into a register is adopted. */
+#if QJS_REGVM
 static __exception int regvm_for_in_start(JSContext *ctx, JSValue *regs_sp)
 {
 #if QJS_DRC
@@ -21323,6 +21333,7 @@ static __exception int regvm_for_in_next(JSContext *ctx, JSValue *regs_sp)
 #endif
     return 0;
 }
+#endif /* QJS_REGVM */
 
 static JSValue JS_GetIterator2(JSContext *ctx, JSValueConst obj,
                                JSValueConst method)
