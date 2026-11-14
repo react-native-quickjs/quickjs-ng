@@ -26345,8 +26345,6 @@ regvm_light_enter(JSContext *ctx, JSObject *co, JSFunctionBytecode *cb,
     nf->b = cb;
     nf->pic = cb->regvm_pic;
     nf->var_refs = co->u.func.var_refs;
-    nf->var_buf = (JSValue *)((uint8_t *)nf + REGVM_LIGHT_PREFIX_BYTES);
-    nf->fr = nf->var_buf + cb->var_count;
     nf->arg_buf = oargv;
     nf->ret_dst = d;
     nf->argc = na;
@@ -26355,26 +26353,27 @@ regvm_light_enter(JSContext *ctx, JSObject *co, JSFunctionBytecode *cb,
     nf->cap_ip = NULL;
     nf->sf = NULL;
     nf->this_obj = this_obj;
-    nf->ret = JS_UNDEFINED;
-    nf->set_v = JS_UNDEFINED;
+    /* `ret` and `set_v` are written before they are read on every path a light
+       function can take, so they are not initialised here. */
     vc = cb->var_count;
 #if QJS_DRC
     if (cb->var_count <= 255)
         vc = cb->regvm_var_count;
 #endif
+    /* The variable area exists only when the promotion map leaves a slot in it
+       (`vc`). Otherwise `fr` is the header's end and `var_buf` is never read.
+       */
+    if (vc != 0) {
+        nf->var_buf = (JSValue *)((uint8_t *)nf + REGVM_LIGHT_PREFIX_BYTES);
+        nf->fr = nf->var_buf + cb->var_count;
+    } else {
+        nf->fr = (JSValue *)((uint8_t *)nf + REGVM_LIGHT_PREFIX_BYTES);
+    }
     nf->flags = REGVM_FLAG_LIGHT;
     if (vc == 0)
         nf->flags |= REGVM_FLAG_TRIVIAL_RET;
-    /*
-     * Fill the variable area and the register file with `undefined`. Every
-     * register must hold a valid, uncounted word before the program runs (the
-     * DRC pin walk and the store handlers read them). The variable area only
-     * needs the slots the promotion map still names -- `regvm_var_count`, the
-     * same bound the release walk and the DRC walk use, and `vc` already holds
-     * it. A function whose locals are all promoted names none, and filling the
-     * source `var_count` instead was the loc10 cycle regression: ten stores to
-     * a slot no handler can read.
-     */
+    /* Fill the variable area and register file with `undefined`; only the
+       variable slots the promotion map still names are filled. */
     for (k = 0; k < vc; k++)
         nf->var_buf[k] = JS_UNDEFINED;
     regs = nf->fr;
@@ -29140,9 +29139,19 @@ static void regvm_set_call_desc(JSFunctionBytecode *b)
         && b->regvm_ctl_count == 0
         && regvm_code_light_safe(b->regvm_code, b->regvm_len)) {
         b->regvm_light = 1;
-        b->regvm_light_need = REGVM_LIGHT_PREFIX_BYTES
-            + sizeof(JSValue)
-                * (size_t)(b->var_count + b->regvm_reg_count + REGVM_HS);
+        {
+            int lvc = b->var_count;
+#if QJS_DRC
+            if (b->var_count <= 255)
+                lvc = b->regvm_var_count;
+#endif
+            /* No variable area when the promotion map leaves no slot in it;
+               `regvm_light_enter` sizes `fr` the same way. */
+            b->regvm_light_need = REGVM_LIGHT_PREFIX_BYTES
+                + sizeof(JSValue)
+                    * (size_t)((lvc ? b->var_count : 0)
+                               + b->regvm_reg_count + REGVM_HS);
+        }
     }
 #endif
 #endif
