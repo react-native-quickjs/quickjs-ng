@@ -88340,7 +88340,7 @@ typedef enum BCTagEnum {
     BC_TAG_REGVM_FUNCTION_BYTECODE,
 } BCTagEnum;
 
-#define BC_VERSION 27
+#define BC_VERSION 28
 
 typedef struct BCWriterState {
     JSContext *ctx;
