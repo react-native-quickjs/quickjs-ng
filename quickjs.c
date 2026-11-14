@@ -66677,6 +66677,170 @@ QJS_AOT_STUB JSValue qjs_aot_new_array_inline(JSContext *ctx, uint32_t n)
     return JS_NewObjectFromShapeCapExtra(ctx, js_dup_shape(ctx->array_shape), JS_CLASS_ARRAY, NULL, 0, n);
 }
 
+/* ---- stack objects (the region compiler) ------------------------------------------------------------------------------------------------------------
+   An object a compiled region makes and proves never leaves it (no store of it, no call that receives it, no return) lives in a block of the region's own C frame
+   instead of the heap: [JSMallocBlockHeader][JSObject body + inline slots (+ inline elements)]. It is NOT on gc_obj_list; its reference count starts at a bias no
+   stray release can reach zero from, so a block is never handed to the allocator. The values in its fields and elements are counted references held by native
+   code, like any other: the cycle collector's trial decrement leaves them positive, so they act as roots (sound, conservative). A push past the room in an array's
+   block is the engine's own growth (expand_fast_array): it allocates a heap element block and leaves the object where it is; release / migrate free that block. */
+#define JS_STACK_BIAS (1 << 30)
+
+static JSObject *js_stack_block(void *buf, size_t bytes, size_t body)
+{
+    JSMallocBlockHeader *h = (JSMallocBlockHeader *)buf;
+    JSObject *p;
+    if (((uintptr_t)buf & (JS_ARENA_ALIGN - 1)) != 0 || sizeof(JSMallocBlockHeader) + body > bytes)
+        return NULL;
+    memset(buf, 0, sizeof(JSMallocBlockHeader) + body);
+    h->u.block_idx = JS_ARENA_FREE_NIL;   /* "not an arena block": js_free_rt would treat it as a large one, and is never called on it */
+    h->ref_count = JS_STACK_BIAS;
+    h->gc_obj_type = JS_GC_OBJ_TYPE_JS_OBJECT;
+    p = (JSObject *)h->user_data;
+    init_list_head(&p->header.link);
+    return p;
+}
+
+/* An ordinary object of `shape`, every field undefined, in `buf` (aligned, `bytes` long). JS_UNINITIALIZED when it does not fit. */
+QJS_AOT_STUB JSValue qjs_aot_stack_object_init(void *buf, size_t bytes, void *shape)
+{
+    JSShape *sh = (JSShape *)shape;
+    int n = sh->prop_count, i;
+    JSObject *p;
+    if (n <= 0 || n > JS_OBJ_LEARNED_INLINE_MAX)
+        return JS_UNINITIALIZED;
+    p = js_stack_block(buf, bytes, offsetof(JSObject, u) + n * sizeof(JSProperty));
+    if (p == NULL)
+        return JS_UNINITIALIZED;
+    p->prop_inline_cap = n;
+    p->class_id = JS_CLASS_OBJECT;
+    p->arr_kind = JS_ARR_KIND_GENERIC;
+    p->extensible = true;
+    p->shape = js_dup_shape(sh);
+    p->prop = (JSProperty *)((uint8_t *)p + offsetof(JSObject, u));
+    for (i = 0; i < n; i++)
+        p->prop[i].u.value = JS_UNDEFINED;
+    return JS_MKPTR(JS_TAG_OBJECT, p);
+}
+
+/* An empty Array of the realm's array shape in `buf`, with room for `n` elements in the block itself (a push past `n` moves the elements to a heap block, as for
+   any inline-valued array). JS_UNINITIALIZED when it does not fit. */
+QJS_AOT_STUB JSValue qjs_aot_stack_array_init(JSContext *ctx, void *buf, size_t bytes, uint32_t n)
+{
+    JSShape *sh = ctx->array_shape;
+    uint32_t inline_cap = sh->prop_size <= 4 ? sh->prop_size : 0;
+    JSObject *p;
+    if (inline_cap == 0)
+        return JS_UNINITIALIZED;
+    p = js_stack_block(buf, bytes, sizeof(JSObject) + inline_cap * sizeof(JSProperty) + n * sizeof(JSValue));
+    if (p == NULL)
+        return JS_UNINITIALIZED;
+    p->prop_inline_cap = inline_cap;
+    p->class_id = JS_CLASS_ARRAY;
+    p->arr_kind = JS_ARR_KIND_GENERIC;
+    p->extensible = true;
+    p->is_exotic = 1;
+    p->fast_array = 1;
+    p->shape = js_dup_shape(sh);
+    p->prop = (JSProperty *)((uint8_t *)p + sizeof(JSObject));
+    JS_ARR_VALS(p) = (JSValue *)((JSProperty *)(p + 1) + inline_cap);
+    p->u.array.count = 0;
+    p->u.array.hole_count = 0;
+    p->u.array.u1.size = n;
+    p->values_inline = 1;   /* growth (expand_fast_array) then allocates a heap element block and leaves this block alone */
+    assert(p->values_inline && JS_ARR_GENERIC(p));
+    p->prop[0].u.value = js_int32(0);
+    return JS_MKPTR(JS_TAG_OBJECT, p);
+}
+
+/* Release what a stack object (and, if given, its stack array) holds: the references in its fields (but the array, which is the other block) and in its
+   elements, and its shape reference. The blocks themselves are the region's frame. */
+QJS_AOT_STUB void qjs_aot_stack_release(JSContext *ctx, JSValue obj, JSValue arr)
+{
+    JSRuntime *rt = ctx->rt;
+    if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
+        JSObject *p = JS_VALUE_GET_OBJ(obj);
+        JSShape *sh = p->shape;
+        int i;
+        assert(JS_REF_COUNT(p) >= JS_STACK_BIAS / 2);   /* nothing released the block's bias away */
+        for (i = 0; i < sh->prop_count; i++) {
+            JSValue v = p->prop[i].u.value;
+            if (JS_VALUE_HAS_REF_COUNT(v) && JS_VALUE_GET_PTR(v) != (JS_VALUE_GET_TAG(arr) == JS_TAG_OBJECT ? JS_VALUE_GET_PTR(arr) : NULL))
+                JS_FreeValueRT(rt, v);
+            p->prop[i].u.value = JS_UNDEFINED;
+        }
+        js_free_shape(rt, sh);
+        p->shape = NULL;   /* the block is dead until qjs_aot_stack_object_init makes it again */
+    }
+    if (JS_VALUE_GET_TAG(arr) == JS_TAG_OBJECT) {
+        JSObject *a = JS_VALUE_GET_OBJ(arr);
+        uint32_t k;
+        assert(JS_REF_COUNT(a) >= JS_STACK_BIAS / 2);
+        for (k = 0; k < a->u.array.count; k++) {
+            JSValue v = JS_ARR_VALS(a)[k];
+            if (JS_VALUE_HAS_REF_COUNT(v))
+                JS_FreeValueRT(rt, v);
+        }
+        a->u.array.count = 0;
+        if (!a->values_inline && JS_ARR_VALS(a) != NULL) {   /* a push past the inline room moved the elements to a heap block (expand_fast_array); the object stayed where it is */
+            js_free_rt(rt, JS_ARR_VALS(a));
+            JS_ARR_VALS(a) = NULL;
+            a->values_inline = 1;
+            a->u.array.u1.size = 0;
+        }
+        js_free_shape(rt, a->shape);
+        a->shape = NULL;
+    }
+}
+
+/* Move a stack object and its stack array (either may be undefined) to the heap: the heap array takes the elements (their references move), the heap object takes
+   the fields (the field that held the stack array holds the heap array), and the stack blocks are emptied and released. *hobj and *harr each hold one reference for
+   the caller. 1, or 0 with nothing moved on an out-of-memory. */
+QJS_AOT_STUB int qjs_aot_stack_migrate(JSContext *ctx, JSValue obj, JSValue arr, JSValue *hobj, JSValue *harr)
+{
+    JSValue ha = JS_UNDEFINED, ho = JS_UNDEFINED;
+    JSObject *a = NULL, *p = NULL;
+    uint32_t k;
+    int i;
+    if (JS_VALUE_GET_TAG(arr) == JS_TAG_OBJECT) {
+        a = JS_VALUE_GET_OBJ(arr);
+        ha = JS_NewObjectFromShapeCapExtra(ctx, js_dup_shape(ctx->array_shape), JS_CLASS_ARRAY, NULL, 0, a->u.array.u1.size > a->u.array.count ? a->u.array.u1.size : a->u.array.count);
+        if (JS_IsException(ha))
+            return 0;
+    }
+    if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
+        p = JS_VALUE_GET_OBJ(obj);
+        ho = qjs_aot_new_from_shape(ctx, p->shape);
+        if (JS_IsException(ho)) {
+            JS_FreeValue(ctx, ha);
+            return 0;
+        }
+    }
+    if (a != NULL) {
+        JSObject *h = JS_VALUE_GET_OBJ(ha);
+        for (k = 0; k < a->u.array.count; k++)
+            JS_ARR_VALS(h)[k] = JS_ARR_VALS(a)[k];
+        h->u.array.count = a->u.array.count;
+        h->prop[0].u.value = js_int32((int32_t)a->u.array.count);
+        a->u.array.count = 0;
+    }
+    if (p != NULL) {
+        JSObject *h = JS_VALUE_GET_OBJ(ho);
+        for (i = 0; i < p->shape->prop_count; i++) {
+            JSValue v = p->prop[i].u.value;
+            if (a != NULL && JS_VALUE_HAS_REF_COUNT(v) && JS_VALUE_GET_PTR(v) == (void *)a)
+                v = JS_DupValue(ctx, ha);
+            h->prop[i].u.value = v;
+            p->prop[i].u.value = JS_UNDEFINED;
+        }
+    }
+    qjs_aot_stack_release(ctx, obj, arr);
+    if (p != NULL)
+        qjs_aot_object_filled(ctx, ho);   /* the slot-claim check the stack object skipped */
+    *hobj = ho;
+    *harr = ha;
+    return 1;
+}
+
 /* `a + b` where one side is a string and the other a string or a primitive whose string form runs no code (a number, a boolean,
    null, undefined). 1 with an owned *out, 0 for any other operands (nothing done), -1 with an exception pending. */
 QJS_AOT_STUB int qjs_aot_add_str(JSContext *ctx, JSValue a, JSValue b, JSValue *out)

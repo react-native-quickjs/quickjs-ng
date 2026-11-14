@@ -246,6 +246,10 @@ QJS_AOT_STUB int qjs_aot_global_get(JSContext *ctx, uint32_t atom, JSValue *out)
 QJS_AOT_STUB int qjs_aot_global_put(JSContext *ctx, uint32_t atom, JSValue val, int init, JSValue *old);
 QJS_AOT_STUB int qjs_aot_add_str(JSContext *ctx, JSValue a, JSValue b, JSValue *out);
 QJS_AOT_STUB JSValue qjs_aot_new_array_inline(JSContext *ctx, uint32_t n);
+QJS_AOT_STUB JSValue qjs_aot_stack_object_init(void *buf, size_t bytes, void *shape);
+QJS_AOT_STUB JSValue qjs_aot_stack_array_init(JSContext *ctx, void *buf, size_t bytes, uint32_t n);
+QJS_AOT_STUB void qjs_aot_stack_release(JSContext *ctx, JSValue obj, JSValue arr);
+QJS_AOT_STUB int qjs_aot_stack_migrate(JSContext *ctx, JSValue obj, JSValue arr, JSValue *hobj, JSValue *harr);
 /* The digest of a bytecode function (the unit's binding key), whether or not it has been called: 1 with 16 bytes, or 0. */
 QJS_AOT_STUB int qjs_aot_function_digest(JSValue fnv, uint8_t out[16]);
 /* the function a receiver of `shape` finds as `atom` on its prototype chain, when it is a plain data property (a compiled copy resolves its receiver's methods from the shape) */
