@@ -4672,7 +4672,8 @@ static_assert(offsetof(JSObject, arr_kind) == 21, "young flag byte");
 static inline int y_is(const void *p) { unsigned m; if (!Y_REG(p)) return 0; m = ((YChunk *)((uintptr_t)p & ~(uintptr_t)65535))->ymode; return m == 1 || (m == 2 && Y_KIND(p) == 0x80); }
 #define Y_IS(p) y_is(p)
 #define Y_VAL(v) (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && Y_IS(JS_VALUE_GET_PTR(v)))
-static inline uint64_t y_tsc(void) { return __builtin_ia32_rdtsc(); }
+static int y_tsc_on = -1;
+static inline uint64_t y_tsc(void) { if (unlikely(y_tsc_on < 0)) y_tsc_on = getenv("QJS_Y_STATS") != NULL; return y_tsc_on ? __builtin_ia32_rdtsc() : 0; }
 #define Y_CHUNK_OF(p) ((YChunk *)((uintptr_t)(p) & ~((uintptr_t)y_chunk_sz - 1)))
 void qjs_y_trip(JSContext *ctx) { ctx->rt->zct_limit = 0; ctx->rt->zct_nobj += 1; }
 static void y_vec_push(YChunk ***v, uint32_t *n, uint32_t *cap, YChunk *c) {
