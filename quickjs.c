@@ -49237,6 +49237,7 @@ typedef struct JSParseState {
     const uint8_t *eol;  // most recently seen end-of-line character
     const uint8_t *mark; // first token character, invariant: eol < mark
     bool json_key_mode;
+    bool json_latin1;   /* JSON.parse of an 8-bit string's own bytes: a byte >= 0x80 is that code point, not UTF-8 */
 
     /* JSON.parse shape-reuse cache, indexed by object nesting depth */
     JSONShapeCache *json_shapes;
@@ -50639,7 +50640,7 @@ static int json_parse_string(JSParseState *s, const uint8_t **pp)
        the source range, skipping the StringBuffer entirely. */
     {
         const uint8_t *q = p;
-        while (q < s->buf_end && *q != '"' && *q != '\\' && *q >= 0x20 && *q < 0x80)
+        while (q < s->buf_end && *q != '"' && *q != '\\' && *q >= 0x20 && (*q < 0x80 || s->json_latin1))
             q++;
         if (q < s->buf_end && *q == '"') {
             JSValue str = js_new_string8_len(s->ctx, (const char *)p, q - p);
@@ -50663,7 +50664,7 @@ static int json_parse_string(JSParseState *s, const uint8_t **pp)
 
         // Fast path: batch consecutive ASCII characters
         const uint8_t *p_start = p;
-        while (p < s->buf_end && *p != '"' && *p != '\\' && *p >= 0x20 && *p < 0x80) {
+        while (p < s->buf_end && *p != '"' && *p != '\\' && *p >= 0x20 && (*p < 0x80 || s->json_latin1)) {
             p++;
         }
 
@@ -50712,7 +50713,7 @@ static int json_parse_string(JSParseState *s, const uint8_t **pp)
                 goto fail;
             }
         } else
-        if (c >= 0x80) {
+        if (c >= 0x80 && !s->json_latin1) {
             c = utf8_decode(p - 1, &p_next);
             if (p_next == p) {
                 json_parse_error(s, p - 1, "Bad UTF-8 sequence");
@@ -106068,13 +106069,14 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr, int depth)
     return JS_EXCEPTION;
 }
 
-static JSValue JS_ParseJSON_internal(JSContext *ctx, const char *buf, size_t buf_len,
-                                     const char *filename, JSONParseRecord *pr)
+static JSValue JS_ParseJSON_internal2(JSContext *ctx, const char *buf, size_t buf_len,
+                                      const char *filename, JSONParseRecord *pr, bool latin1)
 {
     JSParseState s1, *s = &s1;
     JSValue val = JS_UNDEFINED;
 
     js_parse_init(ctx, s, buf, buf_len, filename, 1);
+    s->json_latin1 = latin1;
     if (json_next_token(s))
         goto fail;
     val = json_parse_value(s, pr, 0);
@@ -106093,6 +106095,12 @@ static JSValue JS_ParseJSON_internal(JSContext *ctx, const char *buf, size_t buf
     JS_FreeValue(ctx, val);
     free_token(s, &s->token);
     return JS_EXCEPTION;
+}
+
+static JSValue JS_ParseJSON_internal(JSContext *ctx, const char *buf, size_t buf_len,
+                                     const char *filename, JSONParseRecord *pr)
+{
+    return JS_ParseJSON_internal2(ctx, buf, buf_len, filename, pr, false);
 }
 
 /* 'buf' must be zero terminated i.e. buf[buf_len] = '\0'. */
@@ -107311,6 +107319,23 @@ static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
     const char *str;
     size_t len;
 
+    /* An 8-bit string without a reviver is parsed from its own bytes (Latin-1: JSON outside string literals is ASCII, and inside one
+       a byte is its code point), with no UTF-8 copy of the input. Any failure is redone below from the UTF-8 copy, so every error,
+       its message and its position are the ones the general path gives. */
+    if (JS_VALUE_GET_TAG(argv[0]) == JS_TAG_STRING && !(argc > 1 && JS_IsFunction(ctx, argv[1]))) {
+        JSString *jp = JS_VALUE_GET_STRING(argv[0]);
+        /* the tokenizer reads the byte after the end (a number's last digit test): it must be the terminator */
+        if (!jp->is_wide_char && str8(jp)[jp->len] == 0 && !js_lazy_json_should_enable(ctx, jp->len)) {
+            JSValue exc;
+            obj = JS_ParseJSON_internal2(ctx, (const char *)str8(jp), jp->len, "<input>", NULL, true);
+            if (!JS_IsException(obj))
+                return obj;
+            exc = JS_GetException(ctx);
+            if (JS_IsUncatchableError(exc))
+                return JS_Throw(ctx, exc);
+            JS_FreeValue(ctx, exc);
+        }
+    }
     str = JS_ToCStringLen(ctx, &len, argv[0]);
     if (!str)
         return JS_EXCEPTION;
