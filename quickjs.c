@@ -776,6 +776,19 @@ static struct JSRegRun *regvm_light_head(struct JSRegRun *p);
 /* Raise the arena top over a light frame that is about to stop being the
    innermost thing in the arena. */
 static void regvm_light_seal(JSRuntime *rt, struct JSRegRun *lf);
+#else
+/* `regvm_cur` is present in the stack-only build and always NULL there, but the
+   sites that read it compile in both builds. */
+static inline struct JSRegRun *regvm_light_head(struct JSRegRun *p)
+{
+    (void)p;
+    return NULL;
+}
+static inline void regvm_light_seal(JSRuntime *rt, struct JSRegRun *lf)
+{
+    (void)rt;
+    (void)lf;
+}
 #endif
 
 #if QJS_DRC || QJS_DRC_VALIDATE
