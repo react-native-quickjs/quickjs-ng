@@ -24337,6 +24337,11 @@ typedef struct JSRegRun {
     uint8_t *resume_marker;
 } JSRegRun;
 
+/* A record frame with nothing to release: an empty release walk and no
+   captured-variable cells. Most frames are like this, so `return` can hand
+   the value back without the framed release path. */
+#define REGVM_FLAG_TRIVIAL_RET (1 << 8)
+
 #if QJS_REGVM_INLOOP_CALL || QJS_REGVM_RECORD
 typedef struct JSRegArenaChunk {
     struct JSRegArenaChunk *prev, *next;
@@ -24992,6 +24997,11 @@ static uint8_t *REGVM_CC regvm_t_return_common(REGVM_ARGS);
 #if QJS_REGVM_RECORD
 static uint8_t *REGVM_CC regvm_t_return_nested(REGVM_ARGS);
 static uint8_t *REGVM_CC regvm_t_return_common(REGVM_ARGS);
+static __attribute__((noinline)) uint8_t *REGVM_CC
+regvm_t_return_trivial(REGVM_ARGS);
+static __attribute__((noinline)) uint8_t *REGVM_CC
+regvm_t_return_trivial_chunk(REGVM_ARGS);
+static no_inline void regvm_arena_pop_chunk(JSRuntime *rt);
 #endif
 #if QJS_REGVM_RECORD
 /* Where each region of a nested frame sits. The JSStackFrame is inside the
@@ -25553,6 +25563,16 @@ static uint8_t *REGVM_CC regvm_t_return(REGVM_ARGS)
         return ip;
     }
     s = T_REG(1);
+#if QJS_REGVM_RECORD
+    /* A frame that owns nothing moves the value straight into the caller's
+       register. The general path's `js_dup`/`REG_ADOPT` pair has nothing to
+       free in between, so it is skipped and the handler stays frameless. */
+    if (likely(f->flags & REGVM_FLAG_TRIVIAL_RET)) {
+        f->ret = FR(s);
+        FR(s) = JS_UNDEFINED;
+        __attribute__((musttail)) return regvm_t_return_trivial(REGVM_PASS);
+    }
+#endif
 #if QJS_DRC
     /* The register only borrows, so the return value needs its own reference
        until it lands in the caller's register (or in C). */
@@ -25573,6 +25593,10 @@ static uint8_t *REGVM_CC regvm_t_return_undefined(REGVM_ARGS)
         return ip;
     }
     f->ret = JS_UNDEFINED;
+#if QJS_REGVM_RECORD
+    if (likely(f->flags & REGVM_FLAG_TRIVIAL_RET))
+        __attribute__((musttail)) return regvm_t_return_trivial(REGVM_PASS);
+#endif
     __attribute__((musttail)) return regvm_t_return_common(REGVM_PASS);
 }
 
@@ -25660,6 +25684,52 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_return_nested(REGVM_A
 #endif
     /* back in the caller's realm */
     __attribute__((musttail)) return regvm_t_dispatch(rip, f->fr, f, f->b->realm);
+}
+
+/* The frameless return for a frame that owns nothing. `regvm_t_return_nested`
+ * needs a frame for `regvm_record_release` and for `regvm_arena_pop_chunk`; a
+ * trivial frame needs neither (the chunk case is guarded below), so this is a
+ * value move, a stack-frame pointer store and a dispatch. The value is moved
+ * without the dup/adopt pair, which would cancel out. */
+static __attribute__((noinline)) uint8_t *REGVM_CC
+regvm_t_return_trivial(REGVM_ARGS)
+{
+    JSRegRun *c = f->caller;
+    int dst = f->ret_dst;
+    uint8_t *rip = f->ret_ip;
+    JSValue v = f->ret;
+    size_t top = (size_t)((uint8_t *)f - (uint8_t *)ctx->rt->regvm_frames);
+
+    ctx->rt->regvm_frames_top = top;
+    /* The one part of the pop that can call: the frame was first in its chunk
+       and a previous chunk can be restored. `c`, `dst`, `rip` and `v` are read
+       before the pop can move `regvm_frames`. */
+    if (unlikely(top == 0 && ctx->rt->regvm_chunk->prev))
+        __attribute__((musttail)) return regvm_t_return_trivial_chunk(REGVM_PASS);
+
+    ctx->rt->current_stack_frame = c->sf;
+    /* no `REG_ADOPT`: the caller's register borrows */
+    *(JSValue *)((uint8_t *)c->fr + dst) = v;
+    ctx->rt->regvm_tail_chain = 0;
+    f = c;
+    __attribute__((musttail)) return regvm_t_dispatch(rip, c->fr, c, c->b->realm);
+}
+
+static __attribute__((noinline)) uint8_t *REGVM_CC
+regvm_t_return_trivial_chunk(REGVM_ARGS)
+{
+    JSRegRun *c = f->caller;
+    int dst = f->ret_dst;
+    uint8_t *rip = f->ret_ip;
+    JSValue v = f->ret;
+
+    /* top == 0 with a previous chunk: the chunk is popped */
+    regvm_arena_pop_chunk(ctx->rt);
+    ctx->rt->current_stack_frame = c->sf;
+    *(JSValue *)((uint8_t *)c->fr + dst) = v;
+    ctx->rt->regvm_tail_chain = 0;
+    f = c;
+    __attribute__((musttail)) return regvm_t_dispatch(rip, c->fr, c, c->b->realm);
 }
 #endif
 
@@ -25926,6 +25996,9 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_construct_record(REGV
     f->this_obj = lay.arg_buf[slots];
     f->new_target = lay.arg_buf[slots + 1];
     f->flags |= JS_CALL_FLAG_CONSTRUCTOR;
+    /* the two owned slots above make the release walk non-empty, so the frame
+       is not trivial even if the fill saw no variables */
+    f->flags &= ~REGVM_FLAG_TRIVIAL_RET;
     f->local_buf = lay.arg_buf;
 #if QJS_DRC
     f->local_count = slots + 2 + cb->var_count;
@@ -28558,6 +28631,11 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
 #endif
     }
 
+    /* An empty release walk and no captured cells: frameless return. A
+       constructor clears this below for its this-unless-object rule. */
+    if (rec->local_count == 0 && cb->var_ref_count == 0)
+        rec->flags |= REGVM_FLAG_TRIVIAL_RET;
+
     sf->cur_func = cf;
 #if !REGVM_SLIM_FRAME
     sf->is_strict_mode = cb->is_strict_mode;
@@ -28688,6 +28766,10 @@ static __attribute__((always_inline)) inline void regvm_record_fill_tail(
 #if !REGVM_SLIM_FRAME
     sf->arg_count = slots;
 #endif
+
+    /* Same frameless-return test as `regvm_record_fill`. */
+    if (rec->local_count == 0 && cb->var_ref_count == 0)
+        rec->flags |= REGVM_FLAG_TRIVIAL_RET;
 
     sf->cur_func = cf;
 #if !REGVM_SLIM_FRAME
