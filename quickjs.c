@@ -124,6 +124,7 @@ typedef struct JSRegRopInfo {
     uint8_t size[2]; /* operand bytes without the opcode, narrow then wide register form; 0xff: no format */
     uint8_t rmask;   /* bit k: operand k is a register ('r') */
     uint8_t narrow;  /* regvm_rop_narrow */
+    int8_t tidx;     /* index of the last branch-target operand ('t'), or -1 */
 } JSRegRopInfo;
 static void js_regvm_rop_info_init(JSRegRopInfo *ri);
 #endif
@@ -68039,9 +68040,13 @@ static void js_regvm_rop_info_init(JSRegRopInfo *ri)
         ri[op].size[1] = n1 < 0 ? 0xff : (uint8_t)n1;
         ri[op].rmask = 0;
         ri[op].narrow = (uint8_t)regvm_rop_narrow((uint16_t)op);
-        for (k = 0; fmt && fmt[k] && k < 8; k++)
+        ri[op].tidx = -1;
+        for (k = 0; fmt && fmt[k] && k < 8; k++) {
             if (fmt[k] == 'r')
                 ri[op].rmask |= (uint8_t)(1u << k);
+            if (fmt[k] == 't')
+                ri[op].tidx = (int8_t)k;
+        }
     }
 }
 
@@ -80843,25 +80848,32 @@ static void regvm_own_analyze(JSContext *ctx, JSRegIR *ir, int n_blocks,
     }
     for (b = 0; b < n_blocks; b++) {
         for (i = bs[b]; bs[b] >= 0 && i < be[b]; i++) {
-            const char *f;
-            int ti = -1, tgt = -1, tb, pc;
+            int ti, tgt = -1, pc;
             if (blk[i] != b)
                 continue;
-            f = regvm_rop_fmt[ir->insns[i].rop];
-            if (!f)
-                continue;
-            for (k = 0; f[k]; k++)
-                if (f[k] == 't')
-                    ti = k;
+            ti = ir->ri[ir->insns[i].rop].tidx;
             if (ti < 0)
                 continue;
             pc = ir->insns[i].ops[ti];
-            for (tb = 0; tb < n_blocks; tb++)
-                if (bstart[tb] == pc) { tgt = tb; break; }
-            if (tgt < 0)
-                for (tb = 0; tb < n_blocks; tb++)
-                    if (pc >= bstart[tb] &&
-                        (tb + 1 >= n_blocks || pc < bstart[tb + 1])) { tgt = tb; break; }
+            /* The target's block: the first block starting at pc, else the
+               block whose range holds it. Block starts ascend (an entry block
+               may share pc 0 with the next), so a binary search finds the last
+               start at or below pc, then steps back over equal starts. */
+            {
+                int lo = 0, hi = n_blocks - 1;
+                while (lo <= hi) {
+                    int mid = lo + (hi - lo) / 2;
+                    if (bstart[mid] <= pc) {
+                        tgt = mid;
+                        lo = mid + 1;
+                    } else {
+                        hi = mid - 1;
+                    }
+                }
+                if (tgt >= 0 && bstart[tgt] == pc)
+                    while (tgt > 0 && bstart[tgt - 1] == pc)
+                        tgt--;
+            }
             if (tgt < 0)
                 continue;
             /* The exception unwinder lands at a `catch_enter`/`finally_enter`'s
