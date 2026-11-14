@@ -26444,17 +26444,23 @@ regvm_light_enter(JSContext *ctx, JSObject *co, JSFunctionBytecode *cb,
     /* Fill the variable area and register file with `undefined`; only the
        variable slots the promotion map still names are filled. */
     for (k = 0; k < vc; k++)
-        nf->var_buf[k] = JS_UNDEFINED;
+        __builtin_memcpy(&nf->var_buf[k], &regvm_undefined_value, sizeof(JSValue));
     regs = nf->fr;
     /* a light frame never suspends, so it has no handshake slots */
     nregs = cb->regvm_reg_count;
+    /*
+     * One 16-byte `undefined` store per register. `__builtin_memcpy` from the
+     * constant is alignment- and aliasing-safe; the barrier keeps the loop from
+     * becoming a `memset` call.
+     */
     for (k = 0; k + 1 < nregs; k += 2) {
-        regs[k] = JS_UNDEFINED;
-        regs[k + 1] = JS_UNDEFINED;
+        __builtin_memcpy(&regs[k], &regvm_undefined_value, sizeof(JSValue));
+        __builtin_memcpy(&regs[k + 1], &regvm_undefined_value,
+                         sizeof(JSValue));
         __asm__ volatile("" ::: "memory");
     }
     if (k < nregs)
-        regs[k] = JS_UNDEFINED;
+        __builtin_memcpy(&regs[k], &regvm_undefined_value, sizeof(JSValue));
     *out_regs = regs;
     return nf;
 }
