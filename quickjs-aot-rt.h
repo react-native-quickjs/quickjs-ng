@@ -10,6 +10,18 @@
 /* The register-frame handle. Opaque here; defined in quickjs.c. */
 typedef struct JSRegRun JSRegRun;
 
+/* The calling convention for the shared runtime stubs the generated code calls
+   on a slow path, an IC miss or a generic operation. Clang's `preserve_most`
+   says the stub clobbers almost no caller-saved registers, so generated code
+   keeps its live values in registers across the call instead of spilling them.
+   Declarations and definitions both use it, so the compiler checks that they
+   agree; without the attribute the two sides still link and run. */
+#if defined(__has_attribute) && __has_attribute(preserve_most)
+#define QJS_AOT_STUB __attribute__((preserve_most))
+#else
+#define QJS_AOT_STUB
+#endif
+
 /* QJS_DRC changes the ownership rule for a register store, so it is part of
    the ABI: a unit built with a different -DQJS_DRC is refused at bind. */
 #ifndef QJS_DRC
@@ -79,10 +91,10 @@ extern const uint32_t qjs_aot_count;
 extern const uint32_t qjs_aot_abi;
 
 /* ABI entry points implemented by the engine. */
-uint8_t *qjs_aot_step(uint8_t *ip, JSValue *fr, JSRegRun *f, JSContext *ctx);
+QJS_AOT_STUB uint8_t *qjs_aot_step(uint8_t *ip, JSValue *fr, JSRegRun *f, JSContext *ctx);
 uint8_t *qjs_aot_code(JSRegRun *f);
 JSValue qjs_aot_ret(JSRegRun *f);
-JSValue qjs_aot_unwind(JSContext *ctx, JSRegRun *f, JSValue *fr,
+QJS_AOT_STUB JSValue qjs_aot_unwind(JSContext *ctx, JSRegRun *f, JSValue *fr,
                        uint32_t pc, uint32_t *resume_pc);
 
 /* --- AOT fast-path helpers ------------------------------------------------
@@ -143,11 +155,11 @@ int qjs_aot_binary(JSContext *ctx, int sub, JSValue a, JSValue b, JSValue *out);
 JSValue *qjs_aot_arg_buf(JSRegRun *f);
 
 /* Mirror put_local: set_value(ctx, &vb[slot], js_dup(v)). */
-void qjs_aot_put_local(JSContext *ctx, JSValue *vb, int slot, JSValue v);
+QJS_AOT_STUB void qjs_aot_put_local(JSContext *ctx, JSValue *vb, int slot, JSValue v);
 
 /* Mirror the get_global cell-cache fast path then JS_GetGlobalVar: 0 on
    success with an owned *out, -1 on exception. */
-int qjs_aot_get_global(JSContext *ctx, int atom, int throwing, JSValue *out);
+QJS_AOT_STUB int qjs_aot_get_global(JSContext *ctx, int atom, int throwing, JSValue *out);
 
 /* Mirror put_field's REG_PIC_OWN_W direct-slot fast path (borrowed v): 1 when
    the store happened, 0 when the caller must take the slow path. */
@@ -182,15 +194,15 @@ int qjs_aot_to_bool(JSContext *ctx, JSValue v);
 int qjs_aot_fitsi(double d);
 JSValue qjs_aot_box_num(double d, int isint);
 int qjs_aot_to_num(JSValue v, double *out, int *isint);
-int qjs_aot_dense(JSValue v, JSValue **data, uint32_t *len);
-int qjs_aot_elem_num(JSValue *data, uint32_t i, double *out, int *isint);
+QJS_AOT_STUB int qjs_aot_dense(JSValue v, JSValue **data, uint32_t *len);
+QJS_AOT_STUB int qjs_aot_elem_num(JSValue *data, uint32_t i, double *out, int *isint);
 
 /* hoisted field guard + own-data-property read */
-int qjs_aot_field_guard(const void *pic, JSValue recv, int site, int *slot_off);
-JSValue qjs_aot_field_read(JSValue recv, int slot_off);
+QJS_AOT_STUB int qjs_aot_field_guard(const void *pic, JSValue recv, int site, int *slot_off);
+QJS_AOT_STUB JSValue qjs_aot_field_read(JSValue recv, int slot_off);
 
 /* array length and captured-variable cell accessors */
-int qjs_aot_get_length_num(JSValue v, double *out, int *isint);
+QJS_AOT_STUB int qjs_aot_get_length_num(JSValue v, double *out, int *isint);
 JSValue *qjs_aot_var_ref_ptr(JSRegRun *f, int slot);
 
 /* --- AOT call-site helpers ------------------------------------------------
@@ -198,22 +210,22 @@ JSValue *qjs_aot_var_ref_ptr(JSRegRun *f, int slot);
  * The prototype watchpoint epoch: the unit reads it at function entry; a
  * change means folded values must be re-read.
  */
-uint32_t qjs_aot_epoch(JSContext *ctx);
-JSValue qjs_aot_site_expect(JSContext *ctx, int site);
+QJS_AOT_STUB uint32_t qjs_aot_epoch(JSContext *ctx);
+QJS_AOT_STUB JSValue qjs_aot_site_expect(JSContext *ctx, int site);
 
 /* The specialised C-call path: 1 with an owned *out, 0 to fall back to the
    step engine, -1 on exception. `cproto` is the profile's prototype. */
-int qjs_aot_call_c(JSContext *ctx, int site, int cproto, int na, JSValue callee,
+QJS_AOT_STUB int qjs_aot_call_c(JSContext *ctx, int site, int cproto, int na, JSValue callee,
                    JSValue this_obj, JSValue *argv, JSValue *out);
 
 /* Direct compiled call: 1 with an owned *out, 0 to fall back to the step
    engine, -1 on exception. Only the no-copy frame case is handled. */
-int qjs_aot_call_b(JSContext *ctx, int na, JSValue callee, JSValue this_obj,
+QJS_AOT_STUB int qjs_aot_call_b(JSContext *ctx, int na, JSValue callee, JSValue this_obj,
                    JSValue *argv, JSValue *out);
 
 /* Folded prototype read: 1 with an owned *out while the PIC site still
    resolves to the same prototype slot and the epoch is unchanged. */
-int qjs_aot_proto_fold(JSContext *ctx, JSRegRun *f, const void *pic, int site,
+QJS_AOT_STUB int qjs_aot_proto_fold(JSContext *ctx, JSRegRun *f, const void *pic, int site,
                        JSValue recv, int pic_site, JSValue *out);
 
 #endif /* QUICKJS_AOT_RT_H */
