@@ -68604,8 +68604,9 @@ uint64_t js_aot_enter_count;
 uint64_t *js_aot_icount;
 
 /* The unit's report reads the counters through this (a weak reference there, so a unit also links against an engine without it). */
-const uint64_t *qjs_aot_icount_table(void)
+const uint64_t *qjs_aot_icount_table(unsigned *n)
 {
+    *n = js_aot_icount != NULL ? (unsigned)qjs_aot_count : 0u;
     return js_aot_icount;
 }
 #endif
