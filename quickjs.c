@@ -11328,6 +11328,14 @@ static int regvm_ip_pc(JSFunctionBytecode *b, const uint8_t *ip)
         return -1;
     return (int)(ip - b->regvm_code);
 }
+
+/* A callee's `ret_ip` is one instruction past its caller's call, and pc2line
+   is keyed by instruction start, so step back one byte to resolve the
+   caller's position. */
+static int regvm_ret_pc(JSFunctionBytecode *b, const uint8_t *ret_ip)
+{
+    return ret_ip ? regvm_ip_pc(b, ret_ip - 1) : -1;
+}
 #else
 #define regvm_frame_pc(rt, sf, b) (-1)
 #define regvm_ip_pc(b, ip) (-1)
@@ -24541,47 +24549,62 @@ static void regvm_light_walk(struct JSRegRun *lf, JSRegRootFn fn, void *opaque)
 }
 #endif
 
-/*
- * The logical stack for a backtrace, innermost first. The chain at
- * `regvm_cur` sits above `current_stack_frame`, and each real frame may have a
- * light chain saved below it in `rv_light`. A light frame's pc is its captured
- * `cap_ip`.
- */
+/* The logical stack for a backtrace, innermost first. The chain at
+   `regvm_cur` sits above `current_stack_frame`, and each real frame may have a
+   light chain saved below it in `rv_light`. Only the innermost frame uses its
+   captured `cap_ip`; every outer frame is located by its callee's `ret_ip`,
+   its call site. */
 static int regvm_fill_backtrace_frames(JSRuntime *rt, JSRegBtFrame *bt, int max)
 {
     int nb = 0;
     JSRegRun *lf;
     JSStackFrame *sf;
+    const uint8_t *callee_ret = NULL;
 
     for (lf = regvm_light_head(rt->regvm_cur);
          lf != NULL && nb < max;
          lf = (lf->caller && lf->caller->sf == NULL) ? lf->caller : NULL) {
         bt[nb].func = JS_MKPTR(JS_TAG_OBJECT, lf->func);
         bt[nb].cur_pc = NULL;
-        bt[nb].rpc = regvm_ip_pc(lf->b, lf->cap_ip);
+        bt[nb].rpc = callee_ret ? regvm_ret_pc(lf->b, callee_ret)
+                                : regvm_ip_pc(lf->b, lf->cap_ip);
+        if (bt[nb].rpc < 0)
+            bt[nb].rpc = regvm_ip_pc(lf->b, lf->cap_ip);
         bt[nb].sf = NULL;
         nb++;
+        callee_ret = lf->ret_ip;
     }
     for (sf = rt->current_stack_frame; sf != NULL && nb < max;
          sf = sf->prev_frame) {
         JSFunctionBytecode *fb = NULL;
+        JSRegRun *rec = sf->rv_rec;
         JSObject *fp = JS_VALUE_GET_OBJ(sf->cur_func);
 
         if (js_class_has_bytecode(fp->class_id))
             fb = fp->u.func.function_bytecode;
         bt[nb].func = sf->cur_func;
         bt[nb].cur_pc = sf->cur_pc;
-        bt[nb].rpc = fb ? regvm_frame_pc(rt, sf, fb) : -1;
+        if (fb && callee_ret)
+            bt[nb].rpc = regvm_ret_pc(fb, callee_ret);
+        else
+            bt[nb].rpc = fb ? regvm_frame_pc(rt, sf, fb) : -1;
+        if (bt[nb].rpc < 0 && fb)
+            bt[nb].rpc = regvm_frame_pc(rt, sf, fb);
         bt[nb].sf = sf;
         nb++;
+        callee_ret = rec ? rec->ret_ip : NULL;
         for (lf = regvm_light_head(sf->rv_light);
              lf != NULL && nb < max;
              lf = (lf->caller && lf->caller->sf == NULL) ? lf->caller : NULL) {
             bt[nb].func = JS_MKPTR(JS_TAG_OBJECT, lf->func);
             bt[nb].cur_pc = NULL;
-            bt[nb].rpc = regvm_ip_pc(lf->b, lf->cap_ip);
+            bt[nb].rpc = callee_ret ? regvm_ret_pc(lf->b, callee_ret)
+                                    : regvm_ip_pc(lf->b, lf->cap_ip);
+            if (bt[nb].rpc < 0)
+                bt[nb].rpc = regvm_ip_pc(lf->b, lf->cap_ip);
             bt[nb].sf = NULL;
             nb++;
+            callee_ret = lf->ret_ip;
         }
     }
     return nb;
@@ -26155,7 +26178,6 @@ static uint8_t *REGVM_CC regvm_t_call(REGVM_ARGS)
     int c = T_REG(3);
     JSValue cf = FR(c);
 
-    REGVM_CAPTURE_IP();
     /* Kept a pure classify-and-jump: the lazy materialize, and its call, live
        in `regvm_t_call_lazy`, so no C frame lands on every call. */
     if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
@@ -26177,12 +26199,17 @@ static uint8_t *REGVM_CC regvm_t_call(REGVM_ARGS)
                     return regvm_t_dispatch(cb->regvm_code, regs, nf,
                                             cb->realm);
             }
+            /* A light callee's header carries `ret_ip`, which locates the
+               caller. Record, lazy and slow calls can fail before a callee
+               header exists, so they keep the explicit capture. */
+            REGVM_CAPTURE_IP();
             if (likely(regvm_record_eligible(cb)))
                 __attribute__((musttail))
                     return regvm_t_call_record(REGVM_PASS);
             __attribute__((musttail)) return regvm_t_call_lazy(REGVM_PASS);
         }
     }
+    REGVM_CAPTURE_IP();
     __attribute__((musttail)) return regvm_t_call_slow(REGVM_PASS);
 }
 
@@ -26191,7 +26218,6 @@ static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS)
     int c = T_REG(3);
     JSValue cf = FR(c);
 
-    REGVM_CAPTURE_IP();
     /* Pure classify-and-jump; the lazy materialize is in
        `regvm_t_call_method_lazy`. */
     if (likely(JS_VALUE_GET_TAG(cf) == JS_TAG_OBJECT)) {
@@ -26213,12 +26239,15 @@ static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS)
                     return regvm_t_dispatch(cb->regvm_code, regs, nf,
                                             cb->realm);
             }
+            /* see `regvm_t_call`; non-light paths keep the capture */
+            REGVM_CAPTURE_IP();
             if (likely(regvm_record_eligible(cb)))
                 __attribute__((musttail))
                     return regvm_t_call_method_record(REGVM_PASS);
             __attribute__((musttail)) return regvm_t_call_method_lazy(REGVM_PASS);
         }
     }
+    REGVM_CAPTURE_IP();
     __attribute__((musttail)) return regvm_t_call_method_slow(REGVM_PASS);
 }
 
