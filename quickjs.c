@@ -11700,6 +11700,21 @@ static inline __attribute__((always_inline)) void js_free_block_acc(JSRuntime *r
     js_free_block_flat(rt, ptr);
 }
 
+/* A child of a plain object being freed whose count is still the nursery bias while its chunk is closed: the nursery collection did not promote it, so
+   whoever stored it in an old object did not record it as a root. It is dead and skipped, as js_free_value_rt skips it; QJS_Y_STRICT=1 reports the
+   parent and aborts, to find the store. */
+static __attribute__((noinline, cold)) void y_unpromoted_child(void *c, JSObject *parent)
+{
+    static int strict = -1;
+
+    if (strict < 0)
+        strict = getenv("QJS_Y_STRICT") != NULL;
+    if (strict) {
+        fprintf(stderr, "QJS_Y_STRICT: plain object %p (class %d) holds the unpromoted nursery cell %p (kind %x)\n", (void *)parent, parent->class_id, c, ((uint8_t *)c)[21]);
+        abort();
+    }
+}
+
 static inline __attribute__((always_inline)) void
 free_plain_object(JSRuntime *rt, JSObject *p, JSFreeAcc *acc)
 {
@@ -11736,6 +11751,8 @@ free_plain_object(JSRuntime *rt, JSObject *p, JSFreeAcc *acc)
                 if (JS_VALUE_HAS_REF_COUNT(v) && (SPL_K(7), 1) &&
                     --JS_REF_COUNT(JS_VALUE_GET_PTR(v)) <= 0) {
                     if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && (Y_IS(JS_VALUE_GET_PTR(v)) || Y_NEGCHK(v))) {
+                        if (unlikely(!Y_IS(JS_VALUE_GET_PTR(v))))
+                            y_unpromoted_child(JS_VALUE_GET_PTR(v), p);
                         pr++;
                         continue;
                     }
