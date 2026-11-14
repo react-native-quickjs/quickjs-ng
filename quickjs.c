@@ -65330,17 +65330,13 @@ static void regvm_report_refusal(JSContext *ctx, JSFunctionDef *fd,
         JS_FreeCString(ctx, file);
 }
 
-#ifdef QJS_REGVM_VERIFY
-/*
- * The final refusal (after the conservative retry) is not supposed to happen:
- * every deferral site carries a comment naming the invariant that makes it
- * unreachable. Under QJS_REGVM_VERIFY, reaching one is a failure; the site's
- * reason is printed so the invariant that broke is named.
- *
- * (Not `assert`: the reason is a runtime string, and `assert`'s argument must
- * still be valid when it is compiled out -- a debug build without NDEBUG would
- * not accept a non-literal there.)
- */
+#if QJS_REGVM_VERIFY
+/* The final refusal, after the conservative retry, should be unreachable:
+   every deferral site names the invariant that rules it out. Under
+   QJS_REGVM_VERIFY reaching one aborts with the site's reason. Not `assert`:
+   the reason is a runtime string. QJS_REGVM_VERIFY is always defined (1 in a
+   debug build, 0 in release), so the test must be `#if`, not `#ifdef`. In a
+   release build the refusal is reported and the function left uncompiled. */
 #define REGVM_VERIFY_DEAD_END(why) do { \
         fprintf(stderr, "regvm: unreachable refusal reached: %s\n", (why)); \
         abort(); \
