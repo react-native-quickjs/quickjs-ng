@@ -54766,6 +54766,22 @@ static int regvm_lower_insn(JSContext *ctx, JSRegIR *ir, const uint8_t *bc,
 
     /* globals */
     case OP_get_var:
+        /* `undefined` is a non-writable, non-configurable global with the same
+           immediate in every realm, so reading it is a constant unless a direct
+           `eval` here or in a parent could have introduced a binding. Scope
+           resolution has already failed by this point, and `with` emits its own
+           `OP_with_get_var`. */
+        if (get_u32(bc + pos + 1) == JS_ATOM_undefined) {
+            const JSFunctionDef *q_;
+            int ev = 0;
+            for (q_ = fd; q_; q_ = q_->parent)
+                if (q_->has_eval_call)
+                    ev = 1;
+            if (!ev) {
+                ADD(ROP_load_undefined, dst);
+                return 0;
+            }
+        }
         ADD(ROP_get_global, dst, (int32_t)get_u32(bc + pos + 1), 1); return 0;
     case OP_get_var_undef:
         ADD(ROP_get_global, dst, (int32_t)get_u32(bc + pos + 1), 0); return 0;
