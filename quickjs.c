@@ -3316,7 +3316,22 @@ static uint64_t gc_trig[4], gc_rec_n, gc_rec_peak, gc_rec_thr;
 static int gc_stat_on = -1;
 #define GC_MIN_STEP ((size_t)4 << 20)
 
+/* The next collection is due after at most this much growth (doubled for each consecutive collection that freed little): the set a young collection sweeps
+   then stays small enough to be cache resident, which costs a fraction per object of a set that is a large share of the heap; a full collection is scheduled
+   separately, by the heap's growth over what the last full one left. */
+#define GC_YOUNG_STEP ((size_t)8 << 20)
+static void js_gc_rearm_pace0(JSRuntime *rt, size_t before, size_t after);
 static void js_gc_rearm_pace(JSRuntime *rt, size_t before, size_t after)
+{
+    js_gc_rearm_pace0(rt, before, after);
+    {
+        size_t cap = GC_YOUNG_STEP << rt->gc_cyc_empty_streak;
+
+        if (rt->malloc_gc_threshold > after + cap)
+            rt->malloc_gc_threshold = after + cap;
+    }
+}
+static void js_gc_rearm_pace0(JSRuntime *rt, size_t before, size_t after)
 {
     size_t step = after >> 1, maxstep;
     if (step < GC_MIN_STEP)
@@ -13164,7 +13179,18 @@ static void gc_young(JSRuntime *rt)
     while (sp)
         gc_young_edges(rt, gc_y_stk[--sp], 1, &sp);
     GC_PH(4);
-    /* 4: free the garbage: release what it holds outside S, then the cells */
+    /* 4: free the garbage: release what it holds outside S, then the cells. Releasing can free an object outside S that was the only owner of a live member:
+       the live members hold one extra count meanwhile, given back (parking the member if it was the last) after the release. */
+    sp = 0;
+    if (gc_young_n > gc_y_stk_cap) {
+        gc_y_stk_cap = gc_young_n;
+        gc_y_stk = __builtin_realloc(gc_y_stk, gc_y_stk_cap * sizeof(JSObject *));
+        if (!gc_y_stk)
+            abort();
+    }
+    for (i = 0; i < gc_young_n; i++)
+        if (gc_y_set[i]->gc_live)
+            JS_REF_COUNT(gc_y_set[i])++;
     rt->gc_phase = JS_GC_PHASE_DECREF;
     for (i = 0; i < gc_young_n; i++) {
         JSObject *o = gc_y_set[i];
@@ -13195,11 +13221,20 @@ static void gc_young(JSRuntime *rt)
         if (o->gc_live) {
             o->gc_young = 0;
             o->gc_live = 0;
+            gc_y_stk[sp++] = o;
         } else {
             remove_gc_object(&o->header);
             js_free_rt(rt, o);
         }
     }
+    /* objects outside S that the release took to zero wait on the zero list */
+    if (!list_empty(&rt->gc_zero_ref_count_list))
+        free_zero_refcount(rt);
+    for (i = 0; i < sp; i++) {
+        if (--JS_REF_COUNT(gc_y_stk[i]) <= 0)
+            js_drc_zero(rt, JS_MKPTR(JS_TAG_OBJECT, gc_y_stk[i]));
+    }
+
     GC_PH(6);
     rt->gc_phase = JS_GC_PHASE_NONE;
 }
@@ -13383,6 +13418,15 @@ void JS_RunGC(JSRuntime *rt)
 /* The collection an allocation threshold or a pending request asks for: a young one while the heap has not grown past what the last full one left,
    a full one at least every 8 collections and whenever a young one leaves the heap more than half larger than the last full one did (older
    garbage cycles are then the likely cause). QJS_NOYOUNGGC=1 always runs the full one. */
+/* A full collection is due when the heap has grown past what the last one left by half, and by one more half for each consecutive collection that freed
+   little (a program that builds a large live structure gains nothing from sweeping it again). */
+static bool js_gc_full_due(JSRuntime *rt)
+{
+    unsigned k = rt->gc_cyc_empty_streak > 4 ? 4 : rt->gc_cyc_empty_streak;
+
+    return rt->malloc_state.malloc_size > rt->gc_full_after + (rt->gc_full_after >> 1) * (1 + k);
+}
+
 static bool js_gc_pick_young(JSRuntime *rt)
 {
     if (js_gc_young_on < 0)
@@ -13400,7 +13444,7 @@ static void js_gc_auto_pinned(JSRuntime *rt)
     if (young)
         rt->gc_young_streak++;
     js_gc_passes(rt, young, unlikely(gc_stat_on) ? __builtin_ia32_rdtsc() : 0, sz0);
-    if (young && rt->malloc_state.malloc_size > rt->gc_full_after + (rt->gc_full_after >> 1))
+    if (young && js_gc_full_due(rt))
         rt->gc_need_full = true;
     js_gc_rearm_pace(rt, sz0, rt->malloc_state.malloc_size);
 }
@@ -13416,7 +13460,7 @@ static void js_gc_auto(JSRuntime *rt)
     }
     rt->gc_young_streak++;
     js_run_gc(rt, true);
-    if (rt->malloc_state.malloc_size > rt->gc_full_after + (rt->gc_full_after >> 1))
+    if (js_gc_full_due(rt))
         rt->gc_need_full = true;
 }
 
