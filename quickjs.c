@@ -618,7 +618,15 @@ typedef struct JSAotRun {
 _Static_assert(QJS_AOT_CLAIM_MAX_LAYOUTS == (QJS_AOT_CLAIM_OBJ_NN(63) & 0x3f), "a layout id fits in 6 bits");
 #endif
 #define JS_AOT_GWATCH_MAX 256
+/* The weak references of the objects that have any, keyed by object: an object keeps one flag bit instead of a list head. */
+typedef struct JSWeakTab {
+    struct JSObject **key;
+    struct JSWeakRefRecord **head;
+    uint32_t cap, n; /* cap is a power of two or 0 */
+} JSWeakTab;
+
 struct JSRuntime {
+    JSWeakTab weak_tab;
     JSMallocFunctions mf;
     JSMallocState malloc_state;
     JSArenaState arena_state;
@@ -2548,14 +2556,13 @@ struct JSObject {
                                     11 flag bits + 5 = exactly the 2-byte slot
                                     before class_id, which does not move. */
     uint16_t class_id; /* see JS_CLASS_x */
-    uint8_t values_inline;
+    uint8_t values_inline : 1;
+    uint8_t has_weak_ref : 1; /* the runtime's weak table holds this object's weak references */
     uint8_t arr_kind; /* JS_CLASS_ARRAY only: JS_ARR_KIND_* (see QJS_PACKED_ARRAYS); always 0 unless the flag is on */
     /* byte offsets: 16/24 */
     JSShape *shape; /* prototype and property names + flag */
     JSProperty *prop; /* array of properties */
     /* byte offsets: 24/40 */
-    JSWeakRefRecord *first_weak_ref;
-    /* byte offsets: 28/48 */
     union {
         void *opaque;
         struct JSBoundFunction *bound_function; /* JS_CLASS_BOUND_FUNCTION */
@@ -2953,9 +2960,11 @@ static int JS_CreateProperty(JSContext *ctx, JSObject *p,
                              JSValueConst getter, JSValueConst setter,
                              int flags);
 static int js_string_memcmp(JSString *p1, JSString *p2, int len);
-static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord **first_weak_ref);
+static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord *first_weak_ref);
+static JSWeakRefRecord *weak_take(JSRuntime *rt, JSObject *p);
+static JSWeakRefRecord *weak_head(JSRuntime *rt, JSObject *p);
 static bool is_valid_weakref_target(JSValueConst val);
-static void insert_weakref_record(JSValueConst target,
+static void insert_weakref_record(JSRuntime *rt, JSValueConst target,
                                   struct JSWeakRefRecord *wr);
 static JSValue js_array_buffer_constructor3(JSContext *ctx,
                                             JSValueConst new_target,
@@ -5216,6 +5225,8 @@ void JS_FreeRuntime(JSRuntime *rt)
     }
     js_free_rt(rt, rt->atom_array);
     js_free_rt(rt, rt->atom_hash);
+    js_free_rt(rt, rt->weak_tab.key);
+    js_free_rt(rt, rt->weak_tab.head);
     js_free_rt(rt, rt->shape_hash);
 #if !JS_MEGA_DISABLE
     js_free_rt(rt, rt->mega_cache);
@@ -6731,7 +6742,9 @@ static void JS_FreeAtomStruct(JSRuntime *rt, JSAtomStruct *p)
     rt->atom_array[i] = atom_set_free(rt->atom_free_index);
     rt->atom_free_index = i;
     if (unlikely(p->first_weak_ref)) {
-        reset_weak_ref(rt, &p->first_weak_ref);
+        JSWeakRefRecord *wh = p->first_weak_ref;
+        p->first_weak_ref = NULL;
+        reset_weak_ref(rt, wh);
     }
 #if QJS_DRC
     if (JS_GC_IN_ZCT(p)) {
@@ -10177,7 +10190,7 @@ static inline __attribute__((always_inline)) JSValue js_new_plain_object(JSConte
     p->class_id = JS_CLASS_OBJECT;
     p->values_inline = 0;
     p->arr_kind = JS_ARR_KIND_GENERIC;
-    p->first_weak_ref = NULL;
+    p->has_weak_ref = 0;
     p->shape = sh;
     p->prop = (JSProperty *)((uint8_t *)p + offsetof(JSObject, u));
     JS_REF_COUNT(p) = 1;
@@ -10242,7 +10255,7 @@ static JSValue JS_NewObjectFromShapeCapExtra(JSContext *ctx, JSShape *sh,
     p->is_HTMLDDA = 0;
     p->gv_watched = 0;
     p->is_prototype = 0;
-    p->first_weak_ref = NULL;
+    p->has_weak_ref = 0;
     if (class_id != JS_CLASS_OBJECT)
         p->u.opaque = NULL;
     p->shape = sh;
@@ -11419,9 +11432,8 @@ static void free_object(JSRuntime *rt, JSObject *p)
     p->shape = NULL;
     p->prop = NULL;
 
-    if (unlikely(p->first_weak_ref)) {
-        reset_weak_ref(rt, &p->first_weak_ref);
-    }
+    if (unlikely(p->has_weak_ref))
+        reset_weak_ref(rt, weak_take(rt, p));
 
     finalizer = rt->class_array[p->class_id].finalizer;
     if (finalizer)
@@ -11530,7 +11542,7 @@ free_plain_object(JSRuntime *rt, JSObject *p, JSFreeAcc *acc)
         JSShapeProperty *pr;
 
         DRC_ST(drc_st_freeobj);
-        assert(p->class_id == JS_CLASS_OBJECT && !p->first_weak_ref);
+        assert(p->class_id == JS_CLASS_OBJECT && !p->has_weak_ref);
         assert(rt->class_array[JS_CLASS_OBJECT].finalizer == NULL);
         assert(rt->gc_phase == JS_GC_PHASE_DECREF);
         sh = p->shape;
@@ -11547,7 +11559,7 @@ free_plain_object(JSRuntime *rt, JSObject *p, JSFreeAcc *acc)
                     if (likely(js_free_stack_on) && JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && sp < 32) {
                         JSObject *c = JS_VALUE_GET_OBJ(v);
 
-                        if (likely(c->class_id == JS_CLASS_OBJECT) && likely(c->first_weak_ref == NULL) &&
+                        if (likely(c->class_id == JS_CLASS_OBJECT) && likely(!c->has_weak_ref) &&
                             !JS_GC_IN_ZCT(c)) {
                             stk[sp++] = c;
                             pr++;
@@ -11588,7 +11600,7 @@ free_array_object(JSRuntime *rt, JSObject *p)
     JSShape *sh;
     JSShapeProperty *pr;
 
-    assert(p->class_id == JS_CLASS_ARRAY && !p->first_weak_ref);
+    assert(p->class_id == JS_CLASS_ARRAY && !p->has_weak_ref);
     assert(rt->gc_phase == JS_GC_PHASE_DECREF);
     sh = p->shape;
     pr = get_shape_prop(sh);
@@ -11653,11 +11665,11 @@ static void free_zero_refcount(JSRuntime *rt)
         assert(JS_REF_COUNT(p) == 0);
         if (likely(JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_JS_OBJECT &&
                    ((JSObject *)p)->class_id == JS_CLASS_OBJECT &&
-                   ((JSObject *)p)->first_weak_ref == NULL))
+                   !((JSObject *)p)->has_weak_ref))
             free_plain_object(rt, (JSObject *)p, NULL);
         else if (likely(JS_GC_TYPE(p) == JS_GC_OBJ_TYPE_JS_OBJECT &&
                         ((JSObject *)p)->class_id == JS_CLASS_ARRAY &&
-                        ((JSObject *)p)->first_weak_ref == NULL))
+                        !((JSObject *)p)->has_weak_ref))
             free_array_object(rt, (JSObject *)p);
         else
             free_gc_object(rt, p);
@@ -12173,7 +12185,7 @@ static void js_drc_reconcile_locked(JSRuntime *rt)
             p = rt->zpark[i];
             assert(JS_REF_COUNT(p) == 0 && JS_GC_IN_ZCT(p));
             DRC_ST(drc_st_freed);
-            if (likely(((JSObject *)p)->first_weak_ref == NULL))
+            if (likely(!((JSObject *)p)->has_weak_ref))
                 free_plain_object(rt, (JSObject *)p, &facc);
             else
                 free_gc_object(rt, p);
@@ -12541,8 +12553,8 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
                 prs++;
             }
 
-            if (unlikely(p->first_weak_ref)) {
-                mark_weak_map_value(rt, p->first_weak_ref, mark_func);
+            if (unlikely(p->has_weak_ref)) {
+                mark_weak_map_value(rt, weak_head(rt, p), mark_func);
             }
 
             if (p->class_id != JS_CLASS_OBJECT) {
@@ -12689,7 +12701,7 @@ mark_children_fast(JSRuntime *rt, JSGCObjectHeader *gp, JS_MarkFunc *mark_func)
     if (unlikely(JS_GC_TYPE(gp) != JS_GC_OBJ_TYPE_JS_OBJECT))
         return 0;
     p = (JSObject *)gp;
-    if (unlikely(p->first_weak_ref != NULL ||
+    if (unlikely(p->has_weak_ref ||
                  (p->class_id != JS_CLASS_OBJECT && p->class_id != JS_CLASS_ARRAY)))
         return 0;
     sh = p->shape;
@@ -69173,7 +69185,7 @@ QJS_AOT_STUB JSValue qjs_aot_new_from_shape_cap(JSContext *ctx, void *shape, uin
     p->is_HTMLDDA = 0;
     p->gv_watched = 0;
     p->is_prototype = 0;
-    p->first_weak_ref = NULL;
+    p->has_weak_ref = 0;
     p->shape = js_dup_shape(sh);
     pr = (JSProperty *)((uint8_t *)p + offsetof(JSObject, u));
     p->prop = pr;
@@ -69478,7 +69490,7 @@ static JSObject *js_aot_moved_alloc(JSContext *ctx, JSObject *src)
     h->is_HTMLDDA = 0;
     h->gv_watched = 0;
     h->is_prototype = 0;
-    h->first_weak_ref = NULL;
+    h->has_weak_ref = 0;
     pr = (JSProperty *)((uint8_t *)h + offsetof(JSObject, u));
     h->prop = pr;
     for (i = n; i < cap; i++)
@@ -106347,13 +106359,123 @@ static void map_hash_resize(JSContext *ctx, JSMapState *s)
     s->record_count_threshold = new_hash_size * 2;
 }
 
-static JSWeakRefRecord **get_first_weak_ref(JSValueConst key)
+/* open addressing with linear probing; a removal shifts the following entries back, so there are no tombstones */
+static inline uint32_t weak_hash(const JSObject *p, uint32_t cap)
+{
+    return (uint32_t)((((uintptr_t)p >> 4) * 0x9e3779b1u) >> 7) & (cap - 1);
+}
+static JSWeakRefRecord **weak_slot(JSRuntime *rt, JSObject *p, bool create)
+{
+    JSWeakTab *t = &rt->weak_tab;
+    uint32_t i;
+
+    if (!p->has_weak_ref && !create)
+        return NULL;
+    if (t->cap == 0 || (t->n + 1) * 2 > t->cap) {
+        if (create) {
+            uint32_t ncap = t->cap ? t->cap * 2 : 16, j;
+            JSObject **nk = js_mallocz_rt(rt, ncap * sizeof(*nk));
+            JSWeakRefRecord **nh = js_mallocz_rt(rt, ncap * sizeof(*nh));
+            if (!nk || !nh) {
+                js_free_rt(rt, nk);
+                js_free_rt(rt, nh);
+                abort(); /* a weak reference cannot be dropped */
+            }
+            for (j = 0; j < t->cap; j++) {
+                if (t->key[j]) {
+                    uint32_t k = weak_hash(t->key[j], ncap);
+                    while (nk[k]) k = (k + 1) & (ncap - 1);
+                    nk[k] = t->key[j];
+                    nh[k] = t->head[j];
+                }
+            }
+            js_free_rt(rt, t->key);
+            js_free_rt(rt, t->head);
+            t->key = nk;
+            t->head = nh;
+            t->cap = ncap;
+        } else if (t->cap == 0) {
+            return NULL;
+        }
+    }
+    i = weak_hash(p, t->cap);
+    while (t->key[i]) {
+        if (t->key[i] == p)
+            return &t->head[i];
+        i = (i + 1) & (t->cap - 1);
+    }
+    if (!create)
+        return NULL;
+    t->key[i] = p;
+    t->head[i] = NULL;
+    t->n++;
+    p->has_weak_ref = 1;
+    return &t->head[i];
+}
+
+static void weak_remove(JSRuntime *rt, JSObject *p)
+{
+    JSWeakTab *t = &rt->weak_tab;
+    uint32_t i = weak_hash(p, t->cap), j, k;
+
+    while (t->key[i] != p)
+        i = (i + 1) & (t->cap - 1);
+    t->n--;
+    p->has_weak_ref = 0;
+    for (j = i;;) {
+        t->key[i] = NULL;
+        t->head[i] = NULL;
+        for (;;) {
+            j = (j + 1) & (t->cap - 1);
+            if (!t->key[j])
+                return;
+            k = weak_hash(t->key[j], t->cap);
+            /* the entry at j may move to i unless its home lies cyclically in (i, j] */
+            if (i <= j ? (i < k && k <= j) : (i < k || k <= j))
+                continue;
+            break;
+        }
+        t->key[i] = t->key[j];
+        t->head[i] = t->head[j];
+        i = j;
+    }
+}
+
+static JSWeakRefRecord *weak_head(JSRuntime *rt, JSObject *p)
+{
+    JSWeakRefRecord **s = weak_slot(rt, p, false);
+    return s ? *s : NULL;
+}
+
+/* the list of p, removed from the table */
+static JSWeakRefRecord *weak_take(JSRuntime *rt, JSObject *p)
+{
+    JSWeakRefRecord **s = weak_slot(rt, p, false), *h;
+    if (!s)
+        return NULL;
+    h = *s;
+    weak_remove(rt, p);
+    return h;
+}
+
+/* after a record left p's list: an empty list leaves the table */
+static void weak_release(JSRuntime *rt, JSValueConst key)
+{
+    if (JS_VALUE_GET_TAG(key) == JS_TAG_OBJECT) {
+        JSObject *p = JS_VALUE_GET_OBJ(key);
+        JSWeakRefRecord **s = weak_slot(rt, p, false);
+        if (s && *s == NULL)
+            weak_remove(rt, p);
+    }
+}
+
+static JSWeakRefRecord **get_first_weak_ref(JSRuntime *rt, JSValueConst key)
 {
         switch (JS_VALUE_GET_TAG(key)) {
         case JS_TAG_OBJECT:
             {
                 JSObject *p = JS_VALUE_GET_OBJ(key);
-                return &p->first_weak_ref;
+                return weak_slot(rt, p, true);
             }
             break;
         case JS_TAG_SYMBOL:
@@ -106388,7 +106510,7 @@ static JSMapRecord *map_add_record(JSContext *ctx, JSMapState *s,
         }
         wr->kind = JS_WEAK_REF_KIND_MAP;
         wr->u.map_record = mr;
-        insert_weakref_record(key, wr);
+        insert_weakref_record(ctx->rt, key, wr);
         mr->key = unsafe_unconst(key);
     } else {
         mr->key = js_dup(key);
@@ -106411,7 +106533,7 @@ static void delete_map_weak_ref(JSRuntime *rt, JSMapRecord *mr)
 {
     JSWeakRefRecord **pwr, *wr;
 
-    pwr = get_first_weak_ref(mr->key);
+    pwr = get_first_weak_ref(rt, mr->key);
     for(;;) {
         wr = *pwr;
         assert(wr != NULL);
@@ -106420,6 +106542,7 @@ static void delete_map_weak_ref(JSRuntime *rt, JSMapRecord *mr)
         pwr = &wr->next_weak_ref;
     }
     *pwr = wr->next_weak_ref;
+    weak_release(rt, mr->key);
     js_free_rt(rt, wr);
 }
 
@@ -115978,7 +116101,7 @@ static void js_weakref_finalizer(JSRuntime *rt, JSValueConst val)
     /* Delete weak ref */
     JSWeakRefRecord **pwr, *wr;
 
-    pwr = get_first_weak_ref(wrd->target);
+    pwr = get_first_weak_ref(rt, wrd->target);
     for(;;) {
         wr = *pwr;
         assert(wr != NULL);
@@ -115987,6 +116110,7 @@ static void js_weakref_finalizer(JSRuntime *rt, JSValueConst val)
         pwr = &wr->next_weak_ref;
     }
     *pwr = wr->next_weak_ref;
+    weak_release(rt, wrd->target);
     js_free_rt(rt, wrd);
     js_free_rt(rt, wr);
 }
@@ -116018,7 +116142,7 @@ static JSValue js_weakref_constructor(JSContext *ctx, JSValueConst new_target,
     wrd->obj = obj;
     wr->kind = JS_WEAK_REF_KIND_WEAK_REF;
     wr->u.weak_ref_data = wrd;
-    insert_weakref_record(arg, wr);
+    insert_weakref_record(ctx->rt, arg, wr);
 
     JS_SetOpaqueInternal(obj, wrd);
     return obj;
@@ -116062,7 +116186,7 @@ static void delete_finrec_weakref(JSRuntime *rt, JSFinRecEntry *fre)
 {
     JSWeakRefRecord **pwr, *wr;
 
-    pwr = get_first_weak_ref(fre->target);
+    pwr = get_first_weak_ref(rt, fre->target);
     for(;;) {
         wr = *pwr;
         assert(wr != NULL);
@@ -116071,6 +116195,7 @@ static void delete_finrec_weakref(JSRuntime *rt, JSFinRecEntry *fre)
         pwr = &wr->next_weak_ref;
     }
     *pwr = wr->next_weak_ref;
+    weak_release(rt, fre->target);
     js_free_rt(rt, wr);
 }
 
@@ -116182,7 +116307,7 @@ static JSValue js_finrec_register(JSContext *ctx, JSValueConst this_val,
     list_add_tail(&fre->link, &frd->entries);
     wr->kind = JS_WEAK_REF_KIND_FINALIZATION_REGISTRY_ENTRY;
     wr->u.fin_rec_entry = fre;
-    insert_weakref_record(target, wr);
+    insert_weakref_record(ctx->rt, target, wr);
 
     return JS_UNDEFINED;
 }
@@ -116266,7 +116391,7 @@ int JS_AddIntrinsicWeakRef(JSContext *ctx)
     return 0;
 }
 
-static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord **first_weak_ref)
+static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord *first_weak_ref)
 {
     JSWeakRefRecord *wr, *wr_next;
     JSWeakRefData *wrd;
@@ -116276,7 +116401,7 @@ static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord **first_weak_ref)
 
     /* first pass to remove the records from the WeakMap/WeakSet
        lists */
-    for(wr = *first_weak_ref; wr != NULL; wr = wr->next_weak_ref) {
+    for(wr = first_weak_ref; wr != NULL; wr = wr->next_weak_ref) {
         switch(wr->kind) {
         case JS_WEAK_REF_KIND_MAP:
             mr = wr->u.map_record;
@@ -116302,7 +116427,7 @@ static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord **first_weak_ref)
 
     /* second pass to free the values to avoid modifying the weak
        reference list while traversing it. */
-    for(wr = *first_weak_ref; wr != NULL; wr = wr_next) {
+    for(wr = first_weak_ref; wr != NULL; wr = wr_next) {
         wr_next = wr->next_weak_ref;
         switch(wr->kind) {
         case JS_WEAK_REF_KIND_MAP:
@@ -116350,7 +116475,6 @@ static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord **first_weak_ref)
         js_free_rt(rt, wr);
     }
 
-    *first_weak_ref = NULL; /* fail safe */
 }
 
 static bool is_valid_weakref_target(JSValueConst val)
@@ -116372,10 +116496,10 @@ static bool is_valid_weakref_target(JSValueConst val)
     return true;
 }
 
-static void insert_weakref_record(JSValueConst target,
+static void insert_weakref_record(JSRuntime *rt, JSValueConst target,
                                   struct JSWeakRefRecord *wr)
 {
-    JSWeakRefRecord **pwr = get_first_weak_ref(target);
+    JSWeakRefRecord **pwr = get_first_weak_ref(rt, target);
     /* Add the weak reference */
     wr->next_weak_ref = *pwr;
     *pwr = wr;
