@@ -25601,6 +25601,13 @@ static uint8_t *REGVM_CC regvm_t_call(REGVM_ARGS)
             JSFunctionBytecode *cb = co->u.func.function_bytecode;
             if (likely(regvm_record_eligible(cb)))
                 __attribute__((musttail)) return regvm_t_call_record(REGVM_PASS);
+            /* A lazy function becomes record-eligible only once materialized.
+               Materializing here keeps its first call on the record path, so
+               Error.stack is the same for a bundle and for source. */
+            if (unlikely(cb->is_lazy) &&
+                js_materialize_function_body(cb->realm, cb) == 0 &&
+                regvm_record_eligible(cb))
+                __attribute__((musttail)) return regvm_t_call_record(REGVM_PASS);
 #if defined(QJS_REGVM_COUNT)
             regvm_note_blockers(cb);
 #endif
@@ -25619,6 +25626,11 @@ static uint8_t *REGVM_CC regvm_t_call_method(REGVM_ARGS)
         if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION)) {
             JSFunctionBytecode *cb = co->u.func.function_bytecode;
             if (likely(regvm_record_eligible(cb)))
+                __attribute__((musttail))
+                    return regvm_t_call_method_record(REGVM_PASS);
+            if (unlikely(cb->is_lazy) &&
+                js_materialize_function_body(cb->realm, cb) == 0 &&
+                regvm_record_eligible(cb))
                 __attribute__((musttail))
                     return regvm_t_call_method_record(REGVM_PASS);
 #if defined(QJS_REGVM_COUNT)
@@ -27604,6 +27616,11 @@ static uint8_t *REGVM_CC regvm_t_tail_call(REGVM_ARGS)
                 if (likely(regvm_record_eligible(cb) && f->caller != NULL))
                     __attribute__((musttail))
                         return regvm_t_tail_call_record(REGVM_PASS);
+                if (unlikely(cb->is_lazy && f->caller != NULL) &&
+                    js_materialize_function_body(cb->realm, cb) == 0 &&
+                    regvm_record_eligible(cb))
+                    __attribute__((musttail))
+                        return regvm_t_tail_call_record(REGVM_PASS);
             }
         }
     }
@@ -27625,6 +27642,11 @@ static uint8_t *REGVM_CC regvm_t_tail_call_method(REGVM_ARGS)
             if (likely(co->class_id == JS_CLASS_BYTECODE_FUNCTION)) {
                 JSFunctionBytecode *cb = co->u.func.function_bytecode;
                 if (likely(regvm_record_eligible(cb) && f->caller != NULL))
+                    __attribute__((musttail))
+                        return regvm_t_tail_call_method_record(REGVM_PASS);
+                if (unlikely(cb->is_lazy && f->caller != NULL) &&
+                    js_materialize_function_body(cb->realm, cb) == 0 &&
+                    regvm_record_eligible(cb))
                     __attribute__((musttail))
                         return regvm_t_tail_call_method_record(REGVM_PASS);
             }
@@ -56612,6 +56634,28 @@ static int regvm_fmt_size(const char *fmt, int wide, uint16_t rop)
     return n;
 }
 
+/* Does every opcode in a register program have a threaded handler? Read from
+   the encoded bytes, the final form. `regvm_all_threaded` is never serialized,
+   so the bundle read path runs the same walk. */
+#if QJS_REGVM_THREAD
+static int regvm_code_all_threaded(const uint8_t *code, int len)
+{
+    const uint8_t *p = code, *end = p + len;
+
+    while (p < end) {
+        int op = *p, sz;
+        if (op >= ROP_COUNT || !regvm_is_threaded[op] ||
+            regvm_rop_fmt[op] == NULL)
+            return 0;
+        sz = regvm_fmt_size(regvm_rop_fmt[op], 1, (uint16_t)op);
+        if (sz < 0)
+            return 0;
+        p += 1 + sz;
+    }
+    return p == end;
+}
+#endif
+
 /*
  * Rewrite every atom operand of a register program in place, so serialization
  * passes them through the atom table. `cb` returns each atom's replacement: a
@@ -63889,34 +63933,11 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                                              );
 
 #if QJS_REGVM_THREAD
-            /*
-             * Whether every opcode here has a threaded handler. Read out of the
-             * encoded bytes rather than the IR because that is the final form --
-             * the encoder narrows operands as it emits -- and `wide` is a
-             * constant 1 at the only call site, so the walk is exact.
-             */
-            {
-                const uint8_t *_p = fd->regvm_code;
-                const uint8_t *_end = _p + fd->regvm_len;
-                int _all = 1;
-
-                while (_p < _end) {
-                    int _op = *_p;
-                    int _sz;
-                    if (_op >= ROP_COUNT || !regvm_is_threaded[_op] ||
-                        regvm_rop_fmt[_op] == NULL) {
-                        _all = 0;
-                        break;
-                    }
-                    _sz = regvm_fmt_size(regvm_rop_fmt[_op], 1, (uint16_t)_op);
-                    if (_sz < 0) {
-                        _all = 0;
-                        break;
-                    }
-                    _p += 1 + _sz;
-                }
-                fd->regvm_all_threaded = (_all && _p == _end);
-            }
+            /* Whether every opcode has a threaded handler, read from the
+               encoded bytes, which are the final form. Shared with the bundle
+               read path. */
+            fd->regvm_all_threaded =
+                regvm_code_all_threaded(fd->regvm_code, fd->regvm_len);
 #endif
             if (er == REGVM_REFUSED)
                 goto refused;
@@ -71328,6 +71349,11 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
         goto fail;
     b->realm = JS_DupContext(ctx);
 #if QJS_REGVM_RECORD
+    /* `regvm_all_threaded` is never serialized: recompute it from the code
+       just read, or the function stays off the record and tail-call paths. */
+    if (b->regvm_compiled && b->regvm_code)
+        b->regvm_all_threaded =
+            regvm_code_all_threaded(b->regvm_code, b->regvm_len);
     regvm_set_call_desc(b);
 #endif
 #if QJS_AOT
@@ -72141,6 +72167,11 @@ static int js_materialize_function_body(JSContext *ctx, JSFunctionBytecode *b)
 
     if (ret == 0) {
 #if QJS_REGVM_RECORD
+        /* recompute it from the code just materialized, as the eager read
+           path does */
+        if (b->regvm_compiled && b->regvm_code)
+            b->regvm_all_threaded =
+                regvm_code_all_threaded(b->regvm_code, b->regvm_len);
         regvm_set_call_desc(b);
 #endif
 #if QJS_AOT
