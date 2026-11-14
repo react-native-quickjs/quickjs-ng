@@ -309,6 +309,10 @@ int qjs_aot_func_disabled(JSContext *ctx, uint32_t fn);
 int qjs_aot_note_deopt(JSContext *ctx, uint32_t site);
 QJS_AOT_STUB JSValue qjs_aot_deopt(JSContext *ctx, JSRegRun *f, JSValue *fr,
                                    uint32_t pc, uint32_t site);
+/* An entry that runs nothing hands the call to the interpreter (no frame of the unit is built); the gated form also stops
+   using the unit for the function. `this_obj` is the receiver the caller chose; the value is the function's own return. */
+QJS_AOT_STUB JSValue qjs_aot_call_interp(JSContext *ctx, JSObject *co, JSValue this_obj, JSValue *argv, int argc);
+QJS_AOT_STUB JSValue qjs_aot_gated_call(JSContext *ctx, JSObject *co, JSValue this_obj, JSValue *argv, int argc);
 /* A deopt-everywhere unit asks before a guard whether the sweep wants this
    execution to fail. Only such a unit calls it; a normal unit has no sweep. */
 QJS_AOT_STUB int qjs_aot_should_deopt(JSContext *ctx, uint32_t site);

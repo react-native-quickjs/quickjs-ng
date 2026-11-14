@@ -66277,6 +66277,24 @@ static void js_aot_unbind(JSFunctionBytecode *b)
     regvm_set_frame_shape(b);
 }
 
+/* A compiled function's entry (or its frameless exit) hands the whole call back: nothing of it has run, and no frame of the
+   unit was built. The interpreter makes the call as it would without a unit: the flag keeps JS_CallInternal off the compiled
+   entries (the native entry, the record entry, js_regvm_execute's entry), so this cannot come back here. `this_obj` is the
+   `this` the caller chose (a constructor call has already made its object), and the value is the function's own return. */
+QJS_AOT_STUB JSValue qjs_aot_call_interp(JSContext *ctx, JSObject *co, JSValue this_obj, JSValue *argv, int argc)
+{
+    return JS_CallInternal(ctx, JS_MKPTR(JS_TAG_OBJECT, co), this_obj, JS_UNDEFINED, argc, (JSValueConst *)argv,
+                           JS_CALL_FLAG_AOT_DEOPT);
+}
+
+/* The profitability gate fired for this function: stop using the unit for it (its calls take the interpreter's paths from
+   now on), and make this call there. */
+QJS_AOT_STUB JSValue qjs_aot_gated_call(JSContext *ctx, JSObject *co, JSValue this_obj, JSValue *argv, int argc)
+{
+    js_aot_unbind(co->u.func.function_bytecode);
+    return qjs_aot_call_interp(ctx, co, this_obj, argv, argc);
+}
+
 /* Bind a function to its generated entry. The table is sorted by digest;
    `code_crc` catches a stale unit (QJS_AOT_VERIFY). Called once, when the
    bytecode is final. */
