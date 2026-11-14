@@ -27464,9 +27464,12 @@ static uint8_t *REGVM_CC regvm_t_get_element(REGVM_ARGS)
     } \
     static uint8_t *REGVM_CC regvm_t_##NAME(REGVM_ARGS) \
     { \
-        int d = T_REG(1); \
-        int r = T_REG(3); \
-        int site = T_REG(9); \
+        uint32_t dr; \
+        int d, r, site; \
+        memcpy(&dr, ip + 1, 4); \
+        d = (int)(dr & 0xffff); \
+        r = (int)(dr >> 16); \
+        site = T_REG(9); \
         JSValue val; \
         if (regvm_own_read_hit(f->pic, f->b->regvm_pic_holder, FR(r), site, &val)) { \
             T_SET_NEXT_B(d, val, T_SZ_RRAS); \
@@ -27479,9 +27482,12 @@ static uint8_t *REGVM_CC regvm_t_get_element(REGVM_ARGS)
        opcode back. */ \
     static uint8_t *REGVM_CC regvm_t_##NAME##_own(REGVM_ARGS) \
     { \
-        int d = T_REG(1); \
-        int r = T_REG(3); \
-        int site = T_REG(9); \
+        uint32_t dr; \
+        int d, r, site; \
+        memcpy(&dr, ip + 1, 4); \
+        d = (int)(dr & 0xffff); \
+        r = (int)(dr >> 16); \
+        site = T_REG(9); \
         JSValue recv = FR(r); \
         if (likely(JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT)) { \
             JSObject *p = JS_VALUE_GET_OBJ(recv); \
