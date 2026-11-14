@@ -67248,6 +67248,96 @@ QJS_AOT_STUB JSValue qjs_aot_stack_forward(JSValue v)
     return v;
 }
 
+/* Move the contents of the stack object `src` into the stack object `dst`, both blocks of one owner's frame and live. `dst` takes `src`'s shape and field values; the fields it held are released first.
+   A stack object a field of `src` holds (`srcc`, the one child a block may hold) is not left in the owner's frame under a name that will be reused: its contents move into the block `dstc` and the
+   field of `dst` holds `dstc`; `dstc` (the child `dst` held, released the same way) must be given when `srcc` is. `src` is left a valid block whose fields are all undefined (its own release
+   then frees nothing and drops its shape reference), and `srcc` likewise. 1 when moved; 0 with nothing changed when the contents do not fit (a layout past the room of `dst` or `dstc`), when
+   `src` holds another stack object than `srcc`, or when the children hold stack objects themselves. */
+static void js_stack_take_fields(JSContext *ctx, JSObject *d, JSObject *s, JSValue keep)
+{
+    int i, sn = s->shape->prop_count, dn = d->shape->prop_count;
+    JSShape *old = d->shape;
+    for (i = 0; i < dn; i++) {
+        JSValue v = d->prop[i].u.value;
+        if (!(JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && JS_VALUE_GET_TAG(keep) == JS_TAG_OBJECT && JS_VALUE_GET_PTR(v) == JS_VALUE_GET_PTR(keep)) && JS_VALUE_HAS_REF_COUNT(v))
+            JS_FreeValue(ctx, v);
+        d->prop[i].u.value = JS_UNDEFINED;
+    }
+    d->shape = js_dup_shape(s->shape);
+    js_free_shape(ctx->rt, old);
+    for (i = 0; i < sn; i++) {
+        d->prop[i].u.value = s->prop[i].u.value;
+        s->prop[i].u.value = JS_UNDEFINED;
+    }
+}
+
+QJS_AOT_STUB int qjs_aot_slot_assign(JSContext *ctx, JSValue dst, JSValue dstc, JSValue src, JSValue srcc)
+{
+    JSObject *d, *s, *dc = NULL, *sc = NULL;
+    int i, sn, scn = 0;
+    if (JS_VALUE_GET_TAG(dst) != JS_TAG_OBJECT || JS_VALUE_GET_TAG(src) != JS_TAG_OBJECT)
+        return 0;
+    d = JS_VALUE_GET_OBJ(dst);
+    s = JS_VALUE_GET_OBJ(src);
+    if (d == s || JS_REF_COUNT(d) < JS_STACK_BIAS / 2 || JS_REF_COUNT(s) < JS_STACK_BIAS / 2 || d->shape == NULL || s->shape == NULL)
+        return 0;
+    sn = s->shape->prop_count;
+    if (sn > d->prop_inline_cap)
+        return 0;
+    if (JS_VALUE_GET_TAG(srcc) == JS_TAG_OBJECT) {
+        if (JS_VALUE_GET_TAG(dstc) != JS_TAG_OBJECT)
+            return 0;
+        sc = JS_VALUE_GET_OBJ(srcc);
+        dc = JS_VALUE_GET_OBJ(dstc);
+        if (sc == dc || JS_REF_COUNT(sc) < JS_STACK_BIAS / 2 || JS_REF_COUNT(dc) < JS_STACK_BIAS / 2 || sc->shape == NULL || dc->shape == NULL)
+            return 0;
+        scn = sc->shape->prop_count;
+        if (scn > dc->prop_inline_cap)
+            return 0;
+        for (i = 0; i < scn; i++) {
+            JSValue v = sc->prop[i].u.value;
+            if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && JS_REF_COUNT(JS_VALUE_GET_OBJ(v)) >= JS_STACK_BIAS / 2)
+                return 0;
+        }
+    }
+    {
+        int nsc = 0, dn = d->shape->prop_count;
+        for (i = 0; i < sn; i++) {
+            JSValue v = s->prop[i].u.value;
+            if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && JS_REF_COUNT(JS_VALUE_GET_OBJ(v)) >= JS_STACK_BIAS / 2) {
+                if (JS_VALUE_GET_OBJ(v) != sc)
+                    return 0;
+                nsc++;
+            }
+        }
+        if ((sc != NULL) != (nsc == 1) || nsc > 1)
+            return 0;
+        /* a stack object in a field being released other than the child block that stays would have its bias decremented */
+        for (i = 0; i < dn; i++) {
+            JSValue v = d->prop[i].u.value;
+            if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && JS_REF_COUNT(JS_VALUE_GET_OBJ(v)) >= JS_STACK_BIAS / 2 && JS_VALUE_GET_OBJ(v) != dc)
+                return 0;
+        }
+        if (dc != NULL) {
+            int dcn = dc->shape->prop_count;
+            for (i = 0; i < dcn; i++) {
+                JSValue v = dc->prop[i].u.value;
+                if (JS_VALUE_GET_TAG(v) == JS_TAG_OBJECT && JS_REF_COUNT(JS_VALUE_GET_OBJ(v)) >= JS_STACK_BIAS / 2)
+                    return 0;
+            }
+        }
+    }
+    if (dc != NULL)
+        js_stack_take_fields(ctx, dc, sc, JS_UNDEFINED);
+    js_stack_take_fields(ctx, d, s, dstc);
+    if (sc != NULL) {
+        for (i = 0; i < sn; i++)
+            if (JS_VALUE_GET_TAG(d->prop[i].u.value) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(d->prop[i].u.value) == sc)
+                d->prop[i].u.value = dstc;
+    }
+    return 1;
+}
+
 /* `a + b` where one side is a string and the other a string or a primitive whose string form runs no code (a number, a boolean,
    null, undefined). 1 with an owned *out, 0 for any other operands (nothing done), -1 with an exception pending. */
 QJS_AOT_STUB int qjs_aot_add_str(JSContext *ctx, JSValue a, JSValue b, JSValue *out)
