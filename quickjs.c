@@ -26487,8 +26487,11 @@ regvm_light_alloc(JSRuntime *rt, JSRegRun *f, JSFunctionBytecode *cb)
         /* The entry record lives on the C stack, not in the arena, so take the
            frame from the arena top. Before the first record call there is no
            arena at all; fall back to the record path, which allocates it. */
-        size_t top = (rt->regvm_frames_top + 15) & ~(size_t)15;
+        size_t top;
 
+        if (unlikely(rt->regvm_frames == NULL))
+            return NULL;
+        top = (rt->regvm_frames_top + 15) & ~(size_t)15;
         nf = (JSRegRun *)(rt->regvm_frames + top);
         if (unlikely((uint8_t *)nf + cb->regvm_light_need
                      > rt->regvm_chunk_end))
