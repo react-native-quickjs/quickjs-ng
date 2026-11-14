@@ -78599,10 +78599,9 @@ static void regvm_count_uses(const JSRegIR *ir, int n_values,
 
     memset(nref, 0, (size_t)n_values);
     for (i = 0; i < ir->n_insns; i++) {
-        const char *fmt = regvm_rop_fmt[ir->insns[i].rop];
-        for (k = 0; fmt && fmt[k]; k++) {
-            if (fmt[k] != 'r')
-                continue;
+        unsigned rm_ = ir->ri[ir->insns[i].rop].rmask;
+        for (; rm_; rm_ &= rm_ - 1) {
+            k = ctz32(rm_);
             v = ir->insns[i].ops[k];
             if (v >= 0 && v < n_values && nref[v] < limit)
                 nref[v]++;
@@ -78644,10 +78643,9 @@ static void regvm_transfer_dead_sources(JSContext *ctx, JSRegIR *ir,
     for (i = 0; i < n_values; i++)
         lastu[i] = -1;
     for (i = 0; i < n; i++) {
-        const char *fmt = regvm_rop_fmt[ir->insns[i].rop];
-        for (k = 0; fmt && fmt[k]; k++) {
-            if (fmt[k] != 'r')
-                continue;
+        unsigned rm_ = ir->ri[ir->insns[i].rop].rmask;
+        for (; rm_; rm_ &= rm_ - 1) {
+            k = ctz32(rm_);
             v = ir->insns[i].ops[k];
             if (v >= 0 && v < n_values) {
                 lastu[v] = i;
@@ -78789,11 +78787,10 @@ static void regvm_fold_frame_reads(JSContext *ctx, JSRegIR *ir,
        tracked further. */
     regvm_count_uses(ir, n_values, phi_uses, nref, 3);
     for (i = 0; i < n; i++) {
-        const char *fmt = regvm_rop_fmt[ir->insns[i].rop];
-        for (k = 0; fmt && fmt[k]; k++) {
+        unsigned rm_ = ir->ri[ir->insns[i].rop].rmask;
+        for (; rm_; rm_ &= rm_ - 1) {
             int32_t v;
-            if (fmt[k] != 'r')
-                continue;
+            k = ctz32(rm_);
             v = ir->insns[i].ops[k];
             if (v < 0 || v >= n_values || nref[v] > 2)
                 continue;
@@ -82255,11 +82252,10 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
        */
     if (defined && n_values > 0 && !fd->regvm_baseline) {
         for (i = 0; i < ir.n_insns; i++) {
-            const char *fmt = regvm_rop_fmt[ir.insns[i].rop];
-            for (k = 0; fmt && fmt[k]; k++) {
+            unsigned rm_ = ir.ri[ir.insns[i].rop].rmask;
+            for (; rm_; rm_ &= rm_ - 1) {
                 int32_t v;
-                if (fmt[k] != 'r')
-                    continue;
+                k = ctz32(rm_);
                 v = ir.insns[i].ops[k];
                 if (v >= 0 && v < n_values && !defined[v]) {
                     JS_ThrowInternalError(ctx, "regvm: uninitialized read of "
