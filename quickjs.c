@@ -102586,6 +102586,29 @@ static inline bool js_regexp_atom_starts_at(JSString *str, int start,
     return true;
 }
 
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+/* Index of the first unit equal to c in s[0..n), or -1, eight units at a time where SSE2 is there. */
+static inline int js_regexp_find_u16(const uint16_t *s, unsigned c, int n)
+{
+    int i = 0;
+#if defined(__SSE2__)
+    {
+        __m128i vc = _mm_set1_epi16((short)c);
+        for (; i + 8 <= n; i += 8) {
+            int mask = _mm_movemask_epi8(_mm_cmpeq_epi16(_mm_loadu_si128((const __m128i *)(s + i)), vc));
+            if (mask)
+                return i + (__builtin_ctz((unsigned)mask) >> 1);
+        }
+    }
+#endif
+    for (; i < n; i++)
+        if (s[i] == c)
+            return i;
+    return -1;
+}
+
 /* Return the first index in [from, to) where character 'c' occurs, or -1. */
 static inline int js_regexp_indexof_char_range(JSString *str, int c,
                                                      int from, int to)
@@ -102595,10 +102618,8 @@ static inline int js_regexp_indexof_char_range(JSString *str, int c,
     if (str->is_wide_char) {
         if (c > 0xffff)
             return -1;
-        for(i = from; i < to; i++) {
-            if (str16(str)[i] == c)
-                return i;
-        }
+        i = js_regexp_find_u16(str16(str) + from, (unsigned)c, to - from);
+        return i < 0 ? -1 : from + i;
     } else if ((c & ~0xff) == 0) {
         const uint8_t *p = memchr(str8(str) + from, c, to - from);
 
@@ -102998,6 +103019,21 @@ static int js_regexp_find_literal(const JSReReq *e, JSString *str, int from)
         return -1;
     } else {
         const uint16_t *s = str16(str);
+        if (!ci) {
+            /* the rare unit by vector search, then the literal around it */
+            int lim = n - m + 1;
+            i = from;
+            while (i < lim) {
+                int k = js_regexp_find_u16(s + i + r, u, lim - i);
+                if (k < 0)
+                    return -1;
+                i += k;
+                if (js_regexp_lit_at(e, str, i))
+                    return i;
+                i++;
+            }
+            return -1;
+        }
         for (i = from; i + m <= n; i++) {
             unsigned c = s[i + r];
             if (ci)
