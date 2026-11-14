@@ -434,6 +434,12 @@ QJS_AOT_STUB int qjs_aot_binary_cpool(JSContext *ctx, JSRegRun *f, int sub,
                                       uint32_t idx, int kind, JSValue a,
                                       int d, int ra, JSValue *out);
 
+/* `a <sub> b` on two registers (`d` the destination, `ra` the left operand's register
+   index). 1 with an owned *out, 2 when `s += x` appended in place (the result is left in
+   register `d`), -1 on exception. */
+QJS_AOT_STUB int qjs_aot_binary_rr(JSContext *ctx, JSRegRun *f, int sub, JSValue a,
+                                   JSValue b, int d, int ra, JSValue *out);
+
 /* The frame's argument window: AOT_ARG(ab, slot). */
 JSValue *qjs_aot_arg_buf(JSRegRun *f);
 
