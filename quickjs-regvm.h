@@ -556,6 +556,11 @@ typedef enum JSRegOpcode {
        one byte wide, used when every physical register fits. */
     ROP_load_i8_s, ROP_move_s,
 
+    /* Quickened own-read forms, never emitted by the encoder: the threaded
+       interpreter rewrites a site's opcode to one of these when its cache holds
+       an own data slot, and back when it does not. */
+    ROP_get_field_own, ROP_get_field2_own,
+
     ROP_COUNT
 } JSRegOpcode;
 
