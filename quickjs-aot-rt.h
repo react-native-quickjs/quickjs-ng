@@ -377,6 +377,11 @@ QJS_AOT_STUB int qjs_aot_put_field_slow(JSContext *ctx, JSRegRun *f, uint8_t *ip
 QJS_AOT_STUB uint8_t *qjs_aot_iter_next(uint8_t *ip, JSValue *fr, JSRegRun *f,
                                         JSContext *ctx);
 
+/* `s += <constant string>` (pool or atom) in place when the register holds the only reference:
+   1 appended (result in register `ra`), 0 not this case, -1 exception. `unique` skips the
+   register scan: the caller proved no other register can hold the string. */
+QJS_AOT_STUB int qjs_aot_append_const(JSContext *ctx, JSRegRun *f, int kind, uint32_t idx,
+                                      int ra, int unique);
 /* `for_in_next` over an array, the next key read from the shared small-index strings; any
    other case runs the instruction's handler. Same contract as qjs_aot_step. */
 QJS_AOT_STUB uint8_t *qjs_aot_for_in_next(uint8_t *ip, JSValue *fr, JSRegRun *f,
