@@ -377,6 +377,11 @@ QJS_AOT_STUB int qjs_aot_put_field_slow(JSContext *ctx, JSRegRun *f, uint8_t *ip
 QJS_AOT_STUB uint8_t *qjs_aot_iter_next(uint8_t *ip, JSValue *fr, JSRegRun *f,
                                         JSContext *ctx);
 
+/* `for_in_next` over an array, the next key read from the shared small-index strings; any
+   other case runs the instruction's handler. Same contract as qjs_aot_step. */
+QJS_AOT_STUB uint8_t *qjs_aot_for_in_next(uint8_t *ip, JSValue *fr, JSRegRun *f,
+                                          JSContext *ctx);
+
 /* The cached add-transition store of a compiled named store, before the frame
    is published. 1 when the store landed, 0 when the site has no transition for
    the receiver's shape, -1 on exception. The value is borrowed. */
