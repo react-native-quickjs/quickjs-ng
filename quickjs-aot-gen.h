@@ -6,6 +6,7 @@
 
 #include <stdint.h>
 #include "quickjs.h"
+#include "quickjs-aot-rt.h"
 
 /* Why a function did not make it into the unit. Only AOT_GEN_ELIGIBLE has
    meaningful `code`/`len`; the others carry a stack-bytecode length for the
@@ -69,5 +70,11 @@ typedef struct JSAotGenInsn {
 /* Decode one instruction into *out. Returns 0, or -1 under the conditions
    js_aot_gen_insn_size refuses. */
 int js_aot_gen_decode_insn(const uint8_t *code, int len, int off, JSAotGenInsn *out);
+
+/* The engine's object layouts the generated code reads at constant offsets.
+   The struct and the hash live in quickjs-aot-rt.h, which the unit includes as
+   well, so the two sides cannot drift. The generator fills it with
+   js_aot_gen_layout and writes it plus the hash into quickjs-aot-layout.h. */
+void js_aot_gen_layout(JSAotGenLayout *out);
 
 #endif /* QUICKJS_AOT_GEN_H */

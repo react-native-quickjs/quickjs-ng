@@ -20,6 +20,42 @@ typedef struct JSRegRun JSRegRun;
 #define QJS_AOT_ABI (3u | ((uint32_t)QJS_DRC << 8))
 #endif
 
+/* The engine's object layouts the generated code reads at constant offsets.
+   `js_aot_gen_layout` (engine) fills this from the engine's own structs and
+   sets `hash`; the generator writes it into quickjs-aot-layout.h and the
+   runtime re-derives the hash at bind. A layout change therefore invalidates an
+   old unit instead of corrupting it. All fields are uint32 so the hash is a
+   well-defined word fold, and it covers every field after `hash` itself. */
+typedef struct JSAotGenLayout {
+    uint32_t hash;
+    uint32_t sizeof_JSObject, sizeof_JSShape, sizeof_JSProperty, sizeof_JSString;
+    uint32_t sizeof_JSValue;
+    uint32_t off_object_class_id, off_object_shape, off_object_prop;
+    uint32_t off_object_prop_inline_cap_byte;
+    uint32_t off_shape_prop_size, off_shape_prop_count, off_shape_proto,
+             off_shape_hash_table;
+    uint32_t off_property_u_value;
+    uint32_t off_shape_property_flags_atom;
+    uint32_t off_string_len_bits, off_string_strv;
+    uint32_t off_jsvalue_tag, off_jsvalue_u;
+} JSAotGenLayout;
+
+/* Fold every field after `hash` (the hash field itself is excluded). Shared by
+   the generator and the runtime. */
+static inline uint32_t qjs_aot_layout_hash(const JSAotGenLayout *l)
+{
+    const uint32_t *p = (const uint32_t *)l;
+    uint32_t h = 2166136261u;
+    size_t i;
+
+    for (i = 1; i < sizeof(*l) / sizeof(uint32_t); i++)
+        h = (h ^ p[i]) * 16777619u;
+    return h;
+}
+
+/* The unit's layout hash; defined by a generated unit, checked at bind. */
+extern const uint32_t qjs_aot_layout;
+
 /* Sentinels returned by qjs_aot_step; they mirror REGVM_COLD_RET and
    REGVM_STEP_SUSPEND in quickjs.c. */
 #define QJS_AOT_COLD_RET ((uint8_t *)1)
