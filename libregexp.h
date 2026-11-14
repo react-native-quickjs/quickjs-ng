@@ -105,7 +105,7 @@ int lre_get_flags(const uint8_t *bc_buf);
 int lre_is_raw_atom(const char *buf, size_t len, int re_flags);
 int lre_get_metadata(const uint8_t *bc_buf, size_t bc_buf_len,
                      LREMetadata *meta);
-const char *lre_get_groupnames(const uint8_t *bc_buf);
+const char *lre_get_groupnames(const uint8_t *bc_buf, size_t bc_buf_len);
 int lre_exec(uint8_t **capture,
              const uint8_t *bc_buf, const uint8_t *cbuf, int cindex, int clen,
              int cbuf_type, void *opaque);

@@ -52413,7 +52413,7 @@ static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val,
                                js_int32((capture[1] - str_buf) >> shift)) < 0)
                 goto fail;
         }
-        group_name_ptr = lre_get_groupnames(re_bytecode);
+        group_name_ptr = lre_get_groupnames(re_bytecode, re->bytecode->len);
         if (group_name_ptr) {
             groups = JS_NewObjectProto(ctx, JS_NULL);
             if (JS_IsException(groups))
