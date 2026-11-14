@@ -106977,6 +106977,16 @@ static JSValue internalize_json_property(JSContext *ctx, JSValueConst holder,
 }
 
 
+static bool js_json_is_ascii(const uint8_t *p, uint32_t n)
+{
+    uint32_t i;
+    uint8_t acc = 0;
+
+    for (i = 0; i < n; i++)
+        acc |= p[i];
+    return acc < 0x80;
+}
+
 static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
                              int argc, JSValueConst *argv)
 {
@@ -107000,6 +107010,13 @@ static JSValue js_json_parse(JSContext *ctx, JSValueConst this_val,
                 return obj;
             exc = JS_GetException(ctx);
             if (JS_IsUncatchableError(exc))
+                return JS_Throw(ctx, exc);
+            /* An ASCII input is the same bytes in its UTF-8 copy, and the Latin-1 reading differs only on bytes >= 0x80: the
+               general path would raise this same syntax error, so it is kept rather than built a second time (with its
+               backtrace). A memory or stack failure is redone, as is any failure on a non-ASCII input. */
+            if (JS_VALUE_GET_TAG(exc) == JS_TAG_OBJECT && JS_VALUE_GET_OBJ(exc)->class_id == JS_CLASS_ERROR &&
+                JS_VALUE_GET_OBJ(exc)->shape->proto == JS_VALUE_GET_OBJ(ctx->native_error_proto[JS_SYNTAX_ERROR]) &&
+                js_json_is_ascii(str8(jp), jp->len))
                 return JS_Throw(ctx, exc);
             JS_FreeValue(ctx, exc);
         }
