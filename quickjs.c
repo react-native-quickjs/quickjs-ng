@@ -65239,6 +65239,22 @@ QJS_AOT_STUB const void *qjs_aot_array_builtin_fn(int which)
     return which == 0 ? (const void *)js_array_push : which == 1 ? (const void *)js_array_pop : NULL;
 }
 
+/* The push of a compiled body that does not fit the array's capacity (or its packed element kind): the builtin itself, on a receiver the
+   body has already checked is a plain extensible array whose length is the count and whose prototype is the standard one, so no JS can
+   run. Returns 1 with the new length in *out; 0 when the push threw (an out-of-memory), after clearing the exception, so the body leaves
+   before any effect and its generic body repeats the call and throws it properly. */
+QJS_AOT_STUB int qjs_aot_array_push_slow(JSContext *ctx, JSValue arr, JSValue v, JSValue *out)
+{
+    JSValue r = js_array_push(ctx, arr, 1, (JSValueConst *)&v, 0);
+
+    if (JS_IsException(r)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return 0;
+    }
+    *out = r;
+    return 1;
+}
+
 QJS_AOT_STUB const void *qjs_aot_function_apply_fn(void)
 {
     return (const void *)js_function_apply;
