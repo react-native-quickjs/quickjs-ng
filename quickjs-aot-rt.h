@@ -198,6 +198,9 @@ typedef struct JSAotGenLayout {
     uint32_t array_iter_kind_value, off_cfunc_cproto, cfunc_cproto_iterator_next;
     /* The prototype tag of a builtin that takes a magic number (Array's push and pop are such). */
     uint32_t cfunc_cproto_generic_magic;
+    /* Whether arrays may hold int32 or double elements (QJS_PACKED_ARRAYS), and the byte holding
+       the array's storage kind: any non-zero kind means the elements are not JSValues. */
+    uint32_t packed_arrays, off_object_arr_kind;
 } JSAotGenLayout;
 
 /* The function pointer of Array Iterator's `next`, which a C function object holds when it is
