@@ -39936,6 +39936,31 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     if (line2 >= 0) line_num = line2;
                     break;
                 }
+                /* Transformation: dup put_x_check(n) drop -> put_x_check(n) */
+                if (code_match(&cc, pos_next,
+                               M4(OP_put_loc_check, OP_put_loc_check_init,
+                                  OP_put_var_ref_check, OP_put_var_ref_check_init),
+                               -1, OP_drop, -1)) {
+                    if (cc.line_num >= 0) line_num = cc.line_num;
+                    if (cc.col_num >= 0) col_num = cc.col_num;
+                    add_pc2line_info(s, bc_out.size, line_num, col_num);
+                    dbuf_putc(&bc_out, cc.op);
+                    dbuf_put_u16(&bc_out, cc.idx);
+                    pos_next = cc.pos;
+                    break;
+                }
+            }
+            goto no_change;
+
+        case OP_lnot:
+            /* Transformation: lnot if_false(l) -> if_true(l), and the reverse */
+            if (code_match(&cc, pos_next, M2(OP_if_false, OP_if_true), -1)) {
+                if (cc.line_num >= 0) line_num = cc.line_num;
+                if (cc.col_num >= 0) col_num = cc.col_num;
+                pos_next = cc.pos;
+                label = cc.label;
+                op = cc.op ^ OP_if_false ^ OP_if_true;
+                goto has_label;
             }
             goto no_change;
 
