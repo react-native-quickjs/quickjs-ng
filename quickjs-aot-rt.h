@@ -551,6 +551,10 @@ void qjs_aot_construct_done(JSObject *ctor, JSValue inst);
 int qjs_aot_construct_this(JSContext *ctx, JSObject *ctor, JSValue *out);
 JSValue qjs_aot_wrap_init(JSContext *ctx, JSRegRun *caller_f, JSObject *co, JSValue thisv, JSValue *argv,
                           int argc, void **wc, int init_off, int apply_off);
+/* `new C(...)` for a constructor wrapper C: the allocation and qjs_aot_wrap_init in one call, both through the
+   site's 48-word cache. 1 with the object in *out, 0 when not applicable (nothing done), -1 on an exception. */
+int qjs_aot_new_wrap(JSContext *ctx, JSRegRun *caller_f, JSObject *ctor, JSValue *argv, int argc,
+                     void **nc, int init_off, int apply_off, JSValue *out);
 /* What `qjs_aot_ctor_replayable` remembers between calls (zero-initialised, one per use). */
 typedef struct JSAotCtorCache {
     const void *shape, *proto;
