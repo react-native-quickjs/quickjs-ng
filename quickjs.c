@@ -22761,6 +22761,7 @@ js_ta_store_inline(JSObject *p, uint32_t idx, JSValue val)
 /* Inline the intrinsic %TypedArray%.prototype.length getter in OP_get_length. */
 static JSValue js_typed_array_get_length(JSContext *ctx, JSValueConst this_val);
 
+#if !QJS_REGVM
 static inline bool js_ta_length_getter(JSObject *getter)
 {
     return getter != NULL &&
@@ -22809,13 +22810,18 @@ static no_inline void js_rot3r(JSValue *sp) { JSValue tmp = sp[-1]; sp[-1] = sp[
 static no_inline void js_perm4(JSValue *sp) { JSValue tmp = sp[-2]; sp[-2] = sp[-3]; sp[-3] = sp[-4]; sp[-4] = tmp; }
 static no_inline void js_perm5(JSValue *sp) { JSValue tmp = sp[-2]; sp[-2] = sp[-3]; sp[-3] = sp[-4]; sp[-4] = sp[-5]; sp[-5] = tmp; }
 static no_inline void js_swap2(JSValue *sp) { JSValue tmp1 = sp[-4], tmp2 = sp[-3]; sp[-4] = sp[-2]; sp[-3] = sp[-1]; sp[-2] = tmp1; sp[-1] = tmp2; }
+#endif /* !QJS_REGVM */
 
-/* Cold opcode handlers, defined out of line.
- *
- * sp is passed and returned by value. pc is passed by value and never returned:
- * the caller advances it by the opcode's own constant size. The exception flag
- * rides in bit 0 of the returned pointer, which is free because JSValue is at
- * least 2-byte aligned. */
+/* Cold opcode handlers, defined out of line. sp is passed and returned by
+ * value; pc is passed by value and the caller advances it. The exception flag
+ * rides in bit 0 of the returned pointer. */
+/* `define_method` flag bits, shared with the compiler. */
+#define OP_DEFINE_METHOD_METHOD 0
+#define OP_DEFINE_METHOD_GETTER 1
+#define OP_DEFINE_METHOD_SETTER 2
+#define OP_DEFINE_METHOD_ENUMERABLE 4
+
+#if !QJS_REGVM
 typedef uintptr_t JSColdHandlerResult;
 #define JS_COLD_HANDLER_OK(spx)         ((JSColdHandlerResult)(uintptr_t)(spx))
 #define JS_COLD_HANDLER_EXCEPTION(spx)  ((JSColdHandlerResult)((uintptr_t)(spx) | 1u))
@@ -22879,11 +22885,6 @@ JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_define_method_computed(JSContext 
                     JSAtom atom;
                     int flags, ret, op_flags;
                     bool is_computed;
-    #define OP_DEFINE_METHOD_METHOD 0
-    #define OP_DEFINE_METHOD_GETTER 1
-    #define OP_DEFINE_METHOD_SETTER 2
-    #define OP_DEFINE_METHOD_ENUMERABLE 4
-
                     is_computed = (opcode == OP_define_method_computed);
                     if (is_computed) {
                         atom = JS_ValueToAtom(ctx, sp[-2]);
@@ -23333,6 +23334,7 @@ JS_COLD_HANDLER_FN JSColdHandlerResult js_cold_using_dispose(JSContext *ctx, uin
     }
     return JS_COLD_HANDLER_OK(sp);
 }
+#endif /* !QJS_REGVM */
 
 #if QJS_REGVM
 /*
