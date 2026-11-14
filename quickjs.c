@@ -11612,6 +11612,15 @@ free_plain_object(JSRuntime *rt, JSObject *p, JSFreeAcc *acc)
         assert(rt->gc_phase == JS_GC_PHASE_DECREF);
         sh = p->shape;
         pr = get_shape_prop(sh);
+        /* The children's counts live in cells that are usually cold: ask for all of them first so the misses overlap
+           instead of each decrement waiting for its own. */
+        if (likely(sh->prop_count > 1)) {
+            for(i = 0; i < sh->prop_count; i++) {
+                JSValue v0 = p->prop[i].u.value;
+                if (JS_VALUE_HAS_REF_COUNT(v0))
+                    __builtin_prefetch(js_rc(JS_VALUE_GET_PTR(v0)), 1, 3);
+            }
+        }
         for(i = 0; i < sh->prop_count; i++) {
             if (likely(!(pr->flags & JS_PROP_TMASK))) {
                 JSValue v = p->prop[i].u.value;
@@ -11626,6 +11635,7 @@ free_plain_object(JSRuntime *rt, JSObject *p, JSFreeAcc *acc)
 
                         if (likely(c->class_id == JS_CLASS_OBJECT) && likely(!c->has_weak_ref) &&
                             !JS_GC_IN_ZCT(c)) {
+                            __builtin_prefetch(c->prop, 0, 3);
                             stk[sp++] = c;
                             pr++;
                             continue;
@@ -12282,6 +12292,10 @@ static void js_drc_reconcile_locked(JSRuntime *rt)
         facc.count = facc.size = 0;
         rt->gc_phase = JS_GC_PHASE_DECREF;
         for (i = 0; i < w; i++) {
+            if (i + 8 < w)
+                __builtin_prefetch(js_rc(rt->zpark[i + 8]), 1, 3);
+            if (i + 4 < w)
+                __builtin_prefetch(((JSObject *)rt->zpark[i + 4])->prop, 0, 3);
             p = rt->zpark[i];
             assert(JS_REF_COUNT(p) == 0 && JS_GC_IN_ZCT(p));
             DRC_ST(drc_st_freed);
