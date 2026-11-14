@@ -2601,6 +2601,7 @@ struct JSShape {
        table): freeing or editing it in place moves shape_obs_epoch, which those tables validate instead of shape_free_epoch, so the
        churn of unobserved shapes costs them nothing. Also set when a PIC cell holds the shape (the counters). */
     uint8_t aot_observed;
+    uint16_t y_site; /* index of this shape's allocation-site record in qjs_ysite (0: none yet) */
     uint32_t hash; /* current hash value */
     uint32_t prop_hash_mask;
     int prop_size; /* allocated properties */
@@ -4825,6 +4826,9 @@ static inline unsigned long long JS_PLAIN_GCBYTE(void)
     }
     return js_plain_gcbyte_v;
 }
+typedef struct YSite { uint8_t pre, tick; uint16_t pad; uint32_t made, surv, am, as, sp[3]; } YSite; /* made/surv: this collection epoch; am/as: accumulated */
+YSite qjs_ysite[4096];
+static uint32_t y_site_n = 1;
 static uint64_t y_cyc[8], y_cnt[16], y_pinr, y_pinv;
 uint64_t qjs_y_ep48 = (uint64_t)1 << 48; static uint32_t y_epoch = 1;
 static uint64_t ss_stat[8];
@@ -4861,30 +4865,13 @@ static void y_vec_push(YChunk ***v, uint32_t *n, uint32_t *cap, YChunk *c) {
    allocations the cells that left the nursery as ordinary objects are counted; when (nearly) all of them did (a program that builds a
    long-lived structure), the nursery hands out no chunk for a while, so compiled code allocates counted objects and the reconcile is
    count-paced again. A refused request costs the caller one old-form allocation; the next window is measured afresh. */
-#define Y_WIN_CELLS 32768ull
-#define Y_PAUSE_REQS (1u << 20)
-static uint64_t y_win_a, y_win_p;
-static uint32_t y_pause;
-static int y_gate_prev;
+static int y_gate_want;
+static uint32_t y_pre_n; /* sites whose cells are made old */
 int qjs_y_refill(JSContext *ctx, unsigned idx, unsigned bsi, unsigned long long gcw)
 {
     YChunk *c;
     JSRuntime *rt = ctx->rt;
     YCls *k = &qjs_ycls[idx];
-    if (y_pause) {
-        if (--y_pause == 0 && !y_gate_fixed) qjs_y_gate = y_gate_prev;
-        return 0;
-    }
-    if (y_cnt[1] + y_abytes - y_win_a >= Y_WIN_CELLS) {
-        uint64_t left = y_cnt[10] + y_cnt[2] - y_win_p, made = y_cnt[1] + y_abytes - y_win_a;
-        y_win_a = y_cnt[1] + y_abytes; y_win_p = y_cnt[10] + y_cnt[2];
-        if (left * 100 >= made * 98) {
-            y_pause = Y_PAUSE_REQS;
-            y_gate_prev = qjs_y_gate;
-            if (!y_gate_fixed) qjs_y_gate = 0;
-            return 0;
-        }
-    }
     if (__atomic_load_n(&y_rt, __ATOMIC_ACQUIRE) != rt) {
         JSRuntime *exp = NULL;
         if (!__atomic_compare_exchange_n(&y_rt, &exp, rt, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
@@ -4943,6 +4930,7 @@ void qjs_y_dump_sites(void) { for (int i = 0; i < 256; i++) if (y_site[i].n > 10
 static __attribute__((destructor)) void y_dump(void) {
     uint32_t i, ret = 0, retlive = 0;
     if (!getenv("QJS_Y_STATS")) return;
+    { unsigned q; for (q = 1; q < y_site_n; q++) if (qjs_ysite[q].am + qjs_ysite[q].made > 0) fprintf(stderr, "ysite %u pre=%u am=%u as=%u\n", q, qjs_ysite[q].pre, qjs_ysite[q].am, qjs_ysite[q].as); }
     for (i = 0; i < y_region_next; i++) if (((YChunk *)(Y_BASE + (uint64_t)i * y_chunk_sz))->live) { ret++; retlive += ((YChunk *)(Y_BASE + (uint64_t)i * y_chunk_sz))->live; }
     if (getenv("QJS_Y_LEAK")) {
         int shown = 0;
@@ -5025,7 +5013,7 @@ static void y_runtime_free(JSRuntime *rt)
         y_pool[y_pool_n++] = c;
     }
     for (kb = 0; kb < 16; kb++) { YCls *k = &qjs_ycls[kb]; k->cur = NULL; k->bump = (uint8_t *)1; k->end = NULL; k->rec_n = 0; }
-    y_nurs_n = 0; y_roots_n = 0; y_livecells = 0; y_budget = 0; y_abytes = 0; y_win_a = y_win_p = 0; y_pause = 0;
+    y_nurs_n = 0; y_roots_n = 0; y_livecells = 0; y_budget = 0; y_abytes = 0;
     __atomic_store_n(&y_rt, NULL, __ATOMIC_RELEASE);
 }
 static void y_chunk_free_cell(void *ptr) {
@@ -5034,9 +5022,39 @@ static void y_chunk_free_cell(void *ptr) {
     Y_KIND(ptr) = 0x20; y_livecells--;
     if (--c->live == 0 && !c->ymode) y_chunk_release(c);
 }
+/* Pretenuring. Each shape that nursery cells are made with owns a site record: how many young cells were made with it and how many were promoted. A
+   site whose cells almost all survive makes them old (one in 64 stays young to keep measuring); the nursery itself stays on for every other site. A
+   young cell keeps its site index in the first word of its (unused) list link. */
+uint32_t qjs_y_site_assign(JSShape *sh) {
+    if (!sh->y_site) sh->y_site = y_site_n < 4096 ? (uint16_t)y_site_n++ : 0;
+    return sh->y_site;
+}
+static inline void y_site_promoted(uint32_t si) { if (si) qjs_ysite[si].surv++; }
+/* At the end of a young collection every cell made in the epoch has either been promoted or died, so made/surv are exact; the decision is taken on the
+   accumulated counts. */
+static void y_site_eval(void) {
+    uint32_t q;
+    for (q = 1; q < y_site_n; q++) {
+        YSite *s = &qjs_ysite[q];
+        uint8_t was;
+        if (!s->made && !s->surv) continue;
+        s->am += s->made; s->as += s->surv; s->made = s->surv = 0;
+        if (s->am < 256) continue;
+        was = s->pre;
+        if ((uint64_t)s->as * 100 >= (uint64_t)s->am * 98) s->pre = 1;
+        else if ((uint64_t)s->as * 100 < (uint64_t)s->am * 95) s->pre = 0;
+        s->am >>= 1; s->as >>= 1;
+        if (s->pre != was) {
+            y_pre_n += s->pre ? 1 : -1;
+            /* With cells made old the parked garbage is freed in small batches (the reconcile gate is lifted), not in one large cold walk at a trip. */
+            if (y_gate_want && !y_gate_fixed) qjs_y_gate = y_pre_n == 0;
+        }
+    }
+}
 /* A young cell becomes an ordinary old object: its edges are counted, it takes its shape reference and joins the object list. */
 static inline void y_promote_cell(JSObject *p) {
-    JSShape *sh = p->shape; JSShapeProperty *pr = get_shape_prop(sh); int j;
+    JSShape *sh = p->shape;
+    y_site_promoted(*(uint32_t *)p); JSShapeProperty *pr = get_shape_prop(sh); int j;
     for (j = 0; j < sh->prop_count; j++, pr++) {
         JSValue v;
         if (pr->flags & JS_PROP_TMASK) continue;
@@ -5091,7 +5109,7 @@ __attribute__((constructor)) static void js_drc_repark_init(void)
     {
         extern const uint32_t qjs_aot_count __attribute__((weak));
         if (&qjs_aot_count != NULL && qjs_aot_count > 0 && !y_gate_fixed)
-            qjs_y_gate = 1;
+            qjs_y_gate = y_gate_want = 1;
     }
 #endif
     if (getenv("QJS_NONURSERY")) y_interp_on = 0;
@@ -9207,6 +9225,7 @@ static inline JSShape *js_new_shape_nohash(JSContext *ctx, JSObject *proto,
     sh->parent = NULL;
     sh->layout_id = 0;
     sh->aot_observed = 0;
+    sh->y_site = 0;
     return sh;
 }
 
@@ -10435,6 +10454,10 @@ static inline __attribute__((always_inline)) JSValue js_new_plain_object_ex(JSCo
            promoted; a count of one (plus the young bias) is the creator's, and the collection that follows an allocation window finds it
            dead when nothing noted or pinned it. */
         YCls *yk_ = &qjs_ycls[cap];
+        uint32_t si_ = sh->y_site ? sh->y_site : qjs_y_site_assign(sh);
+        YSite *ys_ = &qjs_ysite[si_];
+        if (unlikely(ys_->pre) && (++ys_->tick & 63))
+            goto y_old;
         if (unlikely((uintptr_t)yk_->bump + yk_->stride > (uintptr_t)yk_->end)) {
             if (!qjs_y_refill(ctx, cap, js_plain_obj_bsi[cap], JS_PLAIN_GCBYTE()))
                 goto y_old;
@@ -10444,6 +10467,8 @@ static inline __attribute__((always_inline)) JSValue js_new_plain_object_ex(JSCo
             p = (JSObject *)(c_ + 8);
             yk_->bump = c_ + yk_->stride;
             *(uint64_t *)c_ = yk_->hdrw;
+            ys_->made++;
+            *(uint32_t *)p = si_;
             memset((uint8_t *)p + offsetof(JSObject, class_id) - 2, 0, 8);
             p->extensible = true;
             p->prop_inline_cap = cap;
@@ -10952,6 +10977,7 @@ static JSValue js_new_young_array(JSContext *ctx, const JSValue *src, int count)
     p = (JSObject *)(c_ + 8);
     yk->bump = c_ + yk->stride;
     *(uint64_t *)c_ = yk->hdrw;
+    *(uint32_t *)p = 0;
     memset((uint8_t *)p + offsetof(JSObject, class_id) - 2, 0, 8);
     p->extensible = true;
     p->is_exotic = 1;
@@ -12536,6 +12562,7 @@ static void y_collect(JSRuntime *rt)
         JSShape *sh = p->shape;
         JSShapeProperty *pr = get_shape_prop(sh);
         ns++;
+        y_site_promoted(*(uint32_t *)p);
         for (j = 0; j < (uint32_t)sh->prop_count; j++, pr++) {
             JSValue v;
             if (pr->flags & JS_PROP_TMASK) continue;
@@ -12596,6 +12623,7 @@ static void y_collect(JSRuntime *rt)
     if (y_livecells > y_livepeak) y_livepeak = y_livecells;
     y_nurs_n = 0; for (kb = 0; kb < 16; kb++) { qjs_ycls[kb].cur = NULL; qjs_ycls[kb].bump = (uint8_t *)1; qjs_ycls[kb].end = NULL; } y_roots_n = 0; if (y_sites > 0) y_roots_cap = 0;
     y_cnt[1] += cells; y_cnt[2] += ns; y_cnt[3] += cells - ns;
+    y_site_eval();
     t2 = y_tsc();
     y_cyc[0] += t1 - t0; y_cyc[2] += t2 - t1;
     y_epoch++; if ((y_epoch & 0xffff) == 0) y_epoch++; qjs_y_ep48 = (uint64_t)(y_epoch & 0xffff) << 48;
@@ -67322,6 +67350,7 @@ void js_aot_gen_layout(JSAotGenLayout *out)
     out->off_rt_layout_count = (uint32_t)offsetof(JSRuntime, aot_layout_count);
     out->off_rt_htmldda = (uint32_t)offsetof(JSRuntime, aot_htmldda);
     out->off_shape_layout_id = (uint32_t)offsetof(JSShape, layout_id);
+    out->off_shape_ysite = (uint32_t)offsetof(JSShape, y_site);
     out->class_proxy = JS_CLASS_PROXY;
     out->off_ctx_interrupt_counter =
         (uint32_t)offsetof(JSContext, interrupt_counter);

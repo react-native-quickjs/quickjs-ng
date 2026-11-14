@@ -79,6 +79,7 @@ typedef struct JSAotGenLayout {
     /* The contracted layouts: the id in a JSShape, the runtime's shape array and
        count, and the bit word that records a broken contract. */
     uint32_t off_shape_layout_id;
+    uint32_t off_shape_ysite;
     uint32_t class_proxy;
     uint32_t off_rt_layout_broken, off_rt_layout_shape, off_rt_layout_count;
     uint32_t off_rt_htmldda;
