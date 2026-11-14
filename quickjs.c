@@ -854,7 +854,16 @@ static void js_drc_validate_range(void *opaque, JSValue *regs, uint32_t nregs)
         JSValue v = regs[i];
         if (!JS_VALUE_HAS_REF_COUNT(v))
             continue;
+        /* Registers borrow under deferred RC, so a counted value at count zero
+           is legitimate if it is parked on the zero-count table. Only a value
+           that is counted, at zero and not parked is garbage. With owning
+           registers the stricter test applies. */
+#if QJS_DRC
+        if (JS_REF_COUNT(JS_VALUE_GET_PTR(v)) < 1 &&
+            !JS_GC_IN_ZCT(JS_VALUE_GET_PTR(v))) {
+#else
         if (JS_REF_COUNT(JS_VALUE_GET_PTR(v)) < 1) {
+#endif
             fprintf(stderr,
                     "drc-validate: register %p[%u] holds a counted value at "
                     "ref_count %u\n",
@@ -9695,6 +9704,10 @@ static void js_drc_zero(JSRuntime *rt, JSValue v)
             JSGCObjectHeader *p = JS_VALUE_GET_PTR(v);
             list_del(&p->link);
             list_add(&p->link, &rt->gc_zero_ref_count_list);
+            /* Parked objects carry the same marker as parked strings, so a
+               borrowing register that still names one is not taken for dangling
+               (see js_drc_validate_range). */
+            JS_GC_IN_ZCT(p) = 1;
             rt->zct_nobj++;
         }
         break;
@@ -9768,6 +9781,7 @@ static void js_drc_reconcile_locked(JSRuntime *rt)
         p = list_entry(el, JSGCObjectHeader, link);
         if (JS_REF_COUNT(p) > 0) {
             list_del(&p->link);
+            JS_GC_IN_ZCT(p) = 0;   /* resurrected: no longer parked */
             if (JS_GC_NOTRACE(p))
                 list_add_tail(&p->link, &rt->gc_notrace_list);
             else
