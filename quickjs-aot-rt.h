@@ -163,6 +163,13 @@ typedef struct JSAotGenLayout {
     /* A C function object: its class id and where it keeps the function pointer
        and the magic number, so a unit can tell a builtin from any other callee. */
     uint32_t class_c_function, off_cfunc_c_function, off_cfunc_magic;
+    /* The inline replay of a cached add-transition store: the cell's epoch stamp and
+       kind, the runtime's epoch, and the object's flag word (where it is, the
+       extensible bit, the bits that forbid the replay, and the inline slot
+       capacity's mask and shift). */
+    uint32_t off_regpic_misses, reg_pic_add_w, off_rt_ic_epoch;
+    uint32_t off_object_flags16, object_extensible_mask, object_noadd_mask;
+    uint32_t object_inline_cap_mask, object_inline_cap_shift;
 } JSAotGenLayout;
 
 /* Fold every field after `hash` (the hash field itself is excluded). Shared by
