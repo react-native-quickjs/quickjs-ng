@@ -67382,6 +67382,13 @@ typedef struct JSRegIR {
     int aw_scanned;    /* instructions already folded into the index */
     int aw_last_win;   /* last instruction naming the call window, or -1 */
     const JSRegRopInfo *ri; /* the runtime's per-opcode operand facts */
+    /* Each value's register-operand use count plus its phi uses, saturated at
+       8 (the largest limit a pass asks for), kept while no instruction is
+       added, dropped or rewritten in a way that changes a count. Every change
+       of that kind clears uses_valid. */
+    uint8_t *uses8;
+    const uint8_t *uses_phi;
+    int uses_valid;
 } JSRegIR;
 
 /* Net control-stack effect of one register instruction. Counting per stack
@@ -76298,6 +76305,7 @@ static int regvm_ir_add(JSContext *ctx, JSRegIR *ir, int rop, int src_pc,
         ir->cap = ncap;
     }
     in = &ir->insns[ir->n_insns++];
+    ir->uses_valid = 0;
     in->rop = (uint16_t)rop;
     in->src_pc = src_pc;
     in->n_ops = (uint16_t)n_ops;
@@ -77643,6 +77651,7 @@ static void regvm_fuse_self_branch(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
     if (out == n)
         goto done;
     ir->n_insns = out;
+    ir->uses_valid = 0;
     first[n] = out;
     for (i = n - 1; i >= 0; i--)
         first[i] = drop[i] ? first[i + 1] : remap[i];
@@ -77805,6 +77814,7 @@ static void regvm_rotate_loop_test(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
         nxt = t + 1;
         if (nxt >= i || insn_pc[nxt] < 0)
             continue;
+        ir->uses_valid = 0;
         br->rop = ROP_branch_cmp_reg_reg;
         br->n_ops = 4;
         /* The latch takes the opposite sense of the header test: REG_CMP_INVERT
@@ -77893,6 +77903,7 @@ static void regvm_fuse_inc_branch(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
     if (out == n)
         goto done;
     ir->n_insns = out;
+    ir->uses_valid = 0;
     first[n] = out;
     for (i = n - 1; i >= 0; i--)
         first[i] = drop[i] ? first[i + 1] : remap[i];
@@ -78596,9 +78607,9 @@ static int regvm_retarget_branch(JSRegIR *ir, int32_t target)
 /* Count both explicit IR operands and values that flow directly into a phi:
    a phi input may produce no edge copy, so the finished stream alone can make
    a multi-use value look unique. */
-static void regvm_count_uses(const JSRegIR *ir, int n_values,
-                             const uint8_t *phi_uses, uint8_t *nref,
-                             uint8_t limit)
+static void regvm_count_uses_raw(const JSRegIR *ir, int n_values,
+                                 const uint8_t *phi_uses, uint8_t *nref,
+                                 uint8_t limit)
 {
     int i, k, v;
 
@@ -78618,6 +78629,33 @@ static void regvm_count_uses(const JSRegIR *ir, int n_values,
             nref[v] = count < limit ? (uint8_t)count : limit;
         }
     }
+}
+
+/* The use counts saturated at `limit` (at most 8). min(count, limit) of the
+   counts saturated at 8 is the count saturated at `limit`, so the IR's cached
+   counts serve every pass until the IR changes. */
+static void regvm_count_uses(JSRegIR *ir, int n_values,
+                             const uint8_t *phi_uses, uint8_t *nref,
+                             uint8_t limit)
+{
+    int v;
+
+    if (!ir->uses8) {
+        regvm_count_uses_raw(ir, n_values, phi_uses, nref, limit);
+        return;
+    }
+    if (!ir->uses_valid || ir->uses_phi != phi_uses) {
+        regvm_count_uses_raw(ir, n_values, phi_uses, ir->uses8, 8);
+        ir->uses_phi = phi_uses;
+        ir->uses_valid = 1;
+    }
+#if QJS_REGVM_VERIFY
+    regvm_count_uses_raw(ir, n_values, phi_uses, nref, 8);
+    if (memcmp(nref, ir->uses8, (size_t)n_values))
+        abort();
+#endif
+    for (v = 0; v < n_values; v++)
+        nref[v] = ir->uses8[v] < limit ? ir->uses8[v] : limit;
 }
 
 /* Transfer at last use: a source referenced only by its definition and this
@@ -78846,6 +78884,7 @@ static void regvm_fold_frame_reads(JSContext *ctx, JSRegIR *ir,
     if (out == n)
         goto done;                      /* nothing folded */
     ir->n_insns = out;
+    ir->uses_valid = 0;
     /* first[i] = where old index i lands now */
     first[n] = out;
     for (i = n - 1; i >= 0; i--)
@@ -78942,6 +78981,7 @@ static void regvm_elide_dead_stores(JSContext *ctx, JSRegIR *ir,
     if (out == n)
         goto done;                      /* nothing dead */
     ir->n_insns = out;
+    ir->uses_valid = 0;
     first[n] = out;
     for (i = n - 1; i >= 0; i--)
         first[i] = drop[i] ? first[i + 1] : remap[i];
@@ -79082,6 +79122,7 @@ static void regvm_fuse_local_rmw(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
     if (out == n)
         goto done;                      /* nothing fused */
     ir->n_insns = out;
+    ir->uses_valid = 0;
     first[n] = out;
     for (i = n - 1; i >= 0; i--)
         first[i] = drop[i] ? first[i + 1] : remap[i];
@@ -79260,6 +79301,7 @@ static void regvm_fuse_branches(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
     if (out == n)
         goto done;                      /* nothing fused */
     ir->n_insns = out;
+    ir->uses_valid = 0;
     first[n] = out;
     for (i = n - 1; i >= 0; i--)
         first[i] = drop[i] ? first[i + 1] : remap[i];
@@ -79366,6 +79408,7 @@ static void regvm_fuse_const_operand(JSContext *ctx, JSRegIR *ir,
     if (out == n)
         goto done;                          /* nothing folded */
     ir->n_insns = out;
+    ir->uses_valid = 0;
     first[n] = out;
     for (i = n - 1; i >= 0; i--)
         first[i] = drop[i] ? first[i + 1] : remap[i];
@@ -79500,6 +79543,7 @@ static void regvm_fuse_field_chain(JSContext *ctx, JSRegIR *ir, int *pc_to_insn,
     if (out == n)
         goto done;                          /* nothing fused */
     ir->n_insns = out;
+    ir->uses_valid = 0;
     first[n] = out;
     for (i = n - 1; i >= 0; i--)
         first[i] = drop[i] ? first[i + 1] : remap[i];
@@ -79808,6 +79852,7 @@ static void regvm_fuse_arith_pair(JSContext *ctx, JSFunctionDef *fd,
     if (out == n)
         goto done;
     ir->n_insns = out;
+    ir->uses_valid = 0;
     first[n] = out;
     for (i = n - 1; i >= 0; i--)
         first[i] = drop[i] ? first[i + 1] : remap[i];
@@ -81510,6 +81555,9 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
 
     ir.insns = NULL;
     ir.ri = ctx->rt->regvm_rop_info;
+    ir.uses8 = NULL;
+    ir.uses_phi = NULL;
+    ir.uses_valid = 0;
     ir.n_insns = 0;
     ir.fuse_hint = 0;
     ir.cap = 0;
@@ -82068,6 +82116,10 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
     }
     fd->regvm_ctl_count = ctl_count;
 
+    /* The use counts the fusion passes share (see regvm_count_uses). Without
+       them every pass counts for itself. */
+    if (!fd->regvm_baseline && n_values > 0)
+        ir.uses8 = js_malloc(ctx, (size_t)n_values);
     if (!fd->regvm_baseline) {
     if (!fd->regvm_conservative)
         regvm_fold_frame_reads(ctx, &ir, fd, pc_to_insn, bc_len + n_stubs_used,
@@ -82216,6 +82268,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                         continue;
                     ir.insns[i].rop = ROP_move;
                     ir.insns[i].ops[1] = bval[slot];
+                    ir.uses_valid = 0;
                 }
                 /* clear only the slots this block touched */
                 for (k = 0; k < ntouch; k++)
@@ -82537,6 +82590,7 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
     js_free(ctx, bscr.shapes);
     js_free(ctx, ir.insns);
     js_free(ctx, ir.own_init);
+    js_free(ctx, ir.uses8);
     js_free(ctx, ir.own_undef);
     js_free(ctx, ir.aw_def);
     js_free(ctx, ir.aw_reads);
@@ -85990,6 +86044,7 @@ static int regvm_baseline_spill(JSContext *ctx, JSRegIR *ir,
     js_free(ctx, ir->insns);
     ir->insns = o.insn;
     ir->n_insns = o.n;
+    ir->uses_valid = 0;
     ir->cap = o.cap;
     return 0;
  fail:
