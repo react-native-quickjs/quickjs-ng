@@ -251,6 +251,7 @@ QJS_AOT_STUB JSValue qjs_aot_stack_object_init(void *buf, size_t bytes, void *sh
 QJS_AOT_STUB JSValue qjs_aot_stack_object_init_cap(void *buf, size_t bytes, void *shape, uint32_t cap);
 QJS_AOT_STUB JSValue qjs_aot_stack_array_init(JSContext *ctx, void *buf, size_t bytes, uint32_t n);
 QJS_AOT_STUB void qjs_aot_stack_release(JSContext *ctx, JSValue obj, JSValue arr);
+QJS_AOT_STUB void qjs_aot_stack_release_m(JSContext *ctx, JSValue obj, uint32_t refmask);
 QJS_AOT_STUB int qjs_aot_stack_migrate(JSContext *ctx, JSValue obj, JSValue arr, JSValue *hobj, JSValue *harr);
 QJS_AOT_STUB int qjs_aot_stack_migrate_child(JSContext *ctx, JSValue obj, JSValue child, JSValue *hobj, JSValue *hchild);
 /* The digest of a bytecode function (the unit's binding key), whether or not it has been called: 1 with 16 bytes, or 0. */

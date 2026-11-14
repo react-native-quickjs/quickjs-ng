@@ -67068,6 +67068,42 @@ QJS_AOT_STUB void qjs_aot_stack_release(JSContext *ctx, JSValue obj, JSValue arr
     }
 }
 
+/* Release a stack object that has no Array pair when the caller knows which fields can hold a counted reference: bit i of `refmask` is set for field i that may. Only those fields are read
+   and released, then the shape reference is dropped; the fields are not written back and the block is dead until the region makes it again (every word of it is rewritten by that
+   init). QJS_AOT_REGION_MASKCHECK=1 in the run's environment checks the mask against all of the fields and aborts on a reference outside it. */
+QJS_AOT_STUB void qjs_aot_stack_release_m(JSContext *ctx, JSValue obj, uint32_t refmask)
+{
+    JSRuntime *rt = ctx->rt;
+    JSObject *p = JS_VALUE_GET_OBJ(obj);
+    JSShape *sh = p->shape;
+    uint32_t m = refmask;
+    assert(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT && JS_REF_COUNT(p) >= JS_STACK_BIAS / 2);
+    {
+        static int chk = -1;
+        if (unlikely(chk < 0))
+            chk = getenv("QJS_AOT_REGION_MASKCHECK") != NULL;
+        if (unlikely(chk)) {
+            int j;
+            for (j = 0; j < sh->prop_count && j < 32; j++) {
+                if (!((refmask >> j) & 1) && JS_VALUE_HAS_REF_COUNT(p->prop[j].u.value)) {
+                    fprintf(stderr, "MASKCHECK: field %d of a stack object holds a reference outside the mask %x\n", j, refmask);
+                    abort();
+                }
+            }
+        }
+    }
+    while (m) {
+        int i = __builtin_ctz(m);
+        m &= m - 1;
+        if (i >= sh->prop_count)
+            break;
+        if (JS_VALUE_HAS_REF_COUNT(p->prop[i].u.value))
+            JS_FreeValueRT(rt, p->prop[i].u.value);
+    }
+    js_free_shape(rt, sh);
+    p->shape = NULL;
+}
+
 /* Move a stack object, its stack array and its stack child object (any may be undefined) to the heap: the heap array takes the elements (their references move), the heap child and the
    heap object take the fields (a field of the object that held the stack array holds the heap array, a field that held the stack child holds the heap child), and the stack blocks are
    emptied and released. A field that no longer holds the child (it was overwritten after the store) is left alone, and the child is moved all the same: the code that made it may still hold
