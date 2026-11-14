@@ -84651,13 +84651,15 @@ static int bc_get_leb128_int(BCReaderState *s, int *pval)
     return bc_get_leb128(s, (uint32_t *)pval);
 }
 
-/* An entry count: a value that does not fit an int is not one any writer produced. */
-static int bc_get_leb128_count(BCReaderState *s, int *pval)
+/* An entry count: a value that does not fit an int is not one any writer produced, and neither is one the rest of the input cannot hold:
+   every entry takes at least `min_bytes` bytes, so a count above (bytes left / min_bytes) is rejected before the table for it is allocated
+   (a 19-byte blob declaring INT32_MAX entries used to make the loader touch gigabytes before it failed). */
+static int bc_get_leb128_count_n(BCReaderState *s, int *pval, size_t min_bytes)
 {
     uint32_t val;
     if (bc_get_leb128(s, &val))
         return -1;
-    if (val > INT32_MAX) {
+    if (val > INT32_MAX || (size_t)val > (size_t)(s->buf_end - s->ptr) / min_bytes) {
         JS_ThrowSyntaxError(s->ctx, "invalid count");
         return -1;
     }
@@ -85512,6 +85514,10 @@ static JSValue JS_ReadBigInt(BCReaderState *s)
         bc_read_trace(s, "}\n");
         return __JS_NewShortBigInt(s->ctx, 0);
     }
+    if (len > (size_t)(s->buf_end - s->ptr)) {   /* the limbs are in the input: reject before allocating for them */
+        bc_read_error_end(s);
+        goto fail;
+    }
     p = js_bigint_new(s->ctx, (len - 1) / (JS_LIMB_BITS / 8) + 1);
     if (!p)
         goto fail;
@@ -86143,6 +86149,14 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
         goto fail;
     if (bc_get_leb128_int(s, &bc.byte_code_len))
         goto fail;
+    /* The function object is allocated for these sizes before its body is read: a pool entry takes at least a byte of the input, and the
+       bytecode is at most the 16x expansion the register program check below allows. */
+    if (bc.cpool_count < 0 || bc.byte_code_len < 0 ||
+        (size_t)bc.cpool_count > (size_t)(s->buf_end - s->ptr) ||
+        (size_t)bc.byte_code_len > (size_t)(s->buf_end - s->ptr) * 16) {
+        JS_ThrowSyntaxError(ctx, "invalid function sizes");
+        goto fail;
+    }
     {
         uint32_t ic_count;
         if (bc_get_leb128(s, &ic_count))
@@ -86412,7 +86426,7 @@ static JSValue JS_ReadModule(BCReaderState *s)
     if (!m)
         goto fail;
     obj = js_dup(JS_MKPTR(JS_TAG_MODULE, m));
-    if (bc_get_leb128_count(s, &rd_cnt))
+    if (bc_get_leb128_count_n(s, &rd_cnt, 1))
         goto fail;
     obj = JS_NewModuleValue(ctx, m);
     if (rd_cnt != 0) {
@@ -86443,7 +86457,7 @@ static JSValue JS_ReadModule(BCReaderState *s)
         }
     }
 
-    if (bc_get_leb128_count(s, &rd_cnt))
+    if (bc_get_leb128_count_n(s, &rd_cnt, 3))
         goto fail;
     if (rd_cnt != 0) {
         m->export_entries_size = rd_cnt;
@@ -86472,7 +86486,7 @@ static JSValue JS_ReadModule(BCReaderState *s)
         }
     }
 
-    if (bc_get_leb128_count(s, &rd_cnt))
+    if (bc_get_leb128_count_n(s, &rd_cnt, 1))
         goto fail;
     if (rd_cnt != 0) {
         m->star_export_entries_size = rd_cnt;
@@ -86489,7 +86503,7 @@ static JSValue JS_ReadModule(BCReaderState *s)
         }
     }
 
-    if (bc_get_leb128_count(s, &rd_cnt))
+    if (bc_get_leb128_count_n(s, &rd_cnt, 3))
         goto fail;
     if (rd_cnt != 0) {
         m->import_entries_size = rd_cnt;
@@ -87029,6 +87043,11 @@ static int JS_ReadObjectAtoms(BCReaderState *s)
     if (s->idx_to_atom_count > 1000*1000) {
         JS_ThrowInternalError(s->ctx, "unreasonable atom count: %u",
                               s->idx_to_atom_count);
+        return -1;
+    }
+    /* each atom entry takes at least one byte of the input */
+    if (s->idx_to_atom_count > (size_t)(s->buf_end - s->ptr)) {
+        JS_ThrowSyntaxError(s->ctx, "invalid count");
         return -1;
     }
 
