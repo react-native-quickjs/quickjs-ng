@@ -66443,18 +66443,49 @@ QJS_AOT_STUB void *qjs_aot_class_shape(JSContext *ctx, JSValue proto, const uint
 QJS_AOT_STUB JSValue qjs_aot_new_from_shape(JSContext *ctx, void *shape)
 {
     JSShape *sh = (JSShape *)shape;
-    JSValue obj;
+    JSRuntime *rt = ctx->rt;
     JSObject *p;
-    int i;
+    JSProperty *pr;
+    int i, n = sh->prop_count;
 
-    /* the slots live in the object's own block whatever their number (up to the learned maximum): one allocation, not two */
-    obj = JS_NewObjectFromShapeCap(ctx, js_dup_shape(sh), JS_CLASS_OBJECT, NULL, sh->prop_count);
-    if (JS_IsException(obj))
+    if (unlikely(n > JS_OBJ_LEARNED_INLINE_MAX)) {
+        JSValue obj = JS_NewObjectFromShape(ctx, js_dup_shape(sh), JS_CLASS_OBJECT, NULL);
+        if (JS_IsException(obj))
+            return obj;
+        p = JS_VALUE_GET_OBJ(obj);
+        for (i = 0; i < n; i++)
+            p->prop[i].u.value = JS_UNDEFINED;
         return obj;
-    p = JS_VALUE_GET_OBJ(obj);
-    for (i = 0; i < sh->prop_count; i++)
-        p->prop[i].u.value = JS_UNDEFINED;
-    return obj;
+    }
+    /* what JS_NewObjectFromShapeCapExtra does for a plain object, without its class switch: one block holding the body and the n slots */
+    js_trigger_gc(rt, sizeof(JSObject));
+    p = js_malloc(ctx, offsetof(JSObject, u) + n * sizeof(JSProperty));
+    if (unlikely(!p))
+        return JS_EXCEPTION;   /* the generic path also drops the shape reference it was given; here none was taken yet */
+    p->prop_inline_cap = n;
+    p->class_id = JS_CLASS_OBJECT;
+    p->values_inline = 0;
+    p->arr_kind = JS_ARR_KIND_GENERIC;
+    p->extensible = true;
+    p->free_mark = 0;
+    p->is_exotic = 0;
+    p->fast_array = 0;
+    p->holey = 0;
+    p->is_constructor = 0;
+    p->is_uncatchable_error = 0;
+    p->tmp_mark = 0;
+    p->is_HTMLDDA = 0;
+    p->gv_watched = 0;
+    p->is_prototype = 0;
+    p->first_weak_ref = NULL;
+    p->shape = js_dup_shape(sh);
+    pr = (JSProperty *)((uint8_t *)p + offsetof(JSObject, u));
+    p->prop = pr;
+    for (i = 0; i < n; i++)
+        pr[i].u.value = JS_UNDEFINED;
+    JS_REF_COUNT(p) = 1;
+    add_gc_object(rt, &p->header, JS_GC_OBJ_TYPE_JS_OBJECT);
+    return JS_MKPTR(JS_TAG_OBJECT, p);
 }
 
 /* What the engine's construct path does once per constructor before its first construct (the unit's layout chain for it, built against
