@@ -70035,8 +70035,22 @@ aot_call_light_impl(JSContext *ctx, JSRegRun *caller_f, int na,
        it implies are kept either way. */
     if (cb->aot_fn == NULL || !(cb->aot_light || cb->aot_nfn != NULL))
         return 0;
-    if (cb->func_kind != JS_FUNC_NORMAL || na < cb->arg_count)
+    if (cb->func_kind != JS_FUNC_NORMAL)
         return 0;
+    /* A call with fewer arguments than the callee declares: the compiled body reads the declared ones, so the window is
+       extended with undefined in a copy (the callee's `arguments` and `.length` still see `na`). Without this the call took
+       JS_CallInternal, js_regvm_execute and the compiled entry: 1.3x the cost of the interpreter's own call (aot_bench call.arity). */
+    JSValue padded[16];
+    if (unlikely(na < cb->arg_count)) {
+        int i;
+        if (cb->arg_count > 16)
+            return 0;
+        for (i = 0; i < na; i++)
+            padded[i] = argv[i];
+        for (; i < cb->arg_count; i++)
+            padded[i] = JS_UNDEFINED;
+        argv = padded;
+    }
     if (unlikely(js_poll_interrupts(ctx)))
         return -1;
     if (cb->aot_nfn != NULL) {
