@@ -25701,20 +25701,24 @@ extern uint64_t js_regvm_fallback_calls;
 #endif
 /*
  * May a record call read the caller's outgoing registers as its argument area
- * instead of copying them? Only when every declared argument is supplied and,
- * under DRC, no var_ref can reach a parameter slot (closure capture, direct
- * eval, make_arg_ref, mapped arguments -- `args_captured`): the registers do
- * not own their values and a write through such a ref frees the old one.
- * Direct put_arg into a borrowed window is handled by regvm_put_arg. Must
- * agree between slot reservation and regvm_record_fill.
+ * instead of copying them? Only when every declared argument is supplied and
+ * the callee is `argv_safe` (no parameter write, no var_ref onto a parameter
+ * slot, no mapped arguments object, no direct eval): a `put_arg` on a borrowed
+ * window would mutate the caller's live temporaries. Under DRC `args_captured`
+ * also disqualifies, since a write through such a ref would free a value the
+ * caller still holds. Must agree between slot reservation and
+ * regvm_record_fill.
+ *
+ * This mirrors JS_CallInternal: it copies when `argc < arg_count` or
+ * `JS_CALL_FLAG_COPY_ARGV && !JS_ARGV_SAFE`.
  */
 static inline int regvm_args_borrowable(const JSFunctionBytecode *cb, int na)
 {
+    return na >= cb->arg_count && cb->argv_safe
 #if QJS_DRC
-    return na >= cb->arg_count && !cb->args_captured;
-#else
-    return na >= cb->arg_count;
+        && !cb->args_captured
 #endif
+        ;
 }
 
 static void regvm_record_fill(JSRuntime *rt, const JSRegRecordLayout *lay,
@@ -29985,6 +29989,11 @@ static __attribute__((always_inline)) inline void regvm_record_fill(
         rec->arg_buf = lay->arg_buf;
         rec->arg_owned = 1;
         rec->local_buf = lay->arg_buf;
+        /* The copy holds every supplied argument (`slots` is the larger of `na`
+           and the declared count), so it is what `arguments` reads, and
+           `arg_buf == argv` holds for the `f.apply(this, arguments)` forwarding
+           test. */
+        rec->argv = lay->arg_buf;
 #if QJS_DRC
         rec->local_count = slots + vcount;
 #else
