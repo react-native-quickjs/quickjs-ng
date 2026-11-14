@@ -55580,9 +55580,13 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
         case OP_call:
         case OP_call_method:
             {
-                /* detect and transform tail calls */
                 int argc;
                 argc = get_u16(bc_buf + pos + 1);
+#if !QJS_REGVM
+                /* Detect and transform tail calls, for the stack interpreter
+                   only. The register backend does not emit this rewrite: its
+                   frame-reusing tail call costs more per call than call +
+                   return and hides the callers from `Error.stack`. */
                 if (code_match(&cc, pos_next, OP_return, -1)) {
                     if (cc.line_num >= 0) line_num = cc.line_num;
                     if (cc.col_num >= 0) col_num = cc.col_num;
@@ -55592,6 +55596,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                                               &line_num, &col_num);
                     break;
                 }
+#endif
                 add_pc2line_info(s, bc_out.size, line_num, col_num);
                 put_short_code(&bc_out, op, argc);
                 break;
