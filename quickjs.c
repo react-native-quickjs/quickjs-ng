@@ -86146,6 +86146,15 @@ static int regvm_baseline_spill(JSContext *ctx, JSRegIR *ir,
     JSRegBlOut o;
     int *newidx;
 
+    /* With every depth below V there is no deep operand; with no shape and
+       no placeholder the pass is the identity. */
+    if (C->n_values <= V && bs->n_shapes == 0) {
+        for (i = 0; i < n; i++)
+            if (ir->insns[i].rop == ROP_move && ir->insns[i].n_ops == 0)
+                break;
+        if (i == n)
+            return 0;
+    }
     o.ctx = ctx;
     o.insn = NULL;
     o.n = o.cap = o.failed = 0;
