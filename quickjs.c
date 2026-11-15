@@ -85859,100 +85859,74 @@ static int regvm_baseline_preds(JSContext *ctx, JSRegBaseline *B)
 
 /* Entry-depth dataflow: every reachable block is entered at one depth
    (`regvm_with_edge_delta` adjusts the with family and the finally return
-   address). Produces B->in_depth/out_depth/max_depth. A disagreement cannot
-   happen for a parser-accepted shape; if it does, return -1 as a hard
+   address). Produces B->in_depth/out_depth/max_depth and push_base[pos], the
+   depth of each instruction's first pushed value, so every value's id is its
+   depth (the with family uses its declared, taken-arm effect). A disagreement
+   cannot happen for a parser-accepted shape; if it does, return -1 as a hard
    error. */
 static int regvm_baseline_depths(JSContext *ctx, JSFunctionDef *fd,
                                  JSRegBaseline *B, int *pdeferred)
 {
     const uint8_t *bc = B->bc;
-    int b, pos, iter, changed, rc = 0;
+    int *work;
+    int b, pos, n_work = 0;
 
     if (B->bc_len <= 0)
         return 0;
-    B->in_depth[0] = 0;
-    for (iter = 0; iter < REGVM_MAX_ITERS; iter++) {
-        changed = 0;
-        for (b = 0; b < B->n_blocks; b++) {
-            int d, np, ns;
-            if (B->in_depth[b] < 0)
-                continue;
-            d = B->in_depth[b];
-            for (pos = B->bstart[b]; pos < B->bstart[b + 1];
-                 pos += short_opcode_info(bc[pos]).size) {
-                regvm_effect(fd, bc, pos, &np, &ns);
-                if (d < np) {
-                    /* cannot happen for a parser-accepted stack shape */
-                    goto refuse;
-                }
-                d += ns - np;
-                if (d > B->max_depth)
-                    B->max_depth = d;
-            }
-            B->out_depth[b] = d;
-            {
-                int term = B->bstart[b], k;
-                for (pos = B->bstart[b]; pos < B->bstart[b + 1];
-                     pos += short_opcode_info(bc[pos]).size)
-                    term = pos;
-                for (k = 0; k < 2; k++) {
-                    int s = B->succ[b * 2 + k];
-                    int dd = d + regvm_with_edge_delta(bc[term], k);
-                    if (s < 0)
-                        continue;
-                    if (B->in_depth[s] < 0) {
-                        B->in_depth[s] = dd;
-                        changed = 1;
-                    } else if (B->in_depth[s] != dd) {
-                        goto refuse;
-                    }
-                }
-            }
-        }
-        if (!changed)
-            break;
-    }
-    if (iter == REGVM_MAX_ITERS)
-        goto refuse;
-    return 0;
- refuse:
-    /* A depth disagreement is a modelling gap in regvm_effect; report it. */
-    *pdeferred = 1;
-    rc = -1;
-    (void)ctx;
-    return rc;
-}
-
-/* push_base[pos] for every instruction: the depth of its first pushed value,
-   so every value's id is its depth. The with family uses its declared (taken
-   arm) effect. */
-static int regvm_baseline_pushbase(JSContext *ctx, JSFunctionDef *fd,
-                                   JSRegBaseline *B)
-{
-    const uint8_t *bc = B->bc;
-    int b, pos;
-
-    B->push_base = js_malloc(ctx, (size_t)(B->bc_len > 0 ? B->bc_len : 1) *
-                              sizeof(int));
-    if (!B->push_base)
+    B->push_base = js_malloc(ctx, (size_t)B->bc_len * sizeof(int));
+    work = js_malloc(ctx, (size_t)B->n_blocks * sizeof(int));
+    if (!B->push_base || !work) {
+        js_free(ctx, work);
         return -1;
+    }
     for (pos = 0; pos < B->bc_len; pos++)
         B->push_base[pos] = -1;
-    for (b = 0; b < B->n_blocks; b++) {
-        int d;
-        if (B->in_depth[b] < 0)
-            continue;
+    /* A block's entry depth is set once, by the first edge reaching it, and
+       every later edge must agree; so each reachable block is walked once,
+       when it is first reached. */
+    B->in_depth[0] = 0;
+    work[n_work++] = 0;
+    while (n_work > 0) {
+        int d, np, ns, k, term;
+
+        b = work[--n_work];
         d = B->in_depth[b];
+        term = B->bstart[b];
         for (pos = B->bstart[b]; pos < B->bstart[b + 1];
              pos += short_opcode_info(bc[pos]).size) {
-            int np, ns;
             regvm_effect(fd, bc, pos, &np, &ns);
+            if (d < np) {
+                /* cannot happen for a parser-accepted stack shape */
+                goto refuse;
+            }
             if (ns > 0)
                 B->push_base[pos] = d - np;
             d += ns - np;
+            if (d > B->max_depth)
+                B->max_depth = d;
+            term = pos;
+        }
+        B->out_depth[b] = d;
+        for (k = 0; k < 2; k++) {
+            int s = B->succ[b * 2 + k];
+            int dd = d + regvm_with_edge_delta(bc[term], k);
+            if (s < 0)
+                continue;
+            if (B->in_depth[s] < 0) {
+                B->in_depth[s] = dd;
+                work[n_work++] = s;
+            } else if (B->in_depth[s] != dd) {
+                goto refuse;
+            }
         }
     }
+    js_free(ctx, work);
     return 0;
+ refuse:
+    /* A depth disagreement is a modelling gap in regvm_effect; report it. */
+    js_free(ctx, work);
+    *pdeferred = 1;
+    return -1;
 }
 
 /* The identity entry/exit value arrays: value id == depth. */
@@ -86317,8 +86291,6 @@ static __exception int js_regvm_build_baseline(JSContext *ctx, JSFunctionDef *fd
             goto done;
         }
     }
-    if (regvm_baseline_pushbase(ctx, fd, &B))
-        goto done;
     if (regvm_baseline_ident(ctx, &B))
         goto done;
 
