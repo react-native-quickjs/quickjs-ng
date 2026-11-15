@@ -49590,7 +49590,7 @@ typedef struct JSFunctionDef {
     uint8_t regvm_compiled; /* the backend lowered this function */
     /* Set when the optimising lowering refused the function and the build is
        retried with the frame authoritative: no slot promotion, reuse,
-       frame-read folding, hoisting or light frame. */
+       frame-read folding or hoisting. */
     uint8_t regvm_conservative;
     /* Set while the baseline tier builds this function: value identity is the
        operand-stack depth, with no SSA, liveness, promotion, reuse, fusion or
@@ -87137,13 +87137,10 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     b->realm = JS_DupContext(ctx);
 
 #if QJS_REGVM_RECORD
+    /* The frame kind is derived from the program alone, as the reader derives
+       it, so a function runs the same before and after a bytecode round trip
+       whichever tier lowered it. */
     regvm_set_call_desc(ctx->rt->regvm_rop_info, b);
-    if (fd->regvm_conservative || fd->regvm_baseline) {
-        /* the conservative retry and the baseline tier keep the frame
-           authoritative: no light frame */
-        b->regvm_light = 0;
-        b->regvm_light_fast = 0;
-    }
 #endif
 #if QJS_AOT && !QJS_REGVM_RECORD
     /* Bytecode is final here; bind the generated entry if one exists. The
