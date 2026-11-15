@@ -1015,6 +1015,12 @@ struct JSRuntime {
 #if QJS_REGVM
     JSRegRopInfo regvm_rop_info[ROP_COUNT];
 #endif
+    /* JS_COMPILE_FAST or JS_COMPILE_OPTIMIZE: see JS_SetCompileMode. */
+    uint8_t compile_mode;
+    /* QJS_AOT_PROFILE_OUT names a profile: every compile optimises, whatever
+       the mode or the flags, so the profile is keyed by the programs the AOT
+       generator builds. */
+    uint8_t compile_force_optimize;
 };
 
 #if QJS_REGVM_RECORD
@@ -4542,6 +4548,15 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
         rt->aot_prof_on = (prof_out && prof_out[0]) ? 1 : 0;
     }
 #endif
+#if QJS_AOT
+    rt->compile_mode = JS_COMPILE_OPTIMIZE;
+#else
+    rt->compile_mode = JS_COMPILE_FAST;
+#endif
+    {
+        const char *prof = getenv("QJS_AOT_PROFILE_OUT");
+        rt->compile_force_optimize = (prof && prof[0]) ? 1 : 0;
+    }
 
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
     init_list_head(&rt->string_list);
@@ -6645,6 +6660,17 @@ static void update_stack_limit(JSRuntime *rt)
         rt->stack_limit = rt->stack_top - rt->stack_size;
     }
 #endif
+}
+
+void JS_SetCompileMode(JSRuntime *rt, int mode)
+{
+    rt->compile_mode = mode == JS_COMPILE_OPTIMIZE ? JS_COMPILE_OPTIMIZE
+                                                   : JS_COMPILE_FAST;
+}
+
+int JS_GetCompileMode(JSRuntime *rt)
+{
+    return rt->compile_mode;
 }
 
 void JS_SetMaxStackSize(JSRuntime *rt, size_t stack_size)
@@ -49606,6 +49632,9 @@ typedef struct JSFunctionDef {
        top of the register file (ROP_slot_get/ROP_slot_put). The tier that
        refuses no parser-accepted shape. */
     uint8_t regvm_baseline;
+    /* Lower with the baseline tier from the start (JS_EVAL_FLAG_FAST_COMPILE
+       or the runtime's fast compile mode); inner functions inherit it. */
+    uint8_t regvm_fast;
     /* The baseline tier's peak operand-stack depth. V is derived from it once
        the call window is known. */
     int regvm_baseline_depth;
@@ -61771,6 +61800,9 @@ static JSFunctionDef *js_new_function_def(JSContext *ctx,
     if (parent) {
         list_add_tail(&fd->link, &parent->child_list);
         fd->is_strict_mode = parent->is_strict_mode;
+#if QJS_REGVM
+        fd->regvm_fast = parent->regvm_fast;
+#endif
         fd->parent_scope_level = parent->scope_level;
     }
 
@@ -85497,7 +85529,10 @@ static __exception int js_regvm_scan(JSContext *ctx, JSFunctionDef *fd)
 
     {
         int deferred = 0;
-        if (js_regvm_build_cfg(ctx, fd, is_leader, &deferred))
+        /* Fast compile goes straight to the baseline tier. */
+        if (fd->regvm_fast)
+            deferred = 1;
+        else if (js_regvm_build_cfg(ctx, fd, is_leader, &deferred))
             goto done;
         /* A shape the CFG cannot express is refused: no register program is
            emitted. The function is still created. */
@@ -88328,6 +88363,26 @@ JSValue JS_EvalFunction(JSContext *ctx, JSValue fun_obj)
 
 /* 'input' must be zero terminated i.e. input[input_len] = '\0'. */
 /* `export_name` and `input` may be pure ASCII or UTF-8 encoded */
+#if QJS_REGVM
+/* Whether source evaluated with `flags` is lowered by the baseline tier. The
+   AOT generator and a profiling build always optimise: a unit binds to the
+   optimised program's digest, and a profile is keyed by it. */
+static bool js_compile_fast(JSRuntime *rt, int flags)
+{
+#if QJS_AOT_GEN || QJS_AOT_PROFILE
+    (void)rt;
+    (void)flags;
+    return false;
+#else
+    if ((flags & JS_EVAL_FLAG_OPTIMIZE) || rt->compile_force_optimize)
+        return false;
+    if (flags & JS_EVAL_FLAG_FAST_COMPILE)
+        return true;
+    return rt->compile_mode == JS_COMPILE_FAST;
+#endif
+}
+#endif
+
 static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
                                  const char *input, size_t input_len,
                                  const char *filename, int line, int flags, int scope_idx)
@@ -88404,6 +88459,9 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
         fd->arguments_allowed = true;
     }
     fd->is_strict_mode = is_strict_mode;
+#if QJS_REGVM
+    fd->regvm_fast = js_compile_fast(ctx->rt, flags);
+#endif
     fd->func_name = JS_DupAtom(ctx, JS_ATOM__eval_);
     if (b) {
         if (add_closure_variables(ctx, fd, b, scope_idx))
