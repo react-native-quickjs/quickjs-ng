@@ -86240,6 +86240,10 @@ static __exception int js_regvm_build_baseline(JSContext *ctx, JSFunctionDef *fd
         defined[v] = 1;
     fd->regvm_baseline = 1;
     fd->regvm_baseline_depth = B.max_depth;
+    /* The baseline promotes no variable: every slot stays in the frame, which
+       the return path must release. A refused optimising attempt may have left
+       a smaller area (or none) here. */
+    fd->regvm_var_count = fd->var_count;
     {
         /* The identity value array the caller would normally allocate. */
         int *ident = js_malloc(ctx, (size_t)(i > 0 ? i : 1) * sizeof(int));
