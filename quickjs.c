@@ -30673,6 +30673,14 @@ static int regvm_accum_append_u(JSContext *ctx, JSFunctionBytecode *b,
         ACC_WHY(AC_OWNED);
         return 0;
     }
+    /* A nursery cell holds its values uncounted, so while this runtime has
+       young cells a string with no count may still be a young object's
+       property, which an in-place append would change. The counts prove
+       nothing until the next minor collection promotes or frees them. */
+    if (y_nurs_n != 0 && __atomic_load_n(&y_rt, __ATOMIC_ACQUIRE) == ctx->rt) {
+        ACC_WHY(AC_OWNED);
+        return 0;
+    }
     if (p1->is_wide_char != p2->is_wide_char) {
         ACC_WHY(AC_WIDTH);
         return 0;
