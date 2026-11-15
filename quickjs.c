@@ -49638,6 +49638,9 @@ typedef struct JSFunctionDef {
     /* The baseline tier's peak operand-stack depth. V is derived from it once
        the call window is known. */
     int regvm_baseline_depth;
+    /* While the baseline encodes: per bytecode pc, 1 where an OP_drop
+       discards a control-stack sentinel (NULL when the function has none). */
+    const uint8_t *regvm_baseline_sdrop;
     /* Why the backend refused this function (a static string), for the
        compile-time error. NULL when it lowered. */
     const char *regvm_defer_why;
@@ -80784,10 +80787,14 @@ static int regvm_encode_step_hook(void *opaque, const JSFunctionDef *fd,
            keeps the true source ids for the copy. */
         for (j = 0; j < ev->ns && j < REGVM_SHAPE_MAX; j++)
             pv[j] = dst_ids[j];
-    } else if (bc[pos] == OP_drop && np == 1 && d >= 1 && st->sentinel_bits &&
-        scratch[d - 1] >= 0 && scratch[d - 1] < st->n_values &&
-        st->sentinel_bits[scratch[d - 1]] &&
-        !regvm_stack_has(scratch, d - 1, scratch[d - 1])) {
+    } else if (bc[pos] == OP_drop && np == 1 && d >= 1 &&
+               (st->fd->regvm_baseline ?
+                (st->fd->regvm_baseline_sdrop &&
+                 st->fd->regvm_baseline_sdrop[pos]) :
+                (st->sentinel_bits &&
+                 scratch[d - 1] >= 0 && scratch[d - 1] < st->n_values &&
+                 st->sentinel_bits[scratch[d - 1]] &&
+                 !regvm_stack_has(scratch, d - 1, scratch[d - 1])))) {
         if (regvm_ir_add(st->ctx, st->ir, ROP_sentinel_drop, pos, NULL, 0))
             return -1;
     } else if (regvm_lower_insn(st->ctx, st->ir, bc, pos,
@@ -81850,7 +81857,9 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
        the
      * entry and releases (without closing) the iterator a close entry records.
      */
-    if (n_values > 0) {
+    /* The baseline decides per drop instead (regvm_baseline_sentinels): its
+       value ids are depths, which a sentinel shares with ordinary values. */
+    if (n_values > 0 && !fd->regvm_baseline) {
         sentinel_bits = js_malloc(ctx, (size_t)n_values);
         if (!sentinel_bits)
             goto done;
@@ -81868,15 +81877,10 @@ static __exception int js_regvm_encode(JSContext *ctx, JSFunctionDef *fd,
                         sentinel_bits[push_base[pos] + 2] = 1;
                 } else if (op2 == OP_catch) {
                     sentinel_bits[push_base[pos]] = 1;
-                } else if (op2 == OP_gosub && !fd->regvm_baseline) {
+                } else if (op2 == OP_gosub) {
                     /* The return address is a slot with no value, so a hand
                        `OP_drop` of it removes the control-stack entry (the
-                       sentinel convention of `regvm_lower`). The baseline tier
-                       must not mark it: its control stack is address-based
-                       (`ROP_finally_enter`/`ROP_finally_leave`), and its shape
-                       expansion moves the operand stack around the gosub push,
-                       so a set `sentinel_bit` would let an unrelated hand-drop
-                       remove a continuation whose finally has not run. */
+                       sentinel convention of `regvm_lower`). */
                     sentinel_bits[push_base[pos]] = 1;
                 }
             }
@@ -85691,6 +85695,8 @@ typedef struct JSRegBaseline {
     int *out_depth;     /* n_blocks */
     int *push_base;     /* bc_len; first pushed value id (== its depth) */
     int max_depth;
+    int has_sentinel;   /* a catch, for-of start or gosub pushes a sentinel */
+    uint8_t *sdrop;     /* bc_len, or NULL: 1 where an OP_drop drops a sentinel */
     /* encode outputs */
     int win;
     JSRegBaselineLayout lay;
@@ -85715,6 +85721,7 @@ static void regvm_baseline_free(JSContext *ctx, JSRegBaseline *B)
     js_free(ctx, B->out);
     js_free(ctx, B->out_depth);
     js_free(ctx, B->push_base);
+    js_free(ctx, B->sdrop);
     js_free(ctx, B->ireg);
     js_free(ctx, B->scratch);
     memset(B, 0, sizeof(*B));
@@ -85905,6 +85912,9 @@ static int regvm_baseline_depths(JSContext *ctx, JSFunctionDef *fd,
             if (d > B->max_depth)
                 B->max_depth = d;
             term = pos;
+            if (bc[pos] == OP_catch || bc[pos] == OP_gosub ||
+                bc[pos] == OP_for_of_start || bc[pos] == OP_for_await_of_start)
+                B->has_sentinel = 1;
         }
         B->out_depth[b] = d;
         for (k = 0; k < 2; k++) {
@@ -85927,6 +85937,97 @@ static int regvm_baseline_depths(JSContext *ctx, JSFunctionDef *fd,
     js_free(ctx, work);
     *pdeferred = 1;
     return -1;
+}
+
+/* Which `OP_drop`s discard a sentinel: the slot an OP_catch, an OP_gosub or
+   a for-of start pushes for a control-stack entry. Value ids are depths here,
+   so one id can be a sentinel at one point and a value at another; instead
+   each stack slot carries a token, the pushing instruction's pc + 1 for a
+   sentinel and 0 otherwise, which permutations copy. A drop discards the
+   sentinel when its slot has a token no slot below it shares (a copy is not
+   the entry), as the optimising tier's id test does. Each reachable block is
+   walked once, from the tokens of the first edge that reaches it. The handler
+   edge of an OP_catch replaces the sentinel with the exception. */
+static int regvm_baseline_sentinels(JSContext *ctx, JSFunctionDef *fd,
+                                    JSRegBaseline *B)
+{
+    const uint8_t *bc = B->bc;
+    int *eoff = NULL, *work = NULL, *etok = NULL, *cur = NULL, *tmp = NULL;
+    uint8_t *seen = NULL;
+    int b, pos, n_work = 0, total = 0, rc = -1;
+    size_t dcap = (size_t)B->max_depth + 4;
+
+    B->sdrop = js_mallocz(ctx, (size_t)B->bc_len);
+    eoff = js_malloc(ctx, (size_t)B->n_blocks * sizeof(int));
+    work = js_malloc(ctx, (size_t)B->n_blocks * sizeof(int));
+    seen = js_mallocz(ctx, (size_t)B->n_blocks);
+    cur = js_malloc(ctx, dcap * sizeof(int));
+    tmp = js_malloc(ctx, dcap * sizeof(int));
+    if (!B->sdrop || !eoff || !work || !seen || !cur || !tmp)
+        goto done;
+    for (b = 0; b < B->n_blocks; b++) {
+        eoff[b] = total;
+        if (B->in_depth[b] > 0)
+            total += B->in_depth[b];
+    }
+    etok = js_mallocz(ctx, (size_t)(total > 0 ? total : 1) * sizeof(int));
+    if (!etok)
+        goto done;
+    seen[0] = 1;
+    work[n_work++] = 0;
+    while (n_work > 0) {
+        int d, np, ns, k, j, term;
+
+        b = work[--n_work];
+        d = B->in_depth[b];
+        memcpy(cur, etok + eoff[b], (size_t)d * sizeof(int));
+        term = B->bstart[b];
+        for (pos = B->bstart[b]; pos < B->bstart[b + 1];
+             pos += short_opcode_info(bc[pos]).size) {
+            int op = bc[pos];
+            regvm_effect(fd, bc, pos, &np, &ns);
+            if (op == OP_drop && np == 1 && ns == 0 && cur[d - 1] != 0) {
+                for (j = 0; j < d - 1 && cur[j] != cur[d - 1]; j++)
+                    ;
+                B->sdrop[pos] = (j == d - 1);
+            }
+            for (j = 0; j < ns; j++) {
+                int src = regvm_perm_of(op, j);
+                tmp[j] = src >= 0 ? cur[d - np + src] : 0;
+            }
+            if (ns == 2 && regvm_keeps_receiver(op))
+                tmp[0] = cur[d - np];
+            if ((op == OP_catch || op == OP_gosub) && ns >= 1)
+                tmp[0] = pos + 1;
+            else if ((op == OP_for_of_start ||
+                      op == OP_for_await_of_start) && ns >= 3)
+                tmp[2] = pos + 1;
+            d -= np;
+            memcpy(cur + d, tmp, (size_t)ns * sizeof(int));
+            d += ns;
+            term = pos;
+        }
+        for (k = 0; k < 2; k++) {
+            int s = B->succ[b * 2 + k];
+            int dd = d + regvm_with_edge_delta(bc[term], k);
+            if (s < 0 || seen[s] || dd != B->in_depth[s])
+                continue;
+            seen[s] = 1;
+            memcpy(etok + eoff[s], cur, (size_t)dd * sizeof(int));
+            if (k == 0 && bc[term] == OP_catch && dd > 0)
+                etok[eoff[s] + dd - 1] = 0;
+            work[n_work++] = s;
+        }
+    }
+    rc = 0;
+ done:
+    js_free(ctx, eoff);
+    js_free(ctx, work);
+    js_free(ctx, seen);
+    js_free(ctx, etok);
+    js_free(ctx, cur);
+    js_free(ctx, tmp);
+    return rc;
 }
 
 /* The identity entry/exit value arrays: value id == depth. */
@@ -86293,6 +86394,8 @@ static __exception int js_regvm_build_baseline(JSContext *ctx, JSFunctionDef *fd
     }
     if (regvm_baseline_ident(ctx, &B))
         goto done;
+    if (B.has_sentinel && regvm_baseline_sentinels(ctx, fd, &B))
+        goto done;
 
     /* The encoder's baseline branch rebuilds `ireg` and grows `reg_count` to
        V+K after the spill pass; pass the depth-identity array for the calls
@@ -86329,6 +86432,7 @@ static __exception int js_regvm_build_baseline(JSContext *ctx, JSFunctionDef *fd
         if (regvm_report_deferred_on())
             fprintf(stderr, "regvm: BASELINE encode bc_len=%d blocks=%d "
                     "max_depth=%d\n", B.bc_len, B.n_blocks, B.max_depth);
+        fd->regvm_baseline_sdrop = B.sdrop;
         rc = js_regvm_encode(ctx, fd, B.bc, B.bc_len,
                              NULL /* reuse */, B.n_blocks, B.bstart, B.in_depth,
                              B.ent_off, B.ent, ent_phi, B.out_off, B.out,
@@ -86342,6 +86446,7 @@ static __exception int js_regvm_build_baseline(JSContext *ctx, JSFunctionDef *fd
                              NULL, NULL, NULL, NULL, defined,
                              NULL, NULL, 0 /* live_words */,
                              ident, i, i /* reg_count */, &refused, &why);
+        fd->regvm_baseline_sdrop = NULL;
         js_free(ctx, ident);
         if (rc)
             goto done;
