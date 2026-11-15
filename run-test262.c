@@ -96,6 +96,9 @@ int local;
 int skip_async;
 int skip_module;
 int dump_memory;
+/* The register VM's compile mode for every runtime: optimising unless -F, so
+   the default run checks the compiler that ships precompiled bytecode. */
+int compile_mode = JS_COMPILE_OPTIMIZE;
 int stats_count;
 JSMemoryUsage stats_all, stats_avg, stats_min, stats_max;
 char *stats_min_filename;
@@ -604,6 +607,8 @@ static void agent_start(void *arg)
     agent = arg;
     tls = agent->tls; // shares thread-local storage with parent thread
     rt = JS_NewRuntime();
+    if (rt)
+        JS_SetCompileMode(rt, compile_mode);
     if (rt == NULL) {
         fatal(1, "JS_NewRuntime failure");
     }
@@ -1745,6 +1750,8 @@ int run_test_buf(ThreadLocalStorage *tls, const char *filename, char *harness,
     JSContext *ctx;
 
     rt = JS_NewRuntime();
+    if (rt)
+        JS_SetCompileMode(rt, compile_mode);
     if (rt == NULL) {
         fatal(1, "JS_NewRuntime failure");
     }
@@ -2010,6 +2017,8 @@ int run_test262_harness_test(ThreadLocalStorage *tls, const char *filename,
     outfile = stdout; /* for js_print_262 */
 
     rt = JS_NewRuntime();
+    if (rt)
+        JS_SetCompileMode(rt, compile_mode);
     if (rt == NULL) {
         fatal(1, "JS_NewRuntime failure");
     }
@@ -2135,6 +2144,7 @@ void help(void)
            "-N             run test prepared by test262-harness+eshost\n"
            "-s             run tests in strict mode, skip @nostrict tests\n"
            "-E             only run tests from the error file\n"
+           "-F             compile source with the fast compile mode (register VM)\n"
            "-u             update error file\n"
            "-v             verbose: output error messages\n"
            "-vv            like -v but also print test name and running time\n"
@@ -2209,6 +2219,8 @@ int main(int argc, char **argv)
             help();
         } else if (str_equal(arg, "-m")) {
             dump_memory++;
+        } else if (str_equal(arg, "-F")) {
+            compile_mode = JS_COMPILE_FAST;
         } else if (str_equal(arg, "-s")) {
             test_mode = TEST_STRICT;
         } else if (str_equal(arg, "-a")) {

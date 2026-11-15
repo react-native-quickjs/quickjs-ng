@@ -248,7 +248,7 @@ JSModuleDef *jsc_module_loader(JSContext *ctx,
 
         /* compile the module */
         func_val = JS_Eval(ctx, (char *)buf, buf_len, module_name,
-                           JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+                           JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY | JS_EVAL_FLAG_OPTIMIZE);
         js_free(ctx, buf);
         if (JS_IsException(func_val))
             return NULL;
@@ -282,7 +282,8 @@ static void compile_file(JSContext *ctx, FILE *fo,
         fprintf(stderr, "Could not load '%s'\n", filename);
         exit(1);
     }
-    eval_flags = JS_EVAL_FLAG_COMPILE_ONLY;
+    /* written bytecode ships: the register VM lowers it optimised */
+    eval_flags = JS_EVAL_FLAG_COMPILE_ONLY | JS_EVAL_FLAG_OPTIMIZE;
     if (module < 0) {
         module = (js__has_suffix(filename, ".mjs") ||
                   JS_DetectModule((const char *)buf, buf_len));
