@@ -33024,7 +33024,12 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
 
 static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_cold_slow(REGVM_ARGS)
 {
-    uint8_t *next = regvm_exec_one(ip, fr, f, ctx);
+    uint8_t *next;
+
+    /* A cold instruction can call a getter, a setter or a coercion, so publish
+       this frame's position for a backtrace first. */
+    REGVM_CAPTURE_IP();
+    next = regvm_exec_one(ip, fr, f, ctx);
 
     if (unlikely(next == NULL))
         T_FAIL();                       /* f->ret is already set */
@@ -34686,6 +34691,8 @@ static uint8_t *REGVM_CC regvm_t_get_local_field_0(REGVM_ARGS)
 
     if (regvm_own_read_hit(f->b, f->pic, f->b->regvm_pic_holder, recv, site, &val))
         T_SET_NEXT_B(d, val, 9);
+    /* the lookup can call a getter */
+    REGVM_CAPTURE_IP();
     if (site == REG_IC_NONE)
         val = JS_GetProperty(ctx, recv, atom);
     else
@@ -34714,6 +34721,8 @@ static uint8_t *REGVM_CC regvm_t_get_arg_field(REGVM_ARGS)
 
     if (regvm_own_read_hit(f->b, f->pic, f->b->regvm_pic_holder, recv, site, &val))
         T_SET_NEXT_B(d, val, T_SZ_RUAS);
+    /* the lookup can call a getter */
+    REGVM_CAPTURE_IP();
     if (site == REG_IC_NONE)
         val = JS_GetProperty(ctx, recv, atom);
     else
@@ -35528,6 +35537,9 @@ static __attribute__((noinline)) uint8_t *REGVM_CC regvm_t_get_element_slow(REGV
     int key = T_REG(5);
     JSValue recv = FR(o), k = FR(key);
     JSValue val;
+
+    /* the lookup can call a getter or a key coercion */
+    REGVM_CAPTURE_IP();
 
     if (JS_VALUE_GET_TAG(recv) == JS_TAG_OBJECT &&
         JS_VALUE_GET_TAG(k) == JS_TAG_INT) {
