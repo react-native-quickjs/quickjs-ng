@@ -628,9 +628,8 @@ static inline bool JS_VALUE_IS_NAN(JSValue v)
    the optimising lowering, for code that is written out (qjsc, a host that
    stores compiled bytecode) or runs long; FAST_COMPILE runs the baseline tier,
    which compiles several times faster and emits slower, valid code of the same
-   format. A profiling run (QJS_AOT_PROFILE) and the AOT generator always
-   optimise, so their programs are the ones the generated units bind to. The
-   stack VM ignores both. */
+   format. The AOT generator always optimises a source it compiles itself.
+   The stack VM ignores both. */
 #define JS_EVAL_FLAG_OPTIMIZE (1 << 8)
 #define JS_EVAL_FLAG_FAST_COMPILE (1 << 9)
 
@@ -701,8 +700,8 @@ JS_EXTERN void JS_SetGCPacingCap(JSRuntime *rt, int cap);
 JS_EXTERN void JS_SetMaxStackSize(JSRuntime *rt, size_t stack_size);
 /* The compile mode of source evaluated without JS_EVAL_FLAG_OPTIMIZE or
    JS_EVAL_FLAG_FAST_COMPILE, including eval() and new Function. The default is
-   JS_COMPILE_FAST, except in an AOT build, where it is JS_COMPILE_OPTIMIZE so
-   that source the generated unit was built from still binds to it. */
+   JS_COMPILE_FAST in every build: optimised bytecode is written offline (qjsc)
+   and loaded, and an AOT unit binds to the program loaded from it. */
 #define JS_COMPILE_FAST 0
 #define JS_COMPILE_OPTIMIZE 1
 JS_EXTERN void JS_SetCompileMode(JSRuntime *rt, int mode);

@@ -1017,10 +1017,6 @@ struct JSRuntime {
 #endif
     /* JS_COMPILE_FAST or JS_COMPILE_OPTIMIZE: see JS_SetCompileMode. */
     uint8_t compile_mode;
-    /* QJS_AOT_PROFILE_OUT names a profile: every compile optimises, whatever
-       the mode or the flags, so the profile is keyed by the programs the AOT
-       generator builds. */
-    uint8_t compile_force_optimize;
 };
 
 #if QJS_REGVM_RECORD
@@ -4548,15 +4544,10 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
         rt->aot_prof_on = (prof_out && prof_out[0]) ? 1 : 0;
     }
 #endif
-#if QJS_AOT
-    rt->compile_mode = JS_COMPILE_OPTIMIZE;
-#else
+    /* Every build compiles at run time with the fast mode. Optimised register
+       bytecode comes from qjsc; a program loaded from it is what profiles and
+       AOT units are keyed by. */
     rt->compile_mode = JS_COMPILE_FAST;
-#endif
-    {
-        const char *prof = getenv("QJS_AOT_PROFILE_OUT");
-        rt->compile_force_optimize = (prof && prof[0]) ? 1 : 0;
-    }
 
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
     init_list_head(&rt->string_list);
@@ -88498,16 +88489,16 @@ JSValue JS_EvalFunction(JSContext *ctx, JSValue fun_obj)
 /* `export_name` and `input` may be pure ASCII or UTF-8 encoded */
 #if QJS_REGVM
 /* Whether source evaluated with `flags` is lowered by the baseline tier. The
-   AOT generator and a profiling build always optimise: a unit binds to the
-   optimised program's digest, and a profile is keyed by it. */
+   AOT generator always optimises: compiling a source input itself is its
+   explicit path, and the unit must match what qjsc writes for that source. */
 static bool js_compile_fast(JSRuntime *rt, int flags)
 {
-#if QJS_AOT_GEN || QJS_AOT_PROFILE
+#if QJS_AOT_GEN
     (void)rt;
     (void)flags;
     return false;
 #else
-    if ((flags & JS_EVAL_FLAG_OPTIMIZE) || rt->compile_force_optimize)
+    if (flags & JS_EVAL_FLAG_OPTIMIZE)
         return false;
     if (flags & JS_EVAL_FLAG_FAST_COMPILE)
         return true;
