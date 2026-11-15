@@ -76509,7 +76509,7 @@ static int regvm_arg_retarget_scan(const JSRegIR *ir, int v,
             if (in->ops[k] == v)
                 reads++;
         }
-        if (di >= 0 && in->ops[di] == v)
+        if (di >= 0 && di < in->n_ops && in->ops[di] == v)
             def = i;
     }
     if (def < 0 || reads != 0)
@@ -76521,11 +76521,14 @@ static int regvm_arg_retarget_scan(const JSRegIR *ir, int v,
             o == REGVM_ORIG_SPLIT || o == REGVM_ORIG_HOMECOPY)
             return -1;
     }
-    /* Nothing from the producer to here may name the window. */
+    /* Nothing from the producer to here may name the window, nor be a stack
+       shape's placeholder, whose reads and writes this scan cannot see. */
     for (i = def; i < ir->n_insns; i++) {
         const JSRegInsn *in = &ir->insns[i];
         const char *fmt = regvm_rop_fmt[in->rop];
         int k;
+        if (in->rop == ROP_move && in->n_ops == 0)
+            return -1;
         if (!fmt)
             continue;
         for (k = 0; k < in->n_ops && fmt[k]; k++)
@@ -76555,7 +76558,8 @@ static void regvm_arg_index_sync(JSRegIR *ir)
             if (r >= 0 && r < ir->aw_n)
                 ir->aw_reads[r]++;
         }
-        if (oi->dst >= 0) {
+        /* A placeholder (a `move` with no operands) has no destination. */
+        if (oi->dst >= 0 && oi->dst < nk) {
             int d = in->ops[oi->dst];
             if (d >= 0 && d < ir->aw_n)
                 ir->aw_def[d] = i;
@@ -76565,6 +76569,28 @@ static void regvm_arg_index_sync(JSRegIR *ir)
                 ir->aw_last_win = i;
     }
     ir->aw_scanned = ir->n_insns;
+}
+
+/* Fold a stack shape's placeholder at `at` into the argument index. Its
+   copies are only made after the spill pass, so the placeholder has no
+   operands; it reads each copied source and redefines each copied slot. A
+   source's producer is therefore read, and a redefined slot's producer is the
+   placeholder, which regvm_arg_retarget never retargets. */
+static void regvm_arg_index_shape(JSRegIR *ir, int at, int n,
+                                  const int32_t *src, const int32_t *dst)
+{
+    int j;
+    if (ir->aw_n <= 0)
+        return;
+    regvm_arg_index_sync(ir);
+    for (j = 0; j < n; j++) {
+        if (src[j] == dst[j])
+            continue;
+        if (src[j] >= 0 && src[j] < ir->aw_n)
+            ir->aw_reads[src[j]]++;
+        if (dst[j] >= 0 && dst[j] < ir->aw_n)
+            ir->aw_def[dst[j]] = at;
+    }
 }
 
 /* Record that the producer at `def` now writes the call window instead of
@@ -76594,7 +76620,7 @@ static int regvm_arg_retarget(JSRegIR *ir, int v,
         int def;
         regvm_arg_index_sync(ir);
         def = ir->aw_def[v];
-        if (def < 0 || ir->aw_reads[v] != 0) {
+        if (def < 0 || ir->aw_reads[v] != 0 || ir->insns[def].n_ops == 0) {
             result = -1;
         } else {
             uint8_t o = ir->insns[def].origin;
@@ -80738,6 +80764,8 @@ static int regvm_encode_step_hook(void *opaque, const JSFunctionDef *fd,
         at = st->ir->n_insns;
         if (regvm_ir_add(st->ctx, st->ir, ROP_move, pos, NULL, 0))
             return -1;
+        regvm_arg_index_shape(st->ir, at, ev->ns < REGVM_SHAPE_MAX ? ev->ns
+                              : REGVM_SHAPE_MAX, pv, dst_ids);
         if (regvm_baseline_record_shape(st->ctx, bs, at, ev->np, ev->ns,
                                         pv, dst_ids))
             return -1;
