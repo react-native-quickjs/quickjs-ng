@@ -67491,6 +67491,15 @@ static int regvm_ctl_bound(JSContext *ctx, const JSRegIR *ir, const uint8_t *bc,
     int *din = NULL, *dout = NULL, *ddelta = NULL;
     int maxctl = 0, it, i, pos, rc = -1;
 
+    /* Without a push the depth never rises above zero. */
+    for (i = 0; i < ir->n_insns; i++) {
+        if (regvm_ctl_delta_rop(ir->insns[i].rop) > 0)
+            break;
+    }
+    if (i == ir->n_insns) {
+        *ctl_out = 0;
+        return 0;
+    }
     din = js_malloc(ctx, (size_t)(n_blocks > 0 ? n_blocks : 1) * sizeof(int));
     dout = js_malloc(ctx, (size_t)(n_blocks > 0 ? n_blocks : 1) * sizeof(int));
     ddelta = js_malloc(ctx, (size_t)(bc_len + 1) * sizeof(int));
