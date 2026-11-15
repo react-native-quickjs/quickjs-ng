@@ -86693,7 +86693,7 @@ static void regvm_build_pc2line(JSContext *ctx, JSFunctionBytecode *b,
     const uint8_t *p, *p_end;
     uint32_t *tp = NULL;
     int *tl = NULL, *tc = NULL;
-    int tn = 0, j, rc;
+    int tn = 0, j, rc, prev_spc = 0, prev_lo = 0;
     int line_num, col_num, last_line, last_col;
     uint32_t last_pc;
 
@@ -86755,16 +86755,26 @@ static void regvm_build_pc2line(JSContext *ctx, JSFunctionBytecode *b,
         int lo, hi, line, col, diff_pc, diff_line, diff_col;
         if (spc < 0)
             continue; /* not an instruction start */
-        /* last stack entry with pc <= spc */
-        lo = 0;
-        hi = tn;
-        while (lo < hi) {
-            int mid = (lo + hi) >> 1;
-            if ((int32_t)tp[mid] <= spc)
-                lo = mid + 1;
-            else
-                hi = mid;
+        /* lo = the number of stack entries with pc <= spc. Instructions
+           mostly follow source order, so it advances from the previous
+           instruction's count and is searched only when spc goes back. */
+        if (spc >= prev_spc) {
+            lo = prev_lo;
+            while (lo < tn && (int32_t)tp[lo] <= spc)
+                lo++;
+        } else {
+            lo = 0;
+            hi = tn;
+            while (lo < hi) {
+                int mid = (lo + hi) >> 1;
+                if ((int32_t)tp[mid] <= spc)
+                    lo = mid + 1;
+                else
+                    hi = mid;
+            }
         }
+        prev_spc = spc;
+        prev_lo = lo;
         if (lo > 0) {
             line = tl[lo - 1];
             col = tc[lo - 1];
