@@ -37898,15 +37898,20 @@ static uint8_t *REGVM_CC regvm_t_unwind_loop(REGVM_ARGS)
        gosub
      * continuation is dropped.
      */
+    /* An uncatchable error (an out-of-memory or an internal error) is never
+       caught: no catch handler resumes and no for-of is closed, as the stack
+       interpreter's unwinder does. */
+    const bool regvm_unc = JS_IsUncatchableError(ctx->rt->current_exception);
     while (f->nctl > 0) {
         JSRegCtl *e = &f->ctl[f->nctl - 1];
 
         if (e->kind == REG_CTL_ITER) {
             --f->nctl;
             JS_FreeValue(ctx, e->next);
-            JS_IteratorClose(ctx, e->iter, true);
+            if (!regvm_unc)
+                JS_IteratorClose(ctx, e->iter, true);
             JS_FreeValue(ctx, e->iter);
-        } else if (e->kind == REG_CTL_CATCH) {
+        } else if (e->kind == REG_CTL_CATCH && !regvm_unc) {
             JSValue caught = ctx->rt->current_exception;
             int dst = e->reg;
             uint8_t *handler = f->b->regvm_code + e->pc;
@@ -42009,14 +42014,16 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
         /* With no operand stack for the close sentinel, an exception leaving
            the frame closes every for-of it passes here, innermost first. A
            catch in the frame resumes at its handler instead. */
+        const bool regvm_unc = JS_IsUncatchableError(rt->current_exception);
         while (regvm_nctl > 0) {
             JSRegCtl *e = &regvm_ctl[regvm_nctl - 1];
             if (e->kind == REG_CTL_ITER) {
                 --regvm_nctl;
                 JS_FreeValue(ctx, e->next);
-                JS_IteratorClose(ctx, e->iter, true);
+                if (!regvm_unc)
+                    JS_IteratorClose(ctx, e->iter, true);
                 JS_FreeValue(ctx, e->iter);
-            } else if (e->kind == REG_CTL_CATCH) {
+            } else if (e->kind == REG_CTL_CATCH && !regvm_unc) {
                 JSValue exc = rt->current_exception;
                 --regvm_nctl;
                 rt->current_exception = JS_UNINITIALIZED;
@@ -74993,15 +75000,20 @@ QJS_AOT_STUB JSValue qjs_aot_unwind(JSContext *ctx, JSRegRun *f, JSValue *fr,
         build_backtrace(ctx, rt->current_exception, JS_UNDEFINED,
                         NULL, 0, 0, 0);
     }
+    /* An uncatchable error (an out-of-memory or an internal error) is never
+       caught: no catch handler resumes and no for-of is closed, as the stack
+       interpreter's unwinder does. */
+    const bool regvm_unc = JS_IsUncatchableError(ctx->rt->current_exception);
     while (f->nctl > 0) {
         JSRegCtl *e = &f->ctl[f->nctl - 1];
 
         if (e->kind == REG_CTL_ITER) {
             --f->nctl;
             JS_FreeValue(ctx, e->next);
-            JS_IteratorClose(ctx, e->iter, true);
+            if (!regvm_unc)
+                JS_IteratorClose(ctx, e->iter, true);
             JS_FreeValue(ctx, e->iter);
-        } else if (e->kind == REG_CTL_CATCH) {
+        } else if (e->kind == REG_CTL_CATCH && !regvm_unc) {
             JSValue exc = rt->current_exception;
 
             --f->nctl;
