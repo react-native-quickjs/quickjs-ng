@@ -9286,10 +9286,16 @@ static int init_shape_hash(JSRuntime *rt)
     return 0;
 }
 
-static uintptr_t hash_atom(JSAtom atom, uintptr_t mask)
+/* The shape property hash bucket of an atom. A string or symbol atom is a
+   sequential table index and spreads over the buckets as it is; only an
+   integer atom, whose payload is the number itself, can collide on its low
+   bits (multiples of a power of two), so only it is multiplied. This keeps
+   the common lookup to a mask. */
+static inline __attribute__((always_inline)) uintptr_t hash_atom(JSAtom atom, uintptr_t mask)
 {
-    int shift = 1 + clz_uintptr(mask+1);
-    return hash_uintptr(atom) >> shift;
+    if (likely(!(atom & JS_ATOM_TAG_INT)))
+        return (uintptr_t)atom & mask;
+    return hash_uintptr(atom) >> (1 + clz_uintptr(mask + 1));
 }
 
 static uint32_t shape_hash(uint32_t h, uint32_t val)
