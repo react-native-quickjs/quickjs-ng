@@ -31067,8 +31067,31 @@ static inline int regvm_instanceof_fast(JSContext *ctx, JSValue a, JSValue b)
     if ((p->class_id == JS_CLASS_BYTECODE_FUNCTION ||
          p->class_id == JS_CLASS_C_FUNCTION) &&
         p->shape->proto == JS_VALUE_GET_OBJ(ctx->function_proto) &&
-        !find_own_property1(p, JS_ATOM_Symbol_hasInstance))
+        !find_own_property1(p, JS_ATOM_Symbol_hasInstance)) {
+        /* The common case without a call: the function's own `prototype` is a
+           plain data property holding an object, and the receiver's chain
+           holds no proxy. Anything else is the ordinary algorithm. */
+        JSProperty *pr;
+        JSShapeProperty *prs = find_own_property(&pr, p, JS_ATOM_prototype);
+        if (prs && !(prs->flags & JS_PROP_TMASK) &&
+            JS_VALUE_GET_TAG(pr->u.value) == JS_TAG_OBJECT &&
+            JS_VALUE_GET_TAG(a) == JS_TAG_OBJECT) {
+            JSObject *proto = JS_VALUE_GET_OBJ(pr->u.value);
+            const JSObject *q = JS_VALUE_GET_OBJ(a), *q1;
+            for (;;) {
+                q1 = q->shape->proto;
+                if (!q1) {
+                    if (unlikely(q->class_id == JS_CLASS_PROXY))
+                        break;
+                    return 0;
+                }
+                if (q1 == proto)
+                    return 1;
+                q = q1;
+            }
+        }
         return JS_OrdinaryIsInstanceOf(ctx, a, b);
+    }
     return -1;
 }
 
