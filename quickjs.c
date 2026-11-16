@@ -308,9 +308,9 @@ const char* JS_GetVersion(void) {
    other value. Each VM build has its own value, since the two builds write
    different function bodies; bump the value of the build whose format changes. */
 #if QJS_REGVM
-#define BC_VERSION (0x80 + 20) /* register bytecode */
+#define BC_VERSION (0x80 + 21) /* register bytecode */
 #else
-#define BC_VERSION 28 /* stack bytecode */
+#define BC_VERSION 30 /* stack bytecode */
 #endif
 
 static inline JSValueConst *vc(JSValue *vals)
