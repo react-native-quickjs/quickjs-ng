@@ -6120,7 +6120,7 @@ static uint8_t *REGVM_CC regvm_s_ROP_with_get(uint8_t *ip, JSValue *fr, JSRegRun
                 if (taken) {
                     JSValue val;
                     if (op == ROP_with_get) {
-                        val = JS_GetProperty(ctx, regs[o], atom);
+                        val = js_with_get_binding(ctx, regs[o], atom);
                     } else {
                         int r = JS_DeleteProperty(ctx, regs[o], atom, 0);
                         if (unlikely(r < 0))
@@ -6177,7 +6177,9 @@ static uint8_t *REGVM_CC regvm_s_ROP_with_make_ref(uint8_t *ip, JSValue *fr, JSR
                         if (JS_IsException(val))
                             goto exception;
                     } else {
-                        val = JS_GetProperty(ctx, regs[o], atom);
+                        val = op == ROP_with_get_ref
+                                  ? js_with_get_binding(ctx, regs[o], atom)
+                                  : JS_GetProperty(ctx, regs[o], atom);
                         if (JS_IsException(val))
                             goto exception;
                         /* get_ref_undef hands the method an undefined receiver */

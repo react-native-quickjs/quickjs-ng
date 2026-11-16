@@ -26367,6 +26367,23 @@ static __exception int js_has_unscopable(JSContext *ctx, JSValue obj,
     return ret;
 }
 
+/* The value of a binding found in a with object (GetBindingValue): the
+   property is looked up again, as it may have been removed while the
+   unscopables were read; a missing one is a ReferenceError in strict code
+   and undefined otherwise. */
+static JSValue js_with_get_binding(JSContext *ctx, JSValue obj, JSAtom atom)
+{
+    int ret = JS_HasProperty(ctx, obj, atom);
+    if (unlikely(ret < 0))
+        return JS_EXCEPTION;
+    if (ret == 0) {
+        if (is_strict_mode(ctx))
+            return JS_ThrowReferenceErrorNotDefined(ctx, atom);
+        return JS_UNDEFINED;
+    }
+    return JS_GetProperty(ctx, obj, atom);
+}
+
 static __exception int js_operator_instanceof(JSContext *ctx, JSValue *sp)
 {
     JSValue op1, op2;
@@ -40832,7 +40849,7 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                 if (taken) {
                     JSValue val;
                     if (op == ROP_with_get) {
-                        val = JS_GetProperty(ctx, regs[o], atom);
+                        val = js_with_get_binding(ctx, regs[o], atom);
                     } else {
                         int r = JS_DeleteProperty(ctx, regs[o], atom, 0);
                         if (unlikely(r < 0))
@@ -40906,7 +40923,9 @@ static JSValue js_regvm_execute(JSContext *caller_ctx, JSValueConst func_obj,
                         if (JS_IsException(val))
                             goto exception;
                     } else {
-                        val = JS_GetProperty(ctx, regs[o], atom);
+                        val = op == ROP_with_get_ref
+                                  ? js_with_get_binding(ctx, regs[o], atom)
+                                  : JS_GetProperty(ctx, regs[o], atom);
                         if (JS_IsException(val))
                             goto exception;
                         /* get_ref_undef hands the method an undefined receiver */
@@ -43341,7 +43360,7 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                     if (taken) {
                         JSValue val;
                         if (op == ROP_with_get) {
-                            val = JS_GetProperty(ctx, regs[o], atom);
+                            val = js_with_get_binding(ctx, regs[o], atom);
                         } else {
                             int r = JS_DeleteProperty(ctx, regs[o], atom, 0);
                             if (unlikely(r < 0))
@@ -43417,7 +43436,9 @@ static uint8_t *regvm_exec_one(uint8_t *ip, JSValue *regs, JSRegRun *f,
                             if (JS_IsException(val))
                                 goto exception;
                         } else {
-                            val = JS_GetProperty(ctx, regs[o], atom);
+                            val = op == ROP_with_get_ref
+                                      ? js_with_get_binding(ctx, regs[o], atom)
+                                      : JS_GetProperty(ctx, regs[o], atom);
                             if (JS_IsException(val))
                                 goto exception;
                             /* get_ref_undef hands the method an undefined receiver */
