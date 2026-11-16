@@ -460,11 +460,15 @@ static inline bool JS_VALUE_IS_NAN(JSValue v)
 typedef union JSValueUnion {
     /* JS_MKVAL() writes all 64 bits even though only 32 are needed:
        leaving the upper half uninitialized makes GCC 14+ generate much
-       slower code on x86-64 */
-    uint64_t uint64;
+       slower code on x86-64. uint64 is declared after float64 on purpose:
+       clang lowers a union through its first member of the largest
+       alignment, and with uint64 first JSValue was lowered differently,
+       which cost about 15% instructions in hot compiled code. */
+    int32_t int32;
     double float64;
     void *ptr;
     int32_t short_big_int;
+    uint64_t uint64;
 } JSValueUnion;
 
 typedef struct JSValue {
@@ -477,8 +481,8 @@ typedef struct JSValue {
 #define JS_VALUE_GET_NORM_TAG(v) JS_VALUE_GET_TAG(v)
 #define JS_VALUE_GET_INT(v) ((int)(v).u.uint64)
 #define JS_VALUE_GET_BOOL(v) ((int)(v).u.uint64)
-#define JS_VALUE_GET_FLOAT64(v) ((v).u.float64)
 #define JS_VALUE_GET_SHORT_BIG_INT(v) ((int32_t)(v).u.uint64)
+#define JS_VALUE_GET_FLOAT64(v) ((v).u.float64)
 #define JS_VALUE_GET_PTR(v) ((v).u.ptr)
 
 /* msvc doesn't understand designated initializers without /std:c++20 */
