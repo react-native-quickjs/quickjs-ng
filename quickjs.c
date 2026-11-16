@@ -71703,7 +71703,7 @@ QJS_AOT_STUB int qjs_aot_shape_slot(const void *shape, uint32_t atom, uint32_t *
     if (sh == NULL)
         return 0;
     sh->aot_observed = 1;
-    h = (uintptr_t)atom & sh->prop_hash_mask;
+    h = hash_atom(atom, sh->prop_hash_mask);
     h = prop_hash_end(sh)[-h - 1];
     prop = get_shape_prop(sh);
     while (h) {
@@ -71730,7 +71730,7 @@ QJS_AOT_STUB int qjs_aot_shape_rslot(const void *shape, uint32_t atom, uint32_t 
 
     if (sh == NULL)
         return 0;
-    h = (uintptr_t)atom & sh->prop_hash_mask;
+    h = hash_atom(atom, sh->prop_hash_mask);
     h = prop_hash_end(sh)[-h - 1];
     prop = get_shape_prop(sh);
     while (h) {
@@ -71754,7 +71754,7 @@ QJS_AOT_STUB int qjs_aot_shape_wslot(const void *shape, uint32_t atom, uint32_t 
 
     if (sh == NULL)
         return 0;
-    h = (uintptr_t)atom & sh->prop_hash_mask;
+    h = hash_atom(atom, sh->prop_hash_mask);
     h = prop_hash_end(sh)[-h - 1];
     prop = get_shape_prop(sh);
     while (h) {
@@ -72633,7 +72633,7 @@ QJS_AOT_STUB int qjs_aot_shape_method(const void *shape, uint32_t atom, JSValue 
     if (sh == NULL)
         return 0;
     sh->aot_observed = 1;
-    h = (uintptr_t)atom & sh->prop_hash_mask;
+    h = hash_atom(atom, sh->prop_hash_mask);
     h = prop_hash_end(sh)[-h - 1];
     prop = get_shape_prop(sh);
     while (h) {
