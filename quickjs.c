@@ -9949,9 +9949,11 @@ static inline void ic_read_update2_guarded(JSRuntime *rt, JSFunctionBytecode *b,
 }
 
 #if !JS_MEGA_DISABLE
+/* The slot of a stub cache entry comes from the shape's content hash, not its address: an address-derived slot gives a different set of
+   conflicts with every allocator layout, which moved a polymorphic kernel by 5-10% between builds that differ in no cached fact. */
 static inline uint32_t js_mega_slot(JSShape *shape, JSAtom atom)
 {
-    return (((uintptr_t)shape >> 5) ^ (uint32_t)atom * 2654435761u) &
+    return (shape->hash ^ (uint32_t)atom * 2654435761u) &
            ((1u << JS_MEGA_BITS) - 1);
 }
 
@@ -10017,7 +10019,7 @@ static void js_megacache_fill(JSRuntime *rt, JSShape *recv_shape, JSAtom atom,
 
 static inline uint32_t js_putadd_slot(JSShape *shape, JSAtom atom)
 {
-    return (((uintptr_t)shape >> 5) ^ (uint32_t)atom * 2654435761u) & ((1u << JS_PUTADD_BITS) - 1);
+    return (shape->hash ^ (uint32_t)atom * 2654435761u) & ((1u << JS_PUTADD_BITS) - 1);
 }
 
 static inline JSPutAddEntry *js_putadd_probe(JSRuntime *rt, JSShape *shape, JSAtom atom)
