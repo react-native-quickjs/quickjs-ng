@@ -460,10 +460,13 @@ static inline bool JS_VALUE_IS_NAN(JSValue v)
 typedef union JSValueUnion {
     /* JS_MKVAL() writes all 64 bits even though only 32 are needed:
        leaving the upper half uninitialized makes GCC 14+ generate much
-       slower code on x86-64. uint64 is declared after float64 on purpose:
-       clang lowers a union through its first member of the largest
-       alignment, and with uint64 first JSValue was lowered differently,
-       which cost about 15% instructions in hot compiled code. */
+       slower code on x86-64. clang compiles the 32-bit store of int32 to
+       faster code (integer-heavy compiled code runs about 3% slower with
+       the 64-bit store), so under clang a value is written and read
+       through int32; the two are the same value. uint64 is declared after
+       float64 on purpose: clang lowers a union through its first member of
+       the largest alignment, and with uint64 first JSValue was lowered
+       differently, which cost about 15% instructions in hot compiled code. */
     int32_t int32;
     double float64;
     void *ptr;
@@ -479,9 +482,15 @@ typedef struct JSValue {
 #define JS_VALUE_GET_TAG(v) ((int32_t)(v).tag)
 /* same as JS_VALUE_GET_TAG, but return JS_TAG_FLOAT64 with NaN boxing */
 #define JS_VALUE_GET_NORM_TAG(v) JS_VALUE_GET_TAG(v)
+#ifdef __clang__
+#define JS_VALUE_GET_INT(v) ((v).u.int32)
+#define JS_VALUE_GET_BOOL(v) ((v).u.int32)
+#define JS_VALUE_GET_SHORT_BIG_INT(v) ((v).u.short_big_int)
+#else
 #define JS_VALUE_GET_INT(v) ((int)(v).u.uint64)
 #define JS_VALUE_GET_BOOL(v) ((int)(v).u.uint64)
 #define JS_VALUE_GET_SHORT_BIG_INT(v) ((int32_t)(v).u.uint64)
+#endif
 #define JS_VALUE_GET_FLOAT64(v) ((v).u.float64)
 #define JS_VALUE_GET_PTR(v) ((v).u.ptr)
 
@@ -497,7 +506,11 @@ static inline JSValue JS_MKPTR(int64_t tag, void *ptr)
 static inline JSValue JS_MKVAL(int64_t tag, int32_t int32)
 {
     JSValue v;
+#ifdef __clang__
+    v.u.int32 = int32;
+#else
     v.u.uint64 = (uint32_t)int32;
+#endif
     v.tag = tag;
     return v;
 }
@@ -514,7 +527,11 @@ static inline JSValue JS_MKNAN(void)
 #define JS_NAN             JS_MKNAN() /* alas, not a constant expression */
 #else
 #define JS_MKPTR(tag, p)   (JSValue){ (JSValueUnion){ .ptr = p }, tag }
+#ifdef __clang__
+#define JS_MKVAL(tag, val) (JSValue){ (JSValueUnion){ .int32 = val }, tag }
+#else
 #define JS_MKVAL(tag, val) (JSValue){ (JSValueUnion){ .uint64 = (uint32_t)(val) }, tag }
+#endif
 #define JS_NAN             (JSValue){ (JSValueUnion){ .float64 = NAN }, JS_TAG_FLOAT64 }
 #endif
 
