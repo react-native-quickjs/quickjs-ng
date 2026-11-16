@@ -160,7 +160,6 @@ extern "C" {
 typedef struct JSRuntime JSRuntime;
 typedef struct JSContext JSContext;
 typedef struct JSObject JSObject;
-typedef struct JSClass JSClass;
 typedef uint32_t JSClassID;
 typedef uint32_t JSAtom;
 
@@ -1298,6 +1297,8 @@ JS_EXTERN JSValue JS_GetPropertyInt64(JSContext *ctx, JSValueConst this_obj,
                                       int64_t idx);
 JS_EXTERN JSValue JS_GetPropertyStr(JSContext *ctx, JSValueConst this_obj,
                                     const char *prop);
+JS_EXTERN JSValue JS_GetPropertyValue(JSContext *ctx, JSValueConst this_obj,
+                                      JSValue prop);
 
 JS_EXTERN int JS_SetProperty(JSContext *ctx, JSValueConst this_obj,
                              JSAtom prop, JSValue val);
@@ -1307,6 +1308,9 @@ JS_EXTERN int JS_SetPropertyInt64(JSContext *ctx, JSValueConst this_obj,
                                   int64_t idx, JSValue val);
 JS_EXTERN int JS_SetPropertyStr(JSContext *ctx, JSValueConst this_obj,
                                 const char *prop, JSValue val);
+// |flags| is a mix of JS_PROP_* values; when in doubt use JS_PROP_C_W_E
+JS_EXTERN int JS_SetPropertyValue(JSContext *ctx, JSValueConst this_obj,
+                                  JSValue prop, JSValue val, int flags);
 JS_EXTERN int JS_HasProperty(JSContext *ctx, JSValueConst this_obj, JSAtom prop);
 JS_EXTERN int JS_IsExtensible(JSContext *ctx, JSValueConst obj);
 JS_EXTERN int JS_PreventExtensions(JSContext *ctx, JSValueConst obj);
@@ -1471,6 +1475,7 @@ JS_EXTERN bool JS_IsPromise(JSValueConst val);
 JS_EXTERN void JS_PromiseMarkAsHandled(JSContext *ctx, JSValueConst promise);
 JS_EXTERN JSValue JS_NewSettledPromise(JSContext *ctx, bool is_reject, JSValueConst value);
 
+// a symbol that is visible to JavaScript code
 JS_EXTERN JSValue JS_NewSymbol(JSContext *ctx, const char *description, bool is_global);
 /* A symbol that script cannot reach: property enumeration, including
    Object.getOwnPropertySymbols and JSON.stringify, skips keys of this kind.
@@ -1749,6 +1754,7 @@ typedef struct JSCFunctionListEntry {
 #define JS_CGETSET_DEF(name, fgetter, fsetter) { name, JS_PROP_CONFIGURABLE, JS_DEF_CGETSET, 0, { .getset = { .get = { .getter = fgetter }, .set = { .setter = fsetter } } } }
 #define JS_CGETSET_DEF2(name, fgetter, fsetter, prop_flags) { name, prop_flags, JS_DEF_CGETSET, 0, { .getset = { .get = { .getter = fgetter }, .set = { .setter = fsetter } } } }
 #define JS_CGETSET_MAGIC_DEF(name, fgetter, fsetter, magic) { name, JS_PROP_CONFIGURABLE, JS_DEF_CGETSET_MAGIC, magic, { .getset = { .get = { .getter_magic = fgetter }, .set = { .setter_magic = fsetter } } } }
+#define JS_CGETSET_MAGIC_DEF2(name, fgetter, fsetter, magic, prop_flags) { name, prop_flags, JS_DEF_CGETSET_MAGIC, magic, { .getset = { .get = { .getter_magic = fgetter }, .set = { .setter_magic = fsetter } } } }
 #define JS_PROP_STRING_DEF(name, cstr, prop_flags) { name, prop_flags, JS_DEF_PROP_STRING, 0, { .str = cstr } }
 #define JS_PROP_INT32_DEF(name, val, prop_flags) { name, prop_flags, JS_DEF_PROP_INT32, 0, { .i32 = val } }
 #define JS_PROP_INT64_DEF(name, val, prop_flags) { name, prop_flags, JS_DEF_PROP_INT64, 0, { .i64 = val } }
@@ -1784,8 +1790,8 @@ JS_EXTERN int JS_SetModuleExportList(JSContext *ctx, JSModuleDef *m,
 /* Version */
 
 #define QJS_VERSION_MAJOR 0
-#define QJS_VERSION_MINOR 16
-#define QJS_VERSION_PATCH 2
+#define QJS_VERSION_MINOR 17
+#define QJS_VERSION_PATCH 0
 #define QJS_VERSION_SUFFIX ""
 
 JS_EXTERN const char* JS_GetVersion(void);

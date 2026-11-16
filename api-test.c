@@ -1063,6 +1063,47 @@ static void backtrace_oom_callsite_array(void)
     JS_FreeRuntime(rt);
 }
 
+static void large_allocation_accounting(void)
+{
+    static const size_t block_size = 1024 * 1024;
+    JSMemoryUsage before, after;
+    JSValue ret, exception;
+    JSRuntime *rt;
+    JSContext *ctx;
+    const char *str;
+
+    rt = new_runtime();
+    ctx = JS_NewContext(rt);
+
+    JS_ComputeMemoryUsage(rt, &before);
+    ret = eval(ctx, "globalThis.a = new Uint8Array(1024 * 1024)");
+    assert(!JS_IsException(ret));
+    JS_FreeValue(ctx, ret);
+    JS_ComputeMemoryUsage(rt, &after);
+    assert(after.malloc_size - before.malloc_size >= (int64_t)block_size);
+
+    JS_ComputeMemoryUsage(rt, &before);
+    JS_SetMemoryLimit(rt, (size_t)before.malloc_size + 4 * block_size);
+    ret = eval(ctx, "globalThis.a = [];\n"
+                    "for (let i = 0; i < 64; i++)\n"
+                    "    a.push(new Uint8Array(1024 * 1024));");
+    assert(JS_IsException(ret));
+    JS_SetMemoryLimit(rt, 0);
+    JS_ComputeMemoryUsage(rt, &after);
+    assert(after.malloc_size - before.malloc_size < (int64_t)(8 * block_size));
+
+    exception = JS_GetException(ctx);
+    assert(JS_IsError(exception));
+    str = JS_ToCString(ctx, exception);
+    assert(str);
+    assert(!strcmp(str, "InternalError: out of memory"));
+    JS_FreeCString(ctx, str);
+    JS_FreeValue(ctx, exception);
+
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 static void backtrace_oom_current_exception(void)
 {
     static const char setup_code[] =
@@ -2129,6 +2170,42 @@ void new_typed_array(void)
     JS_FreeRuntime(rt);
 }
 
+void private_symbols(void)
+{
+    JSRuntime *rt = new_runtime();
+    JSContext *ctx = JS_NewContext(rt);
+    JSValue pub = JS_NewSymbol(ctx, "public", /*is_global*/false);
+    JSValue priv = JS_NewPrivateSymbol(ctx, "private");
+    assert(JS_IsSymbol(pub));
+    assert(JS_IsSymbol(priv));
+    JSValue obj = JS_NewObject(ctx);
+    assert(JS_IsObject(obj));
+    assert(true == JS_SetPropertyValue(ctx, obj, pub, JS_TRUE, JS_PROP_C_W_E));
+    assert(true == JS_SetPropertyValue(ctx, obj, priv, JS_FALSE, JS_PROP_C_W_E));
+    JSValue global_object = JS_GetGlobalObject(ctx);
+    assert(true == JS_SetPropertyStr(ctx, global_object, "o", JS_DupValue(ctx, obj)));
+    JS_FreeValue(ctx, global_object);
+    JSValue result = eval(ctx, "Object.getOwnPropertySymbols(o)");
+    assert(JS_IsArray(result));
+    int64_t length = -1;
+    assert(0 == JS_GetLength(ctx, result, &length));
+    assert(length == 1);
+    JSValue item = JS_GetPropertyUint32(ctx, result, 0);
+    assert(JS_IsSymbol(item));
+    assert(JS_IsSameValue(ctx, item, pub));
+    JS_FreeValue(ctx, item);
+    JS_FreeValue(ctx, result);
+    result = JS_GetPropertyValue(ctx, obj, JS_DupValue(ctx, pub));
+    assert(JS_IsBool(result));
+    assert(JS_IsSameValue(ctx, result, JS_TRUE));
+    result = JS_GetPropertyValue(ctx, obj, JS_DupValue(ctx, priv));
+    assert(JS_IsBool(result));
+    assert(JS_IsSameValue(ctx, result, JS_FALSE));
+    JS_FreeValue(ctx, obj);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 int main(void)
 {
     cfunctions();
@@ -2148,6 +2225,7 @@ int main(void)
     dump_memory_usage();
     new_errors();
     dom_exception_added_twice();
+    large_allocation_accounting();
     backtrace_oom_current_exception();
     backtrace_oom_callsite_array();
     proxy_own_keys_huge_length();
@@ -2168,5 +2246,6 @@ int main(void)
     add_intrinsic_bigint();
     new_typed_array();
     std_eval_interrupt_handler();
+    private_symbols();
     return 0;
 }
